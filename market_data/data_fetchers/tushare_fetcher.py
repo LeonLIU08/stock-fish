@@ -9,9 +9,10 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 优点：数据质量高、接口稳定
 
 流控策略：
-1. 实现"每分钟调用计数器"
-2. 超过免费配额（80次/分）时，强制休眠到下一分钟
-3. 使用 tenacity 实现指数退避重试
+1. 实现"每分钟调用计数器"（全局 80 次/分，TUSHARE_RATE_LIMIT_PER_MINUTE）
+2. 港股 hk_daily / hk_basic 等低积分接口按 TUSHARE_HK_RATE_LIMIT_PER_MINUTE 单独限流
+3. 触及接口频次时等待间隔后再调用，不立刻切备用源（港股日线数据优先用 Tushare）
+4. 使用 tenacity 实现指数退避重试
 """
 
 import json as _json
@@ -19,6 +20,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
@@ -46,6 +48,24 @@ logger = logging.getLogger(__name__)
 _ETF_SH_PREFIXES = ('51', '52', '56', '58')
 _ETF_SZ_PREFIXES = ('15', '16', '18')
 _ETF_ALL_PREFIXES = _ETF_SH_PREFIXES + _ETF_SZ_PREFIXES
+
+# Tushare Pro 港股接口独立频次。默认 1 次/分钟，由 TUSHARE_HK_RATE_LIMIT_PER_MINUTE 覆盖。
+# 文档：https://tushare.pro/document/1?doc_id=108
+_HK_RATE_LIMITED_APIS = frozenset({"hk_daily", "hk_basic", "hk_mins"})
+_RATE_LIMIT_BUFFER_SECONDS = 1.0
+_HK_RATE_LIMIT_SERVER_RETRIES = 1
+_RATE_LIMIT_KEYWORDS = (
+    "quota",
+    "配额",
+    "limit",
+    "权限",
+    "频率超限",
+    "超限",
+    "频次",
+    "rate limit",
+    "too many",
+    "访问频率",
+)
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -118,28 +138,40 @@ class TushareFetcher(BaseFetcher):
     数据来源：Tushare Pro API
     
     关键策略：
-    - 每分钟调用计数器，防止超出配额
-    - 超过 80 次/分钟时强制等待
+    - 每分钟调用计数器，防止超出全局配额
+    - 港股 hk_daily 等接口按 TUSHARE_HK_RATE_LIMIT_PER_MINUTE 限流，冷却时等待后再请求
     - 失败后指数退避重试
     
     配额说明（Tushare 免费用户）：
     - 每分钟最多 80 次请求
     - 每天最多 500 次请求
+    - 港股 hk_daily 低积分档 1 次/分钟（升级积分后调高 TUSHARE_HK_RATE_LIMIT_PER_MINUTE）
     """
     
     name = "TushareFetcher"
     priority = int(os.getenv("TUSHARE_PRIORITY", "2"))  # 默认优先级，会在 __init__ 中根据配置动态调整
 
-    def __init__(self, rate_limit_per_minute: int = 80):
+    def __init__(self, rate_limit_per_minute: Optional[int] = None):
         """
         初始化 TushareFetcher
 
         Args:
-            rate_limit_per_minute: 每分钟最大请求数（默认80，Tushare免费配额）
+            rate_limit_per_minute: 全局每分钟最大请求数（默认读取 TUSHARE_RATE_LIMIT_PER_MINUTE）
         """
-        self.rate_limit_per_minute = rate_limit_per_minute
+        config = get_config()
+        self.rate_limit_per_minute = (
+            rate_limit_per_minute
+            if rate_limit_per_minute is not None
+            else int(getattr(config, "tushare_rate_limit_per_minute", 80) or 80)
+        )
+        self.hk_rate_limit_per_minute = int(
+            getattr(config, "tushare_hk_rate_limit_per_minute", 1) or 0
+        )
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
+        self._rate_lock = Lock()
+        self._api_last_call: Dict[str, float] = {}
+        self._api_cooldown_until: Dict[str, float] = {}
         self._api: Optional[object] = None  # Tushare API 实例
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
@@ -149,6 +181,14 @@ class TushareFetcher(BaseFetcher):
 
         # 根据 API 初始化结果动态调整优先级
         self.priority = self._determine_priority()
+        if self.hk_rate_limit_per_minute > 0:
+            interval = 60.0 / self.hk_rate_limit_per_minute + _RATE_LIMIT_BUFFER_SECONDS
+            logger.info(
+                "Tushare 港股接口限流: %s 次/分钟（最短间隔 %.1fs），"
+                "升级积分后设置 TUSHARE_HK_RATE_LIMIT_PER_MINUTE",
+                self.hk_rate_limit_per_minute,
+                interval,
+            )
     
     def _init_api(self) -> None:
         """
@@ -219,56 +259,117 @@ class TushareFetcher(BaseFetcher):
         """
         return self._api is not None
 
-    def _check_rate_limit(self) -> None:
+    @staticmethod
+    def _is_rate_limit_message(message: str) -> bool:
+        text = message or ""
+        lowered = text.lower()
+        return any(keyword in text or keyword in lowered for keyword in _RATE_LIMIT_KEYWORDS)
+
+    def _api_qpm(self, api_name: Optional[str]) -> Optional[int]:
+        if not api_name or api_name not in _HK_RATE_LIMITED_APIS:
+            return None
+        qpm = int(self.hk_rate_limit_per_minute or 0)
+        return qpm if qpm > 0 else None
+
+    def _api_min_interval(self, api_name: Optional[str]) -> Optional[float]:
+        qpm = self._api_qpm(api_name)
+        if not qpm:
+            return None
+        return 60.0 / qpm + _RATE_LIMIT_BUFFER_SECONDS
+
+    def _seconds_until_api_ready(self, api_name: Optional[str], now: Optional[float] = None) -> float:
+        if not api_name:
+            return 0.0
+        now = now if now is not None else time.time()
+        wait = self._api_cooldown_until.get(api_name, 0.0) - now
+        interval = self._api_min_interval(api_name)
+        last = self._api_last_call.get(api_name, 0.0)
+        if interval and last:
+            wait = max(wait, interval - (now - last))
+        return max(0.0, wait)
+
+    def _mark_api_rate_limited(self, api_name: str) -> None:
+        interval = self._api_min_interval(api_name) or (60.0 + _RATE_LIMIT_BUFFER_SECONDS)
+        now = time.time()
+        with self._rate_lock:
+            self._api_last_call[api_name] = now
+            self._api_cooldown_until[api_name] = now + interval
+
+    def _check_rate_limit(self, api_name: Optional[str] = None) -> None:
         """
         检查并执行速率限制
-        
+
         流控策略：
-        1. 检查是否进入新的一分钟
-        2. 如果是，重置计数器
-        3. 如果当前分钟调用次数超过限制，强制休眠
+        1. 全局每分钟调用计数，超过配额则等待到下一分钟
+        2. 对 hk_daily 等独立频次接口按 TUSHARE_HK_RATE_LIMIT_PER_MINUTE 等待后再调用
         """
-        current_time = time.time()
-        
-        # 检查是否需要重置计数器（新的一分钟）
-        if self._minute_start is None:
-            self._minute_start = current_time
-            self._call_count = 0
-        elif current_time - self._minute_start >= 60:
-            # 已经过了一分钟，重置计数器
-            self._minute_start = current_time
-            self._call_count = 0
-            logger.debug("速率限制计数器已重置")
-        
-        # 检查是否超过配额
-        if self._call_count >= self.rate_limit_per_minute:
-            # 计算需要等待的时间（到下一分钟）
-            elapsed = current_time - self._minute_start
-            sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
-            
+        while True:
+            sleep_for = 0.0
+            with self._rate_lock:
+                now = time.time()
+                wait_api = self._seconds_until_api_ready(api_name, now)
+
+                if self._minute_start is None:
+                    self._minute_start = now
+                    self._call_count = 0
+                elif now - self._minute_start >= 60:
+                    self._minute_start = now
+                    self._call_count = 0
+                    logger.debug("速率限制计数器已重置")
+
+                wait_global = 0.0
+                if self._call_count >= self.rate_limit_per_minute:
+                    elapsed = now - self._minute_start
+                    wait_global = max(0.0, 60 - elapsed) + 1
+
+                sleep_for = max(wait_api, wait_global)
+                if sleep_for <= 0:
+                    self._call_count += 1
+                    if api_name and self._api_min_interval(api_name):
+                        self._api_last_call[api_name] = time.time()
+                    logger.debug(
+                        f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}"
+                    )
+                    return
+
+            qpm = self._api_qpm(api_name)
+            limit_desc = f"{qpm}次/分钟" if qpm else f"{self.rate_limit_per_minute}次/分钟"
             logger.warning(
-                f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
-                f"等待 {sleep_time:.1f} 秒..."
+                "Tushare %s 频率限制 %s，等待 %.1fs 后再次调用...",
+                api_name or "global",
+                limit_desc,
+                sleep_for,
             )
-            
-            time.sleep(sleep_time)
-            
-            # 重置计数器
-            self._minute_start = time.time()
-            self._call_count = 0
-        
-        # 增加调用计数
-        self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
+            time.sleep(sleep_for)
 
     def _call_api_with_rate_limit(self, method_name: str, **kwargs) -> pd.DataFrame:
-        """统一通过速率限制包装 Tushare API 调用。"""
+        """统一通过速率限制包装 Tushare API 调用。服务端频率超限时等待间隔后重试。"""
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
 
-        self._check_rate_limit()
-        method = getattr(self._api, method_name)
-        return method(**kwargs)
+        extra_retries = _HK_RATE_LIMIT_SERVER_RETRIES if self._api_qpm(method_name) else 0
+        while True:
+            self._check_rate_limit(api_name=method_name)
+            method = getattr(self._api, method_name)
+            try:
+                return method(**kwargs)
+            except RateLimitError:
+                raise
+            except Exception as e:
+                if not self._is_rate_limit_message(str(e)):
+                    raise
+                self._mark_api_rate_limited(method_name)
+                if extra_retries <= 0:
+                    logger.warning(f"Tushare {method_name} 频率超限: {e}")
+                    raise RateLimitError(f"Tushare {method_name} 频率超限: {e}") from e
+                extra_retries -= 1
+                wait = self._seconds_until_api_ready(method_name)
+                logger.warning(
+                    "Tushare %s 服务端频率超限，等待 %.1fs 后再次调用: %s",
+                    method_name,
+                    wait,
+                    e,
+                )
 
     def _get_china_now(self) -> datetime:
         """返回上海时区当前时间，方便测试覆盖跨日刷新逻辑。"""
@@ -464,12 +565,8 @@ class TushareFetcher(BaseFetcher):
         # US stocks not supported
         if _is_us_code(stock_code):
             raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
-        
-        # Rate-limit check
-        self._check_rate_limit()
-        
+
         is_hk = _is_hk_market(stock_code)
-         # 判断是否为 ETF / 港股，以选择不同接口
         is_etf = _is_etf_code(stock_code)
         if is_hk:
             ts_code = self._convert_hk_stock_code_for_tushare(stock_code)
@@ -477,48 +574,26 @@ class TushareFetcher(BaseFetcher):
         else:
             ts_code = self._convert_stock_code(stock_code)
             api_name = "fund_daily" if is_etf else "daily"
-        
-        # Convert date format (Tushare requires YYYYMMDD)
+
         ts_start = start_date.replace('-', '')
         ts_end = end_date.replace('-', '')
-        
-       
 
         logger.debug(f"调用 Tushare {api_name}({ts_code}, {ts_start}, {ts_end})")
-        
+
         try:
-            if is_hk:
-                # 港股使用 hk_daily 接口
-                df = self._api.hk_daily(
-                    ts_code=ts_code,
-                    start_date=ts_start,
-                    end_date=ts_end,
-                )
-            elif is_etf:
-                # ETF uses fund_daily interface
-                df = self._api.fund_daily(
-                    ts_code=ts_code,
-                    start_date=ts_start,
-                    end_date=ts_end,
-                )
-            else:
-                # Regular A-share stocks use daily interface
-                df = self._api.daily(
-                    ts_code=ts_code,
-                    start_date=ts_start,
-                    end_date=ts_end,
-                )
-            
-            return df
-            
+            return self._call_api_with_rate_limit(
+                api_name,
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+        except RateLimitError:
+            raise
         except Exception as e:
-            error_msg = str(e).lower()
-            
-            # 检测配额超限
-            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+            if self._is_rate_limit_message(str(e)):
+                self._mark_api_rate_limited(api_name)
                 logger.warning(f"Tushare 配额可能超限: {e}")
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            
             raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -595,31 +670,26 @@ class TushareFetcher(BaseFetcher):
             self._stock_name_cache = {}
         
         try:
-            # 速率限制检查
-            self._check_rate_limit()
-            
-
-            # 根据市场/类型选择基础信息接口
             if _is_hk_market(stock_code):
                 ts_code = self._convert_hk_stock_code_for_tushare(stock_code)
-                # 港股：使用 hk_basic
-                df = self._api.hk_basic(
+                df = self._call_api_with_rate_limit(
+                    "hk_basic",
                     ts_code=ts_code,
-                    fields='ts_code,name'
+                    fields="ts_code,name",
                 )
             elif _is_etf_code(stock_code):
                 ts_code = self._convert_stock_code(stock_code)
-                # ETF：使用 fund_basic
-                df = self._api.fund_basic(
+                df = self._call_api_with_rate_limit(
+                    "fund_basic",
                     ts_code=ts_code,
-                    fields='ts_code,name'
+                    fields="ts_code,name",
                 )
             else:
                 ts_code = self._convert_stock_code(stock_code)
-                # A 股股票：使用 stock_basic
-                df = self._api.stock_basic(
+                df = self._call_api_with_rate_limit(
+                    "stock_basic",
                     ts_code=ts_code,
-                    fields='ts_code,name'
+                    fields="ts_code,name",
                 )
             
             if df is not None and not df.empty:

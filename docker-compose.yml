@@ -1,7 +1,10 @@
 services:
-  # StockFish - A 股分析 + 推演编排
+  # StockFish - A 股分析 + 推演编排（本地 Dockerfile 构建，不拉取第三方预构建镜像）
   stockfish:
-    image: zhuhai123/stockfish-stockfish:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stockfish-local:dev
     container_name: stockfish
     env_file:
       - .env
@@ -14,38 +17,42 @@ services:
       # qlib 数据下载代理（socks5 代理加速 GitHub 下载）
       - QLIB_DATA_PROXY=${QLIB_DATA_PROXY:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       mirofish:
         condition: service_started
+        required: false
     restart: unless-stopped
     volumes:
       - ./:/app                      # 项目代码挂载，改代码即时生效
-      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket（qlib 推理需要）
-      - ~/.qlib:/root/.qlib          # qlib 数据
-      - ~/github/qlib-zh/mlruns:/root/github/qlib-zh/mlruns  # MLflow 模型
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket（qlib 推理/训练需要）
+      - ${HOME}/.qlib:/root/.qlib          # qlib 数据
+      - ${HOME}/github/qlib-zh/mlruns:/root/github/qlib-zh/mlruns  # MLflow 模型
     networks:
       - stockfish-net
 
-  # MiroFish - 群体智能模拟引擎
+  # MiroFish - 群体智能模拟引擎（本地 Dockerfile.mirofish 构建 backend）
   mirofish:
-    image: zhuhai123/stockfish-mirofish:latest
+    build:
+      context: ./MiroFish
+      dockerfile: ../Dockerfile.mirofish
+    image: mirofish-local:dev
     container_name: mirofish
     env_file:
       - .env
     ports:
-      - "3000:3000"
-      - "5001:5001"
+      - "127.0.0.1:5001:5001"
     restart: unless-stopped
     volumes:
       - ./MiroFish/backend:/app/backend          # 后端代码挂载
+      - ./MiroFish/locales:/app/locales          # 本仓库未包含完整 MiroFish 前端，locales 单独挂载
       - mirofish-uploads:/app/backend/uploads
     networks:
       - stockfish-net
 
   # 飞书 Bot（WebSocket 长连接）
   stockfish-bot:
-    image: zhuhai123/stockfish-stockfish:latest
+    image: stockfish-local:dev
     container_name: stockfish-bot
     env_file:
       - .env

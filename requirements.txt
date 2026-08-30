@@ -20,6 +20,7 @@ numpy>=1.24.0
 
 # 全球行情
 yfinance>=0.2.18
+longbridge>=1.0.0
 
 # 重试 & 流控
 tenacity>=8.2.0

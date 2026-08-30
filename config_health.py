@@ -88,6 +88,25 @@ def _check_any_env(keys: List[str]) -> bool:
     return any(_check_env(k) for k in keys)
 
 
+def _quote_field(quote: Any, name: str) -> Any:
+    """从 dict / dataclass / 普通对象上取字段。"""
+    if quote is None:
+        return None
+    if isinstance(quote, dict):
+        return quote.get(name)
+    return getattr(quote, name, None)
+
+
+def _quote_price(quote: Any) -> Optional[float]:
+    raw = _quote_field(quote, "price")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class _Cache:
     """简单的 TTL 缓存，避免短时间内重复检查"""
     def __init__(self, ttl: float = 30.0):
@@ -274,22 +293,21 @@ class ConfigHealthChecker:
         elif self.agent and hasattr(self.agent, "provider"):
             try:
                 provider = self.agent.provider
-                if hasattr(provider, "get_realtime_quote"):
-                    quote = provider.get_realtime_quote("600519")
-                    if quote and isinstance(quote, dict) and quote.get("price", 0) > 0:
-                        connectivity_ok = True
-                        connectivity_detail = f"连通正常（当前价: {quote.get('price', 0)}）"
-                    else:
-                        connectivity_detail = "端返回空数据"
-                elif hasattr(provider, "get_quote"):
+                quote = None
+                if hasattr(provider, "get_quote"):
                     quote = provider.get_quote("600519")
-                    if quote and isinstance(quote, dict) and quote.get("price", 0) > 0:
-                        connectivity_ok = True
-                        connectivity_detail = f"连通正常（当前价: {quote.get('price', 0)}）"
-                    else:
-                        connectivity_detail = "端返回空数据"
+                elif hasattr(provider, "get_realtime_quote"):
+                    quote = provider.get_realtime_quote("600519")
                 else:
-                    connectivity_detail = "无 get_realtime_quote/get_quote 方法"
+                    connectivity_detail = "无 get_quote/get_realtime_quote 方法"
+
+                price = _quote_price(quote)
+                if price is not None and price > 0:
+                    connectivity_ok = True
+                    name = _quote_field(quote, "name") or "600519"
+                    connectivity_detail = f"连通正常（{name} 当前价: {price}）"
+                elif connectivity_detail == "未检测":
+                    connectivity_detail = "端返回空数据"
             except Exception as e:
                 connectivity_detail = f"探活失败: {e}"
             self._cache.set("backend_connectivity", (connectivity_ok, connectivity_detail))
@@ -331,13 +349,14 @@ class ConfigHealthChecker:
 
         # SearXNG
         searxng_url = os.environ.get("SEARXNG_BASE_URL", "").strip()
-        searxng_public = os.environ.get("SEARXNG_PUBLIC_INSTANCES_ENABLED", "true").lower() == "true"
-        has_searxng = bool(searxng_url) or searxng_public
+        searxng_urls = os.environ.get("SEARXNG_BASE_URLS", "").strip()
+        searxng_public = os.environ.get("SEARXNG_PUBLIC_INSTANCES_ENABLED", "false").lower() == "true"
+        has_searxng = bool(searxng_url or searxng_urls) or searxng_public
         items.append(self._make_item(
             "SEARXNG_BASE_URL",
             "ok" if has_searxng else "not_configured",
             has_searxng,
-            detail=searxng_url if searxng_url else ("使用公共实例" if searxng_public else "未配置"),
+            detail=(searxng_url or searxng_urls) if (searxng_url or searxng_urls) else ("使用公共实例" if searxng_public else "未配置"),
             tier=3,
         ))
 

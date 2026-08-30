@@ -538,21 +538,8 @@ class AdvancedBackend(BaseStockBackend):
 
     def _build_search_service(self):
         """Build a SearchService with keys from config."""
-        from market_data.search.search_service import SearchService
-        from market_data.compat import get_config
-        cfg = get_config()
-        return SearchService(
-            bocha_keys=cfg.bocha_api_keys or None,
-            tavily_keys=cfg.tavily_api_keys or None,
-            anspire_keys=cfg.anspire_api_keys or None,
-            brave_keys=cfg.brave_api_keys or None,
-            serpapi_keys=cfg.serpapi_keys or None,
-            minimax_keys=cfg.minimax_api_keys or None,
-            searxng_base_urls=cfg.searxng_base_urls or None,
-            searxng_public_instances_enabled=cfg.searxng_public_instances_enabled,
-            news_max_age_days=getattr(cfg, 'news_max_age_days', 3),
-            news_strategy_profile=getattr(cfg, 'news_strategy_profile', 'short'),
-        )
+        from market_data.search.search_service import create_search_service_from_config
+        return create_search_service_from_config()
 
     def search_news(self, symbol: str, stock_name: str = '', max_results: int = 10) -> List[NewsItem]:
         """增强搜索：使用 7 引擎搜索，支持中文/英文多源。需要至少配置一个搜索 API Key。"""

@@ -6,3 +6,12 @@ reports
 simulation_output
 *.log
 .DS_Store
+qlib-zh/DATA
+memory/cache
+memory/stocks
+memory/analysis
+memory/masters/records
+batch_results
+master-audit
+.venv
+venv

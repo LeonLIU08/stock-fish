@@ -129,38 +129,27 @@ if ! command -v docker &> /dev/null; then
 fi
 echo "  ✓ Docker $(docker --version | cut -d' ' -f3 | tr -d ',')"
 
-# 拉取 / 检查镜像
-echo "  拉取镜像..."
-IMAGES=("zhuhai123/stockfish-stockfish:latest" "zhuhai123/stockfish-mirofish:latest" "zhuhai123/qlib-rdagent:v1")
-ALL_PULLED=true
-for img in "${IMAGES[@]}"; do
-    if docker pull "$img" --quiet 2>/dev/null; then
-        echo "  ✓ $img"
-    else
-        LOCAL_NAME=$(echo "$img" | sed 's|zhuhai123/||')
-        if docker image inspect "$LOCAL_NAME" >/dev/null 2>&1; then
-            echo "  ✓ $LOCAL_NAME (本地缓存)"
-            docker tag "$LOCAL_NAME" "$img" 2>/dev/null || true
-        else
-            echo "  ⚠ 拉取 $img 失败，尝试本地构建..."
-            ALL_PULLED=false
-        fi
-    fi
-done
+# 本地构建 StockFish / MiroFish；Qlib 计算镜像仓库内无 Dockerfile，仍拉取 v1
+echo "  准备 Qlib 数据目录..."
+mkdir -p "${HOME}/.qlib" "${HOME}/github/qlib-zh/mlruns"
 
-if [ "$ALL_PULLED" = "false" ]; then
-    echo ""
-    echo "[2/3] 构建镜像..."
-    if [ "$MODE" = "--no-mirofish" ]; then
-        docker compose build stockfish
-    else
-        docker compose build
-    fi
-    echo "  ✓ 镜像构建完成"
+echo "  拉取 Qlib 运行镜像 zhuhai123/qlib-rdagent:v1 ..."
+if docker pull zhuhai123/qlib-rdagent:v1; then
+    echo "  ✓ zhuhai123/qlib-rdagent:v1"
 else
-    echo ""
-    echo "[2/3] 镜像已就绪"
+    echo "[ERROR] 无法拉取 Qlib 镜像 zhuhai123/qlib-rdagent:v1"
+    echo "        训练/推理/微调都依赖该镜像，请检查网络后重试"
+    exit 1
 fi
+
+echo ""
+echo "[2/3] 本地构建 StockFish / MiroFish ..."
+if [ "$MODE" = "--no-mirofish" ]; then
+    docker compose build stockfish
+else
+    docker compose build stockfish mirofish
+fi
+echo "  ✓ 镜像构建完成"
 
 echo ""
 echo "[3/3] 启动服务..."
@@ -200,7 +189,6 @@ echo "========================================"
 echo ""
 echo "  StockFish (分析+桥接): http://localhost:8000"
 if [ "$MODE" != "--no-mirofish" ]; then
-    echo "  MiroFish (模拟引擎):   http://localhost:3000"
     echo "  MiroFish API:          http://localhost:5001"
 fi
 echo ""

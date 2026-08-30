@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     MINIMAX_API_KEYS: Optional[str] = None
     SEARXNG_BASE_URL: Optional[str] = None
     SEARXNG_BASE_URLS: Optional[str] = None
-    SEARXNG_PUBLIC_INSTANCES_ENABLED: bool = True
+    SEARXNG_PUBLIC_INSTANCES_ENABLED: bool = False
 
     # ---- 实时行情优先级 ----
     REALTIME_SOURCE_PRIORITY: str = "tencent,akshare_sina,efinance,akshare_em"
@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     AKSHARE_SLEEP_MIN: float = 2.0
     AKSHARE_SLEEP_MAX: float = 5.0
     TUSHARE_RATE_LIMIT_PER_MINUTE: int = 80
+    # 港股 hk_daily / hk_basic / hk_mins 独立频次（次/分钟）。低积分档为 1，
+    # 升级 Tushare 积分后调高即可缩短等待；0 表示不单独限流。
+    TUSHARE_HK_RATE_LIMIT_PER_MINUTE: int = 1
     MAX_RETRIES: int = 3
     RETRY_BASE_DELAY: float = 1.0
     RETRY_MAX_DELAY: float = 30.0

@@ -125,6 +125,10 @@ class LegacyConfigAdapter:
         return getattr(self._settings, "TUSHARE_RATE_LIMIT_PER_MINUTE", 80)
 
     @property
+    def tushare_hk_rate_limit_per_minute(self) -> int:
+        return getattr(self._settings, "TUSHARE_HK_RATE_LIMIT_PER_MINUTE", 1)
+
+    @property
     def enable_realtime_quote(self) -> bool:
         return getattr(self._settings, "ENABLE_REALTIME_QUOTE", True)
 
@@ -276,7 +280,7 @@ class LegacyConfigAdapter:
 
     @property
     def searxng_public_instances_enabled(self) -> bool:
-        return getattr(self._settings, "SEARXNG_PUBLIC_INSTANCES_ENABLED", True)
+        return getattr(self._settings, "SEARXNG_PUBLIC_INSTANCES_ENABLED", False)
 
     # ---- Social sentiment ----
 

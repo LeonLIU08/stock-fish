@@ -80,9 +80,10 @@ wget-log*
 
 # Memory system (runtime data, regeneratable)
 memory/cache/data/
-memory/stocks/
-memory/analysis/
 memory/masters/records/
+# 每只股票的运行时数据目录，保留 Python 源码
+memory/stocks/*/
+memory/analysis/*/
 
 # Claude Code
 .claude/

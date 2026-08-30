@@ -463,7 +463,16 @@ class BaseFetcher(ABC):
                 f"rows={len(df)}, elapsed={elapsed:.2f}s"
             )
             return df
-            
+
+        except RateLimitError as e:
+            elapsed = time.time() - request_start
+            error_type, error_reason = summarize_exception(e)
+            logger.warning(
+                f"[{self.name}] {stock_code} 触发频率限制，切换备用源: "
+                f"范围={start_date} ~ {end_date}, error_type={error_type}, "
+                f"elapsed={elapsed:.2f}s, reason={error_reason}"
+            )
+            raise
         except Exception as e:
             elapsed = time.time() - request_start
             error_type, error_reason = summarize_exception(e)

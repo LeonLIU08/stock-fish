@@ -1708,12 +1708,15 @@ class SearXNGSearchProvider(BaseSearchProvider):
     PUBLIC_INSTANCES_CACHE_TTL_SECONDS = 3600
     PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS = 60
     PUBLIC_INSTANCES_POOL_LIMIT = 20
-    PUBLIC_INSTANCES_MAX_ATTEMPTS = 3
+    PUBLIC_INSTANCES_MAX_ATTEMPTS = 5
     PUBLIC_INSTANCES_TIMEOUT_SECONDS = 5
     SELF_HOSTED_TIMEOUT_SECONDS = 10
+    INSTANCE_SKIP_TTL_SECONDS = 1800
+    _JSON_BLOCKED_STATUS = {403, 418, 429, 451}
 
     _public_instances_cache: Optional[Tuple[float, List[str]]] = None
     _public_instances_stale_retry_after: float = 0.0
+    _skipped_instances: Dict[str, float] = {}
     _public_instances_lock = threading.Lock()
 
     def __init__(self, base_urls: Optional[List[str]] = None, *, use_public_instances: bool = False):
@@ -1734,6 +1737,7 @@ class SearXNGSearchProvider(BaseSearchProvider):
         with cls._public_instances_lock:
             cls._public_instances_cache = None
             cls._public_instances_stale_retry_after = 0.0
+            cls._skipped_instances = {}
 
     @staticmethod
     def _parse_http_error(response) -> str:
@@ -1755,6 +1759,39 @@ class SearXNGSearchProvider(BaseSearchProvider):
             raw_text = getattr(response, "text", "")
             body = raw_text if isinstance(raw_text, str) else ""
             return f"HTTP {response.status_code}: {body[:200]}"
+
+    @classmethod
+    def _format_http_error(cls, response) -> str:
+        """Human-readable HTTP errors; avoid dumping HTML bodies."""
+        code = getattr(response, "status_code", 0)
+        if code == 418:
+            return "HTTP 418（实例 WAF/反爬拒绝自动化 JSON 请求）"
+        if code == 403:
+            return "HTTP 403（未启用 JSON 输出，或实例/代理拒绝访问）"
+        if code == 429:
+            return "HTTP 429（实例限流）"
+        if code == 451:
+            return "HTTP 451（实例拒绝提供该内容）"
+        return cls._parse_http_error(response)
+
+    @classmethod
+    def _skip_instance(cls, base_url: str, *, ttl: Optional[float] = None) -> None:
+        until = time.time() + (ttl if ttl is not None else cls.INSTANCE_SKIP_TTL_SECONDS)
+        with cls._public_instances_lock:
+            cls._skipped_instances[base_url.rstrip("/")] = until
+
+    @classmethod
+    def _is_skipped(cls, base_url: str) -> bool:
+        url = base_url.rstrip("/")
+        now = time.time()
+        with cls._public_instances_lock:
+            until = cls._skipped_instances.get(url)
+            if until is None:
+                return False
+            if until <= now:
+                cls._skipped_instances.pop(url, None)
+                return False
+            return True
 
     @staticmethod
     def _time_range(days: int) -> str:
@@ -1901,7 +1938,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept": "application/json",
             }
             params = {
                 "q": query,
@@ -1914,12 +1952,9 @@ class SearXNGSearchProvider(BaseSearchProvider):
             response = request_get(search_url, headers=headers, params=params, timeout=timeout)
 
             if response.status_code != 200:
-                error_msg = self._parse_http_error(response)
-                if response.status_code == 403:
-                    error_msg = (
-                        f"{error_msg}；SearXNG 实例可能未启用 JSON 输出（请检查 settings.yml），"
-                        "或实例/代理拒绝了本次访问"
-                    )
+                error_msg = self._format_http_error(response)
+                if response.status_code in self._JSON_BLOCKED_STATUS:
+                    self._skip_instance(base)
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1928,9 +1963,19 @@ class SearXNGSearchProvider(BaseSearchProvider):
                     error_message=error_msg,
                 )
 
+            content_type = str(response.headers.get("content-type") or "").lower()
             try:
                 data = response.json()
             except Exception:
+                if "html" in content_type or (response.text or "").lstrip()[:15].lower().startswith("<!doctype"):
+                    self._skip_instance(base)
+                    return SearchResponse(
+                        query=query,
+                        results=[],
+                        provider=self.name,
+                        success=False,
+                        error_message="响应非 JSON（实例可能未启用 JSON 输出）",
+                    )
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -2033,14 +2078,19 @@ class SearXNGSearchProvider(BaseSearchProvider):
             timeout = self.SELF_HOSTED_TIMEOUT_SECONDS
             empty_error = "SearXNG 未配置可用实例"
         elif self._use_public_instances:
-            public_instances = self._get_public_instances()
+            all_public = self._get_public_instances()
+            public_instances = [url for url in all_public if not self._is_skipped(url)]
             candidates = self._rotate_candidates(
                 public_instances,
                 max_attempts=min(len(public_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
             )
             retry_enabled = False
             timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
-            empty_error = "未获取到可用的公共 SearXNG 实例"
+            empty_error = (
+                "未获取到可用的公共 SearXNG 实例"
+                if not all_public
+                else "公共 SearXNG 实例均不可用（多数未开放 JSON 或启用了反爬）"
+            )
         else:
             candidates = []
             retry_enabled = False
@@ -2170,7 +2220,7 @@ class SearchService:
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
-        searxng_public_instances_enabled: bool = True,
+        searxng_public_instances_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -3564,36 +3614,49 @@ class SearchService:
             provider_max_results,
         )
         
-        # 轮流使用不同的搜索引擎
+        # 轮流使用不同的搜索引擎；单个引擎失败时回退到下一个
         provider_index = 0
         
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
             available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
-            
-            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                    topic=dim['tavily_topic'],
+            response = None
+            provider = None
+            for offset in range(len(available_providers)):
+                provider = available_providers[(provider_index + offset) % len(available_providers)]
+                logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
+
+                if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                    response = provider.search(
+                        dim['query'],
+                        max_results=provider_max_results,
+                        days=search_days,
+                        topic=dim['tavily_topic'],
+                    )
+                else:
+                    response = provider.search(
+                        dim['query'],
+                        max_results=provider_max_results,
+                        days=search_days,
+                    )
+                if response.success:
+                    break
+                logger.warning(
+                    "[情报搜索] %s: %s 失败 - %s",
+                    dim['desc'],
+                    provider.name,
+                    response.error_message,
                 )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                )
+
+            provider_index += 1
+            if response is None or provider is None:
+                break
+
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
                     response,
@@ -3624,8 +3687,6 @@ class SearchService:
                     len(response.results),
                     len(filtered_response.results),
                 )
-            else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
             
             # 短暂延迟避免请求过快
             time.sleep(0.5)
@@ -3902,6 +3963,26 @@ _search_service: Optional[SearchService] = None
 _search_service_lock = threading.Lock()
 
 
+def create_search_service_from_config(config=None) -> SearchService:
+    """Build a SearchService from the current app config."""
+    if config is None:
+        from market_data.compat import get_config
+        config = get_config()
+
+    return SearchService(
+        bocha_keys=config.bocha_api_keys or None,
+        tavily_keys=config.tavily_api_keys or None,
+        anspire_keys=config.anspire_api_keys or None,
+        brave_keys=config.brave_api_keys or None,
+        serpapi_keys=config.serpapi_keys or None,
+        minimax_keys=config.minimax_api_keys or None,
+        searxng_base_urls=config.searxng_base_urls or None,
+        searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+        news_max_age_days=getattr(config, "news_max_age_days", 3),
+        news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+    )
+
+
 def get_search_service() -> SearchService:
     """获取搜索服务单例"""
     global _search_service
@@ -3909,21 +3990,7 @@ def get_search_service() -> SearchService:
     if _search_service is None:
         with _search_service_lock:
             if _search_service is None:
-                from market_data.compat import get_config
-                config = get_config()
-                
-                _search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    anspire_keys=config.anspire_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
-                    news_max_age_days=config.news_max_age_days,
-                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
-                )
+                _search_service = create_search_service_from_config()
     
     return _search_service
 

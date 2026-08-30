@@ -43,13 +43,8 @@ def _get_search_service():
         return _search_service_cache if _search_service_cache is not False else None
 
     try:
-        from market_data.search.search_service import SearchService
-        import os as _os
-        bocha_key = _os.environ.get('BOCHA_API_KEY') or getattr(settings, 'BOCHA_API_KEY', None)
-        bocha_keys = [k.strip() for k in bocha_key.split(',') if k.strip()] if bocha_key else None
-        tavily_key = _os.environ.get('TAVILY_API_KEY') or getattr(settings, 'TAVILY_API_KEY', None)
-        tavily_keys = [k.strip() for k in tavily_key.split(',') if k.strip()] if tavily_key else None
-        svc = SearchService(bocha_keys=bocha_keys, tavily_keys=tavily_keys)
+        from market_data.search.search_service import create_search_service_from_config
+        svc = create_search_service_from_config()
         _search_service_cache = svc
         _search_service_cache_time = now
         return svc
@@ -624,7 +619,10 @@ class StockAnalysisAgent:
     def _compute_risk_metrics(self, symbol: str, state) -> None:
         """从历史价格计算 VaR/最大回撤/年化波动率/Beta"""
         try:
-            hist = self.provider.get_historical(symbol, days=365)
+            hist = cache_manager.get_historical(
+                symbol, 365,
+                lambda: self.provider.get_historical(symbol, days=365),
+            )
             if not hist or len(hist) < 30:
                 return
 
