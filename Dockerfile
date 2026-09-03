@@ -5,10 +5,14 @@ WORKDIR /app
 ARG TARGETARCH
 
 # 基础依赖（gcc + Docker CLI 用于 qlib 推理容器编排）
+# matplotlib Agg 出图：freetype/png + 文泉驿微米黑（中文坐标/标题）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     curl \
     ca-certificates \
+    libfreetype6 \
+    libpng16-16 \
+    fonts-wqy-microhei \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Docker CLI（仅客户端，无需 daemon）。按构建架构选择静态包。
@@ -29,6 +33,9 @@ COPY sxsc_tushare /app/sxsc_tushare/
 RUN pip install /app/sxsc_tushare/ 2>/dev/null || echo "sxsc_tushare 安装跳过"
 
 COPY . .
+
+ENV MPLBACKEND=Agg
+ENV MPLCONFIGDIR=/tmp/matplotlib
 
 EXPOSE 8000
 

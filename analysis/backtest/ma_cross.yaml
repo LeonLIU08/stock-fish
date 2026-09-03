@@ -1,0 +1,75 @@
+# 策略回测配置（均线金叉示例）
+# 运行: python scripts/run_backtest.py
+# 覆盖: python scripts/run_backtest.py --config analysis/backtest/ma_cross.yaml --interval 5m
+
+universe:
+  # 每只股票独立账户、独立核算
+  independent: true
+  symbols:
+    - code: "00700"
+      name: "腾讯控股"
+      lot_size: 100
+    - code: "09988"
+      name: "阿里巴巴"
+      lot_size: 100
+    - code: "06869"
+      name: "长飞光纤"
+      lot_size: 500
+
+window:
+  # 留空则 end=今天, start=end 往前 lookback_years 年
+  start: null
+  end: null
+  lookback_years: 1
+  timezone: "Asia/Hong_Kong"
+
+capital:
+  per_symbol: 300000
+
+bars:
+  # 1m / 5m / 15m / 60m / 1d
+  interval: "1d"
+
+strategy:
+  name: ma_cross
+  long_only: true
+  max_trades_per_day: 2
+  signal_on: close          # 当前仅支持收盘判定
+  fill_on: next_open        # 当前仅支持次根开盘成交
+  position_mode: all_in     # all_in | fraction（fraction 时读取 signal_size）
+  params:
+    # 可增删方案，fast 必须 < slow
+    schemes:
+      ma5_ma10: [5, 10]
+      ma5_ma20: [5, 20]
+      ma10_ma20: [10, 20]
+  # 实际要跑的参数方案；空列表表示全部
+  variants:
+    - ma5_ma10
+    - ma5_ma20
+    - ma10_ma20
+
+costs:
+  commission_rate: 0.0003   # 佣金，双边
+  stamp_duty_rate: 0.001    # 印花税，双边
+  lot_size: 1               # 未单独配置标的时的默认最小买卖单位
+
+benchmarks:
+  hsi:
+    name: "恒生指数"
+    yahoo: "^HSI"
+    fallbacks: ["HSI.HI"]
+  hstech:
+    name: "恒生科技指数"
+    yahoo: "^HSTECH"
+    fallbacks: ["3033.HK"]
+
+evaluation:
+  # 样本外起点；留空则按 oos_ratio 从区间末尾切
+  oos_start: null
+  oos_ratio: 0.3
+  rolling_window_days: 252   # 滚动 12 个月（交易日）
+  extreme_days: 5
+
+output:
+  dir: "backtest_results"

@@ -10,6 +10,7 @@ services:
       - .env
     environment:
       - OASIS_DEBUG=${OASIS_DEBUG:-false}
+      - MPLBACKEND=Agg
       # Docker-in-Docker: 宿主机路径传给内部 docker run -v 使用
       - QLIB_HOST_PROJECT_ROOT=${PWD}/qlib-zh
       - QLIB_HOST_DATA_DIR=${HOME}/.qlib

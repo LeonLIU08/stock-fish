@@ -21,6 +21,10 @@ qlib-zh/models/
 # 批量分析缓存
 batch_results/
 
+# 规则策略回测输出与 K 线缓存
+backtest_results/
+data/backtest_cache/
+
 # 虚拟环境
 venv/
 .venv/
@@ -37,6 +41,9 @@ env/
 reports/
 simulation_output/
 *.dist-info/
+
+# 舆情历史缓存（按股票持久化，可本地再生）
+data/sentiment_history/
 
 # 系统文件
 .DS_Store

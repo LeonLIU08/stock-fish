@@ -718,6 +718,131 @@ class LongbridgeFetcher(BaseFetcher):
 
         return pd.DataFrame(rows)
 
+    def fetch_history_bars(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+        """Fetch OHLCV bars at daily or minute granularity.
+
+        Longbridge caps each request at 1000 candles, so minute history is
+        pulled in date chunks and concatenated.
+
+        Returns a DataFrame with columns:
+        datetime, open, high, low, close, volume, amount
+        Datetimes are timezone-aware Asia/Hong_Kong.
+        """
+        if not self.is_available_for_request("daily_data"):
+            raise RuntimeError("Longbridge temporarily unavailable for history bars")
+
+        symbol = _to_longbridge_symbol(stock_code)
+        if symbol is None:
+            raise ValueError(f"Cannot convert {stock_code} to Longbridge symbol")
+
+        ctx = self._get_ctx()
+        if ctx is None:
+            raise RuntimeError("Longbridge QuoteContext not available")
+
+        from longbridge.openapi import AdjustType
+
+        period = self._interval_to_period(interval)
+        start_dt = datetime.strptime(start_date[:10], "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
+        if end_dt < start_dt:
+            raise ValueError(f"end_date {end_date} is before start_date {start_date}")
+
+        chunk_days = {
+            "1m": 2,
+            "5m": 10,
+            "15m": 30,
+            "60m": 90,
+            "1d": 400,
+        }.get(interval, 2)
+
+        frames: list[pd.DataFrame] = []
+        cursor = start_dt
+        chunk_index = 0
+        while cursor <= end_dt:
+            chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_dt)
+            chunk_index += 1
+            try:
+                candles = ctx.history_candlesticks_by_date(
+                    symbol,
+                    period,
+                    AdjustType.ForwardAdjust,
+                    cursor,
+                    chunk_end,
+                )
+            except Exception as e:
+                if self._is_connection_error(e):
+                    self._mark_connection_cooldown(e)
+                raise
+
+            if candles:
+                frames.append(self._candles_to_bar_frame(candles))
+                logger.info(
+                    "[Longbridge] %s %s 分片 %s: %s ~ %s, bars=%s",
+                    symbol,
+                    interval,
+                    chunk_index,
+                    cursor.isoformat(),
+                    chunk_end.isoformat(),
+                    len(candles),
+                )
+            if interval != "1d":
+                time.sleep(0.05)
+            cursor = chunk_end + timedelta(days=1)
+
+        if not frames:
+            return pd.DataFrame(
+                columns=["datetime", "open", "high", "low", "close", "volume", "amount"]
+            )
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime")
+        df = df.reset_index(drop=True)
+        return df
+
+    @staticmethod
+    def _interval_to_period(interval: str):
+        from longbridge.openapi import Period
+
+        mapping = {
+            "1m": "Min_1",
+            "5m": "Min_5",
+            "15m": "Min_15",
+            "60m": "Min_60",
+            "1d": "Day",
+        }
+        attr = mapping.get(interval)
+        if not attr or not hasattr(Period, attr):
+            raise ValueError(f"Longbridge 不支持 interval={interval}")
+        return getattr(Period, attr)
+
+    @staticmethod
+    def _candles_to_bar_frame(candles) -> pd.DataFrame:
+        rows = []
+        for c in candles:
+            ts = getattr(c, "timestamp", None)
+            if ts is None:
+                continue
+            t = pd.Timestamp(ts)
+            if t.tzinfo is None:
+                t = t.tz_localize("UTC")
+            t = t.tz_convert("Asia/Hong_Kong")
+            rows.append({
+                "datetime": t,
+                "open": safe_float(getattr(c, "open", None)),
+                "high": safe_float(getattr(c, "high", None)),
+                "low": safe_float(getattr(c, "low", None)),
+                "close": safe_float(getattr(c, "close", None)),
+                "volume": int(getattr(c, "volume", 0) or 0),
+                "amount": safe_float(getattr(c, "turnover", None)) or 0.0,
+            })
+        return pd.DataFrame(rows)
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """Normalize column names to standard format."""
         if df.empty:
