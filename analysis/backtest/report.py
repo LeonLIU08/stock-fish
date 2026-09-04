@@ -124,6 +124,10 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
             f"- {spec.get('name', key)} (`{key}`): 收益 {_pct(b.get('buy_hold_return'))}"
             f"，数据 {b.get('coverage', 'n/a')}，来源 `{b.get('source', 'n/a')}`"
         )
+    lines.append(
+        "- 均匀定投（每只股票独立）：起点收盘价可买手数 N，间隔 = 交易日数 / N，"
+        "每隔该间隔买入 1 手（开盘成交，含佣金/印花税，剩余现金留在账户）"
+    )
 
     lines += ["", "## 分股成绩（成本后 · 全样本）", ""]
     bench_keys = list((config.benchmarks or {}).keys())
@@ -131,9 +135,9 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
     lines.append(
         "| 股票 | 参数方案 | 策略收益 | 年化 | 最大回撤 | 夏普 | 交易次数 | 胜率 |"
         + extra_headers
-        + " 自身买入持有 |"
+        + " 自身买入持有 | 均匀定投 | 相对定投超额 |"
     )
-    lines.append("|" + "---|" * (8 + len(bench_keys) + 1))
+    lines.append("|" + "---|" * (8 + len(bench_keys) + 3))
 
     for row in payload.get("results", []):
         m = row.get("metrics", {})
@@ -145,7 +149,8 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
             f"{_pct(m.get('annualized_return'))} | {_pct(m.get('max_drawdown'))} | "
             f"{_num(m.get('sharpe'), 2)} | {m.get('n_trades', 0)} | "
             f"{_pct(m.get('win_rate')) if m.get('win_rate') is not None else 'n/a'} |"
-            f"{extras} {_pct(m.get('buy_hold_return'))} |"
+            f"{extras} {_pct(m.get('buy_hold_return'))} | {_pct(m.get('dca_return'))} | "
+            f"{_pct(m.get('excess_vs_dca'))} |"
         )
 
     for row in payload.get("results", []):
@@ -160,6 +165,13 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
             f"现金 {row.get('metrics', {}).get('final_cash')}  "
             f"持仓 {row.get('metrics', {}).get('final_shares')} 股",
             f"- 累计费用: {row.get('metrics', {}).get('cumulative_fees')}",
+            f"- 均匀定投: 起点价 {row.get('metrics', {}).get('dca_start_price')}，"
+            f"可买 {row.get('metrics', {}).get('dca_n_lots')} 手，"
+            f"{row.get('metrics', {}).get('dca_n_trading_days')} 个交易日 / N = 间隔 "
+            f"{row.get('metrics', {}).get('dca_interval')}，"
+            f"实买 {row.get('metrics', {}).get('dca_n_lots_bought')} 手 / "
+            f"{row.get('metrics', {}).get('dca_n_buy_days')} 天，"
+            f"收益 {_pct(row.get('metrics', {}).get('dca_return'))}",
             f"- 图表: `{row.get('report_html', '')}`",
             "",
         ]
@@ -298,6 +310,17 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
 
     gaps = "".join(f"<li>{html.escape(g)}</li>" for g in (row.get("gaps") or []))
     variant_label = row.get("variant_label") or row.get("variant") or row.get("scheme", "")
+    m = row.get("metrics") or {}
+    dca_interval = m.get("dca_interval")
+    dca_interval_s = "n/a" if dca_interval is None else str(dca_interval)
+    dca_note = (
+        f"均匀定投：起点价 {html.escape(str(m.get('dca_start_price', 'n/a')))}，"
+        f"可买 {html.escape(str(m.get('dca_n_lots', 'n/a')))} 手，"
+        f"{html.escape(str(m.get('dca_n_trading_days', 'n/a')))} 个交易日 / N = 间隔 {html.escape(dca_interval_s)}，"
+        f"实买 {html.escape(str(m.get('dca_n_lots_bought', 'n/a')))} 手 / "
+        f"{html.escape(str(m.get('dca_n_buy_days', 'n/a')))} 天，"
+        f"收益 {_pct(m.get('dca_return'))}，相对定投超额 {_pct(m.get('excess_vs_dca'))}"
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -322,6 +345,7 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
   <div class="card">
     <h2>关键指标（成本前/成本后，样本内/样本外）</h2>
     <p class="muted">样本内截止 {html.escape(str(split.get('is_end')))}，样本外起点 {html.escape(str(split.get('oos_start')))}</p>
+    <p class="muted">{dca_note}</p>
     <table>
       <thead><tr><th>样本</th><th>成本</th><th>收益</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>成交次数</th></tr></thead>
       <tbody>{kpi_html}</tbody>

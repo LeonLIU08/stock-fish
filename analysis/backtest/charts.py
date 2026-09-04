@@ -237,7 +237,7 @@ def plot_nav_and_underwater(
     ax = axes[0]
     if not strat_nav.empty:
         ax.plot(strat_nav.index, strat_nav.values, color="#f87171", lw=1.6, label="策略(成本后)")
-    colors = ["#60a5fa", "#fbbf24", "#34d399", "#c084fc"]
+    colors = ["#60a5fa", "#fbbf24", "#34d399", "#c084fc", "#fb7185"]
     aligned_benches = {}
     for i, (name, series) in enumerate(benches.items()):
         if series is None or series.empty:

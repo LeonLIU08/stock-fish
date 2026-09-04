@@ -211,6 +211,81 @@ class AnalyticsTests(unittest.TestCase):
         self.assertGreater(split["full_pre_cost"]["total_return"], split["full_post_cost"]["total_return"])
 
 
+class EvenDcaTests(unittest.TestCase):
+    def test_schedule_constant_price(self):
+        from analysis.backtest.analytics import simulate_even_dca
+
+        # 10 个交易日、价格恒为 10；本金 5000、每手 100 股 → 可买 5 手，间隔 = 2
+        closes = [10.0] * 10
+        df = _bars(closes)
+        cfg = BacktestConfig(
+            symbols=["TEST"],
+            symbol_lot_sizes={"TEST": 100},
+            interval="1d",
+            start=date(2025, 1, 1),
+            end=date(2025, 6, 1),
+            capital=5_000,
+            cost=CostModel(commission_rate=0.0, stamp_duty_rate=0.0, lot_size=100),
+        )
+        result = simulate_even_dca(df, cfg, "TEST")
+        self.assertEqual(result.n_lots, 5)
+        self.assertEqual(result.n_trading_days, 10)
+        self.assertEqual(result.interval, 2.0)
+        self.assertEqual(result.n_lots_bought, 5)
+        self.assertEqual(result.n_buy_days, 5)
+        self.assertEqual(result.final_shares, 500)
+        self.assertAlmostEqual(result.final_cash, 0.0, places=6)
+        self.assertAlmostEqual(result.total_return, 0.0, places=6)
+        shares = result.equity["shares"].tolist()
+        # 买点在第 0/2/4/6/8 根（间隔 2）
+        self.assertEqual(shares, [100, 100, 200, 200, 300, 300, 400, 400, 500, 500])
+
+    def test_rising_price_lags_buy_hold(self):
+        from analysis.backtest.analytics import simulate_even_dca
+        from analysis.backtest.metrics import _buy_hold_return
+
+        closes = [10.0 + 0.05 * i for i in range(10)]
+        df = _bars(closes)
+        cfg = BacktestConfig(
+            symbols=["TEST"],
+            symbol_lot_sizes={"TEST": 100},
+            interval="1d",
+            start=date(2025, 1, 1),
+            end=date(2025, 6, 1),
+            capital=3_500,
+            cost=CostModel(commission_rate=0.0, stamp_duty_rate=0.0, lot_size=100),
+        )
+        result = simulate_even_dca(df, cfg, "TEST")
+        # 起点收盘 10，每手 1000，N=3；间隔 10/3；买点 int(i * 10/3) = 0, 3, 6
+        self.assertEqual(result.n_lots, 3)
+        self.assertAlmostEqual(result.interval, 10 / 3)
+        self.assertEqual(result.n_lots_bought, 3)
+        self.assertEqual(result.final_shares, 300)
+        bh = _buy_hold_return(df, df)
+        self.assertIsNotNone(bh)
+        self.assertLess(result.total_return, bh)
+
+    def test_cannot_afford_one_lot(self):
+        from analysis.backtest.analytics import simulate_even_dca
+
+        df = _bars([100.0] * 8)
+        cfg = BacktestConfig(
+            symbols=["TEST"],
+            symbol_lot_sizes={"TEST": 100},
+            interval="1d",
+            start=date(2025, 1, 1),
+            end=date(2025, 6, 1),
+            capital=1_000,
+            cost=CostModel(commission_rate=0.0, stamp_duty_rate=0.0, lot_size=100),
+        )
+        result = simulate_even_dca(df, cfg, "TEST")
+        self.assertEqual(result.n_lots, 0)
+        self.assertIsNone(result.interval)
+        self.assertEqual(result.n_lots_bought, 0)
+        self.assertEqual(result.final_shares, 0)
+        self.assertAlmostEqual(result.total_return, 0.0, places=6)
+
+
 class ChartSmokeTests(unittest.TestCase):
     def test_charts_write_png(self):
         import tempfile

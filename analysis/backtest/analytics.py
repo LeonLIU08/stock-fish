@@ -1,6 +1,7 @@
 """Derived series for backtest reports: NAV, drawdown, heatmap, rolling, extremes."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -56,6 +57,156 @@ def nav_from_price(price: pd.Series, start_value: float = 1.0) -> pd.Series:
     if price.empty or float(price.iloc[0]) == 0:
         return pd.Series(dtype=float)
     return start_value * price / float(price.iloc[0])
+
+
+def nav_from_capital(equity: pd.Series, capital: float, start_value: float = 1.0) -> pd.Series:
+    """Scale account equity by initial capital so leftover cash is visible."""
+    if equity is None or equity.empty or not capital:
+        return pd.Series(dtype=float)
+    return start_value * equity.astype(float) / float(capital)
+
+
+@dataclass
+class DcaResult:
+    """Evenly spaced 1-lot buys over the evaluation window."""
+
+    equity: pd.DataFrame = field(default_factory=pd.DataFrame)
+    n_lots: int = 0
+    n_trading_days: int = 0
+    interval: Optional[float] = None
+    n_lots_bought: int = 0
+    n_buy_days: int = 0
+    start_price: float = 0.0
+    lot_size: int = 1
+    total_return: float = 0.0
+    final_equity: float = 0.0
+    final_cash: float = 0.0
+    final_shares: int = 0
+
+
+def _session_daily_ohlc(bars: pd.DataFrame, tz: str = _HK_TZ) -> pd.DataFrame:
+    """One row per exchange session: first open, last close, last timestamp."""
+    if bars is None or bars.empty:
+        return pd.DataFrame(columns=["open", "close", "datetime"])
+    work = bars.loc[bars["open"].notna() & bars["close"].notna(), ["datetime", "open", "close"]].copy()
+    if work.empty:
+        return pd.DataFrame(columns=["open", "close", "datetime"])
+    work["datetime"] = to_hk_index(work["datetime"])
+    work["_day"] = work["datetime"].dt.normalize()
+    return work.groupby("_day", sort=True).agg(
+        open=("open", "first"),
+        close=("close", "last"),
+        datetime=("datetime", "last"),
+    )
+
+
+def _dca_buy_lots_by_day(n_lots: int, n_days: int) -> List[int]:
+    """Spread N 1-lot buys from day 0 at step = n_days / N."""
+    lots = [0] * n_days
+    if n_lots <= 0 or n_days <= 0:
+        return lots
+    interval = n_days / n_lots
+    for i in range(n_lots):
+        idx = int(i * interval)
+        if idx >= n_days:
+            idx = n_days - 1
+        lots[idx] += 1
+    return lots
+
+
+def simulate_even_dca(
+    bars: pd.DataFrame,
+    config: BacktestConfig,
+    symbol: str,
+) -> DcaResult:
+    """Dollar-cost average 1 lot every (trading_days / N) sessions.
+
+    N is how many lots ``capital`` can buy at the first session's close
+    (lot size + the same commission / stamp model as the strategy).
+    Buys fill at that session's open; leftover cash stays in the account.
+    """
+    capital = float(config.capital)
+    lot_size = int(config.lot_size_for(symbol))
+    empty = DcaResult(lot_size=lot_size, final_equity=capital, final_cash=capital)
+    daily = _session_daily_ohlc(bars, config.timezone or _HK_TZ)
+    if daily.empty:
+        return empty
+
+    start_price = float(daily["close"].iloc[0])
+    n_days = len(daily)
+    empty = DcaResult(
+        n_trading_days=n_days,
+        start_price=start_price,
+        lot_size=lot_size,
+        final_equity=capital,
+        final_cash=capital,
+    )
+    if start_price <= 0:
+        return empty
+
+    cost = config.cost
+    max_shares = cost.max_shares(capital, start_price, lot_size=lot_size)
+    n_lots = (max_shares // lot_size) if lot_size > 0 else 0
+    interval = (n_days / n_lots) if n_lots > 0 else None
+    buy_lots = _dca_buy_lots_by_day(n_lots, n_days)
+
+    cash = capital
+    cash_gross = capital
+    shares = 0
+    n_lots_bought = 0
+    n_buy_days = 0
+    rows: List[Dict[str, Any]] = []
+
+    for i, (_, row) in enumerate(daily.iterrows()):
+        o = float(row["open"])
+        c = float(row["close"])
+        fee_bar = 0.0
+        turnover = 0.0
+        lots = buy_lots[i] if i < len(buy_lots) else 0
+        if lots > 0 and o > 0 and cash > 0:
+            qty = min(lots * lot_size, cost.max_shares(cash, o, lot_size=lot_size))
+            if lot_size > 1:
+                qty = (qty // lot_size) * lot_size
+            if qty > 0:
+                notional = qty * o
+                fee = cost.fee(notional)
+                cash -= notional + fee
+                cash_gross -= notional
+                shares += qty
+                fee_bar = fee
+                turnover = notional / capital if capital else 0.0
+                n_lots_bought += qty // lot_size
+                n_buy_days += 1
+        mv = shares * c
+        rows.append({
+            "datetime": row["datetime"],
+            "equity": cash + mv,
+            "equity_gross": cash_gross + mv,
+            "cash": cash,
+            "shares": shares,
+            "price": c,
+            "position": 1 if shares > 0 else 0,
+            "turnover": turnover,
+            "leverage": (mv / capital) if capital else 0.0,
+            "fee": fee_bar,
+        })
+
+    equity = pd.DataFrame(rows)
+    final_equity = float(equity["equity"].iloc[-1]) if not equity.empty else capital
+    return DcaResult(
+        equity=equity,
+        n_lots=int(n_lots),
+        n_trading_days=n_days,
+        interval=float(interval) if interval is not None else None,
+        n_lots_bought=int(n_lots_bought),
+        n_buy_days=int(n_buy_days),
+        start_price=start_price,
+        lot_size=lot_size,
+        total_return=_total_return(capital, final_equity),
+        final_equity=final_equity,
+        final_cash=float(cash),
+        final_shares=int(shares),
+    )
 
 
 def underwater(equity: pd.Series) -> pd.Series:

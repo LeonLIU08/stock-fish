@@ -20,7 +20,7 @@ window:
   # 留空则 end=今天, start=end 往前 lookback_years 年
   start: null
   end: null
-  lookback_years: 1
+  lookback_years: 0.25
   timezone: "Asia/Hong_Kong"
 
 capital:
@@ -63,6 +63,8 @@ benchmarks:
     name: "恒生科技指数"
     yahoo: "^HSTECH"
     fallbacks: ["3033.HK"]
+  # 另：每只股票自动生成「均匀定投」净值曲线（无需代码）
+  # 起点收盘价 + lot_size + 资金 → 可买手数 N；间隔 = 交易日数 / N；每隔该间隔买入 1 手（次日/当日开盘）
 
 evaluation:
   # 样本外起点；留空则按 oos_ratio 从区间末尾切

@@ -15,9 +15,11 @@ from analysis.backtest.analytics import (
     extreme_days,
     factor_exposures,
     monthly_return_table,
+    nav_from_capital,
     nav_from_price,
     rolling_stats,
     round_trips,
+    simulate_even_dca,
     split_cost_table,
 )
 from analysis.backtest.bars import BarLoader, coverage_note, slice_eval_window
@@ -111,6 +113,16 @@ def run_backtest(config: BacktestConfig) -> Dict:
                 list(config.benchmarks.keys()),
             )
             metrics["cumulative_fees"] = round(engine_result.cumulative_fees, 2)
+            dca = simulate_even_dca(eval_bars, config, symbol)
+            metrics["dca_return"] = round(dca.total_return, 6)
+            metrics["excess_vs_dca"] = round(metrics["total_return"] - dca.total_return, 6)
+            metrics["dca_n_lots"] = dca.n_lots
+            metrics["dca_interval"] = round(dca.interval, 4) if dca.interval is not None else None
+            metrics["dca_n_lots_bought"] = dca.n_lots_bought
+            metrics["dca_n_buy_days"] = dca.n_buy_days
+            metrics["dca_n_trading_days"] = dca.n_trading_days
+            metrics["dca_start_price"] = round(dca.start_price, 4)
+            metrics["dca_lot_size"] = dca.lot_size
             daily = daily_frame(engine_result.equity)
             split = split_cost_table(daily, engine_result.trades, config)
             trips = round_trips(engine_result.trades)
@@ -139,6 +151,11 @@ def run_backtest(config: BacktestConfig) -> Dict:
                     name = (config.benchmarks.get(key) or {}).get("name", key)
                     bench_navs[name] = nav_from_price(aligned.dropna())
                     bench_rets[key] = aligned.pct_change()
+                dca_daily = daily_frame(dca.equity) if dca.equity is not None and not dca.equity.empty else None
+                if dca_daily is not None and not dca_daily.empty and "equity" in dca_daily.columns:
+                    dca_aligned = dca_daily["equity"].reindex(daily.index).ffill()
+                    bench_navs["均匀定投"] = nav_from_capital(dca_aligned, config.capital)
+                    bench_rets["dca"] = dca_aligned.pct_change()
                 charts["nav"] = _safe_chart(plot_nav_and_underwater, strat_nav, bench_navs, case_dir)
                 heatmap = monthly_return_table(daily["ret_net"]) if "ret_net" in daily.columns else None
                 charts["heatmap"] = _safe_chart(plot_monthly_heatmap, heatmap, case_dir)
