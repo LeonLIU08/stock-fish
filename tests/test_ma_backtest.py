@@ -9,7 +9,7 @@ import pandas as pd
 
 from analysis.backtest import strategies as _builtin_strategies  # noqa: F401
 from analysis.backtest.analytics import daily_frame, monthly_return_table, split_cost_table
-from analysis.backtest.bars import to_yahoo_hk
+from analysis.backtest.bars import is_us_symbol, to_yahoo_hk, to_yahoo_symbol
 from analysis.backtest.config import DEFAULT_CONFIG_PATH, BacktestConfig, CostModel, load_backtest_config
 from analysis.backtest.engine import simulate
 from analysis.backtest.signals import SIGNAL_ACTION_COL, SignalAction, attach_signals
@@ -46,6 +46,16 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(to_yahoo_hk("06869"), "6869.HK")
         self.assertEqual(to_yahoo_hk("09988"), "9988.HK")
         self.assertEqual(to_yahoo_hk("HK00700"), "0700.HK")
+
+    def test_yahoo_us_codes(self):
+        self.assertTrue(is_us_symbol("NVDA"))
+        self.assertTrue(is_us_symbol("AAPL"))
+        self.assertTrue(is_us_symbol("GOOGL"))
+        self.assertTrue(is_us_symbol("TSLA"))
+        self.assertFalse(is_us_symbol("00700"))
+        self.assertEqual(to_yahoo_symbol("NVDA"), "NVDA")
+        self.assertEqual(to_yahoo_symbol("AAPL.US"), "AAPL")
+        self.assertEqual(to_yahoo_symbol("00700"), "0700.HK")
 
 
 class StrategyRegistryTests(unittest.TestCase):

@@ -41,7 +41,7 @@ DEFAULT_BENCHMARKS: Dict[str, Dict[str, Any]] = {
     },
     "hstech": {
         "name": "恒生科技指数",
-        "yahoo": "^HSTECH",
+        "yahoo": "HSTECH.HK",
         "fallbacks": ["3033.HK"],
     },
 }

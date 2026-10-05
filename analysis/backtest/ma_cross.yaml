@@ -15,16 +15,29 @@ universe:
     - code: "06869"
       name: "长飞光纤"
       lot_size: 500
+    - code: "NVDA"
+      name: "英伟达"
+      lot_size: 1
+    - code: "AAPL"
+      name: "苹果"
+      lot_size: 1
+    - code: "GOOGL"
+      name: "谷歌"
+      lot_size: 1
+    - code: "TSLA"
+      name: "特斯拉"
+      lot_size: 1
 
 window:
   # 留空则 end=今天, start=end 往前 lookback_years 年
   start: null
   end: null
-  lookback_years: 0.25
+  lookback_years: 1
   timezone: "Asia/Hong_Kong"
 
 capital:
   per_symbol: 300000
+  # total: 900000          # independent: false 时必填；缺了报错，不回退成 per_symbol 或 ×N
 
 bars:
   # 1m / 5m / 15m / 60m / 1d
@@ -61,7 +74,7 @@ benchmarks:
     fallbacks: ["HSI.HI"]
   hstech:
     name: "恒生科技指数"
-    yahoo: "^HSTECH"
+    yahoo: "HSTECH.HK"          # Yahoo 没有 ^HSTECH；指数代码是 HSTECH.HK
     fallbacks: ["3033.HK"]
   # 另：每只股票自动生成「均匀定投」净值曲线（无需代码）
   # 起点收盘价 + lot_size + 资金 → 可买手数 N；间隔 = 交易日数 / N；每隔该间隔买入 1 手（次日/当日开盘）

@@ -90,7 +90,12 @@
 
 ### □ 回测系统 (Backtesting Framework)
 
-选择股票池、历史区间，对比预测信号与实际涨跌幅，评估模型表现。
+规则回测（均线等）的开发计划、完成留底与勾选状态：
+
+- 路径：[`analysis/backtest/todo/`](analysis/backtest/todo/README.md)
+- 当前：001、002 已完成；003 组合账本未完成（事件循环已写入规格：pending / 已持仓闸门 / `capital.total` 必填）；004 策略 `size_order` 未完成（A 组未绿前不并行）
+
+另：用分析管道信号做 IC/IR 评估的旧设想仍列于下，与上面的规则回测不是同一条线。
 
 - `analysis/backtest/backtest_engine.py`
   - 输入：股票池（list of symbols）、时间区间、调仓周期

@@ -33,6 +33,14 @@ _YF_MAX_CALENDAR_DAYS = {
 }
 
 
+def is_us_symbol(symbol: str) -> bool:
+    """NVDA / AAPL / GOOGL / BRK.B / NVDA.US -> True; 港股数字代码 -> False."""
+    raw = (symbol or "").strip().upper()
+    if raw.endswith(".US"):
+        raw = raw[:-3]
+    return bool(re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", raw))
+
+
 def to_yahoo_hk(symbol: str) -> str:
     """00700 / HK00700 / 00700.HK -> 0700.HK"""
     raw = (symbol or "").strip().upper()
@@ -47,6 +55,20 @@ def to_yahoo_hk(symbol: str) -> str:
     if not digits:
         raise ValueError(f"无法解析港股代码: {symbol}")
     return f"{(digits.lstrip('0') or '0').zfill(4)}.HK"
+
+
+def to_yahoo_symbol(symbol: str) -> str:
+    """Map a config symbol to a Yahoo Finance ticker (HK or US)."""
+    raw = (symbol or "").strip().upper()
+    if not raw:
+        raise ValueError("股票代码为空")
+    if raw.startswith("^"):
+        return raw
+    if raw.endswith(".US"):
+        raw = raw[:-3]
+    if is_us_symbol(raw):
+        return raw
+    return to_yahoo_hk(symbol)
 
 
 def _ensure_hk_tz(series: pd.Series) -> pd.Series:
@@ -162,14 +184,21 @@ class BarLoader:
     ) -> Tuple[pd.DataFrame, str]:
         bars = warmup_bars if warmup_bars is not None else 20
         padded_start = config.start - timedelta(days=config.warmup_calendar_days(bars))
+        yahoo = to_yahoo_symbol(symbol)
+        fetchers = [
+            lambda: self._from_longbridge(symbol, padded_start, config.end, config.interval),
+            lambda: self._from_yahoo(yahoo, padded_start, config.end, config.interval),
+        ]
+        if not is_us_symbol(symbol):
+            fetchers.append(
+                lambda: self._from_akshare_hk(symbol, padded_start, config.end, config.interval)
+            )
+        fetchers.append(
+            lambda: self._from_manager_daily(symbol, padded_start, config.end, config.interval)
+        )
         return self._load(
             cache_key=f"{symbol}_{config.interval}_{padded_start}_{config.end}",
-            fetchers=(
-                lambda: self._from_longbridge(symbol, padded_start, config.end, config.interval),
-                lambda: self._from_yahoo(to_yahoo_hk(symbol), padded_start, config.end, config.interval),
-                lambda: self._from_akshare_hk(symbol, padded_start, config.end, config.interval),
-                lambda: self._from_manager_daily(symbol, padded_start, config.end, config.interval),
-            ),
+            fetchers=fetchers,
             start=padded_start,
             end=config.end,
         )

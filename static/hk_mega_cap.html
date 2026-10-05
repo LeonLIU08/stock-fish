@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>港股正股 · 总市值 ≥ 1000 亿</title>
+  <style>
+    :root {
+      --bg: #0c1219;
+      --bg-2: #111a24;
+      --card: #152436;
+      --line: #1e3a5f;
+      --text: #e8eef6;
+      --muted: #7a93b0;
+      --soft: #8ab4f8;
+      --red: #ff4757;
+      --red-2: #ff6b4a;
+      --gold: #e8c38a;
+      --grid: rgba(138, 180, 248, 0.08);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: var(--bg); color: var(--text); }
+    body {
+      font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", -apple-system, sans-serif;
+      min-height: 100vh;
+      letter-spacing: 0.01em;
+    }
+    .page {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 36px 28px 72px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 24px;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 22px;
+    }
+    .kicker {
+      color: var(--gold);
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 620;
+      line-height: 1.25;
+      background: linear-gradient(135deg, #ff8a7a, #ff4757 42%, #e8c38a);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+      text-align: right;
+      max-width: 340px;
+    }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .kpi {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 18px;
+    }
+    .kpi .label { color: var(--muted); font-size: 11px; letter-spacing: 0.08em; margin-bottom: 8px; }
+    .kpi .value { font-size: 24px; font-weight: 640; font-variant-numeric: tabular-nums; }
+    .kpi .hint { color: var(--soft); font-size: 12px; margin-top: 6px; }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 18px 10px;
+      margin-bottom: 18px;
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .panel-title { font-size: 15px; font-weight: 600; color: var(--soft); }
+    .panel-note { color: var(--muted); font-size: 12px; }
+    .seg {
+      display: flex;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px;
+      gap: 2px;
+    }
+    .seg button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+    .seg button.active {
+      background: linear-gradient(135deg, #ff4757, #ff6348);
+      color: #fff;
+    }
+    .chart-frame {
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      height: 500px;
+      margin-top: 8px;
+    }
+    .y-title {
+      position: absolute;
+      top: -18px;
+      right: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+    .y-axis {
+      position: relative;
+      height: 360px;
+      margin-top: 8px;
+    }
+    .y-tick {
+      position: absolute;
+      right: 10px;
+      transform: translateY(-50%);
+      font-size: 11px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .plot {
+      position: relative;
+      overflow-x: auto;
+      overflow-y: hidden;
+      height: 500px;
+      border-left: 1px solid var(--line);
+    }
+    .plot::-webkit-scrollbar { height: 8px; }
+    .plot::-webkit-scrollbar-thumb { background: #2a4a6e; border-radius: 99px; }
+    .scroll { position: relative; min-height: 500px; padding: 0 18px 0 6px; }
+    .grid-line {
+      position: absolute;
+      left: 0; right: 0;
+      height: 1px;
+      background: var(--grid);
+      pointer-events: none;
+    }
+    .ref-line {
+      position: absolute;
+      left: 0; right: 0;
+      height: 0;
+      border-top: 1px dashed rgba(232, 195, 138, 0.45);
+      pointer-events: none;
+      z-index: 2;
+    }
+    .ref-label {
+      position: absolute;
+      right: 8px;
+      transform: translateY(-120%);
+      font-size: 10px;
+      color: var(--gold);
+      letter-spacing: 0.04em;
+    }
+    .bars {
+      position: relative;
+      display: flex;
+      align-items: flex-end;
+      height: 360px;
+      margin-top: 8px;
+    }
+    .col {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      height: 360px;
+      cursor: pointer;
+    }
+    .col:hover .fill { filter: brightness(1.16); }
+    .fill {
+      width: 62%;
+      min-width: 6px;
+      border-radius: 4px 4px 1px 1px;
+      background: linear-gradient(180deg, #ff7a6a 0%, #ff4757 68%, #c81e33 100%);
+      box-shadow: 0 0 18px rgba(255, 71, 87, 0.12);
+    }
+    .col.mid .fill {
+      background: linear-gradient(180deg, #ff9a6e 0%, #e4573d 100%);
+      box-shadow: none;
+      opacity: 0.92;
+    }
+    .col.tail .fill {
+      background: linear-gradient(180deg, #d9b48a 0%, #a57c4e 100%);
+      box-shadow: none;
+      opacity: 0.82;
+    }
+    .xlabs {
+      display: flex;
+      height: 124px;
+      padding-top: 8px;
+      overflow: visible;
+    }
+    .x-lab {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+      transform: rotate(90deg);
+      transform-origin: 10px 8px;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+    .tooltip {
+      position: fixed;
+      z-index: 20;
+      min-width: 220px;
+      pointer-events: none;
+      background: #0f1923;
+      border: 1px solid #ff4757;
+      border-radius: 10px;
+      padding: 12px 14px;
+      box-shadow: 0 16px 40px rgba(0,0,0,.4);
+      display: none;
+    }
+    .tooltip .t-name { font-size: 15px; font-weight: 650; margin-bottom: 2px; }
+    .tooltip .t-code { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .tooltip .t-row { display: flex; justify-content: space-between; gap: 18px; font-size: 12px; margin-top: 4px; }
+    .tooltip .t-row span:first-child { color: var(--muted); }
+    .table-wrap { overflow: auto; max-height: 540px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      position: sticky; top: 0;
+      background: #1a2d42;
+      color: var(--muted);
+      font-weight: 500;
+      text-align: left;
+      padding: 10px 8px;
+      font-size: 11px;
+      letter-spacing: 0.06em;
+    }
+    td { padding: 9px 8px; border-top: 1px solid rgba(30,58,95,.7); font-variant-numeric: tabular-nums; }
+    tbody tr:hover { background: rgba(255,71,87,0.06); }
+    .rank { color: var(--muted); width: 44px; }
+    .mini {
+      height: 6px;
+      border-radius: 99px;
+      background: rgba(255,71,87,.18);
+      overflow: hidden;
+      width: 88px;
+    }
+    .mini i {
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, #ff6348, #ff4757);
+      border-radius: 99px;
+    }
+    .tools {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .tools input {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 12px;
+      outline: none;
+      width: 200px;
+    }
+    .tools input:focus { border-color: var(--red); }
+    footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.7;
+    }
+    @media (max-width: 860px) {
+      .kpis { grid-template-columns: 1fr 1fr; }
+      header { flex-direction: column; align-items: flex-start; }
+      .meta { text-align: left; }
+      h1 { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <div class="kicker">Longbridge · Hong Kong Equities</div>
+        <h1>港股正股 · 总市值超过 1000 亿</h1>
+      </div>
+      <div class="meta">
+        数据来源 Longbridge 选股器 · 2026-09-04<br>
+        仅主板 / 创业板正股，已剔除人民币柜台、ETF、REIT、DRS<br>
+        市值为总股本 × 港币现价，A+H 为公司总市值
+      </div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">市值分布</div>
+          <div class="panel-note">Y 轴从 0 起，单位万亿港元。头部是悬崖，1000 亿门槛贴近底轴 —— 这是真实量级，不是截断。</div>
+        </div>
+        <div class="seg" id="seg">
+          <button data-n="20" class="active">前 20</button>
+          <button data-n="40">前 40</button>
+          <button data-n="0">全部 136</button>
+        </div>
+      </div>
+      <div class="chart-frame">
+        <div class="y-axis" id="yAxis">
+          <div class="y-title">市值（万亿港元）</div>
+        </div>
+        <div class="plot" id="plot">
+          <div class="scroll" id="scroll">
+            <div class="bars" id="bars"></div>
+            <div class="xlabs" id="xlabs"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="panel-title">明细</div>
+        <div class="tools">
+          <input id="q" type="search" placeholder="搜索代码 / 名称 / 行业">
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>代码</th><th>名称</th><th>市值</th><th></th><th>现价</th><th>行业</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      太古 A / B 为同一集团不同股本，市值不可加总。名称中的 -W / -SW 为不同投票权正股，已保留。
+      人民币柜台（8xxxx）与正股重复计市值，已排除。
+    </footer>
+  </div>
+  <div class="tooltip" id="tip"></div>
+
+  <script>
+    const DATA = [
+      [1,"0700.HK","腾讯控股",40563.65,445.6,"互联网内容与信息"],
+      [2,"0005.HK","汇丰控股",28737.04,167.4,"多元化银行"],
+      [3,"1398.HK","工商银行",27425.46,7.695,"多元化银行"],
+      [4,"3750.HK","宁德时代",26673.33,576.5,"电气部件和设备"],
+      [5,"0939.HK","建设银行",25584.52,9.78,"多元化银行"],
+      [6,"1288.HK","农业银行",22801.39,6.515,"多元化银行"],
+      [7,"9988.HK","阿里巴巴-W",22151.88,111.4,"零售商"],
+      [8,"3988.HK","中国银行",19671.07,6.105,"多元化银行"],
+      [9,"0857.HK","中国石油股份",18540.03,10.13,"综合油气公司"],
+      [10,"0941.HK","中国移动",17374.44,80.1,"电信服务"],
+      [11,"3968.HK","招商银行",13303.47,52.75,"多元化银行"],
+      [12,"3308.HK","中际旭创",11896.89,1010,"通信设备"],
+      [13,"0883.HK","中国海洋石油",11863.48,24.96,"油气勘探与生产"],
+      [14,"6288.HK","迅销",11201.38,35.2,"服装零售商"],
+      [15,"2318.HK","中国平安",10430,57.6,"人寿和健康保险"],
+      [16,"1088.HK","中国神华",9877.37,45.54,"煤炭和消耗性燃料"],
+      [17,"2899.HK","紫金矿业",9652.43,36.3,"多元化金属与采矿"],
+      [18,"2628.HK","中国人寿",8733.79,30.9,"人寿和健康保险"],
+      [19,"1299.HK","友邦保险",8111.77,78.4,"人寿和健康保险"],
+      [20,"1211.HK","比亚迪股份",7895.49,86.6,"汽车制造商"],
+      [21,"0300.HK","美的集团",7720.58,101.2,"家用电器"],
+      [22,"1810.HK","小米集团-W",7310.46,28.38,"硬件、存储及外设"],
+      [23,"3328.HK","交通银行",7033.76,7.96,"多元化银行"],
+      [24,"1658.HK","邮储银行",6587.21,5.485,"多元化银行"],
+      [25,"9999.HK","网易",6014.36,188.5,"电子游戏与多媒体"],
+      [26,"0386.HK","中国石油化工股份",5798.38,4.795,"综合油气公司"],
+      [27,"0981.HK","中芯国际",5783.06,67.55,"半导体厂商"],
+      [28,"0945.HK","宏利金融-S",5735.9,346.2,"人寿和健康保险"],
+      [29,"2359.HK","药明康德",5715.14,191.5,"生命科学工具与服务"],
+      [30,"2388.HK","中银香港",5566.57,52.65,"多元化银行"],
+      [31,"2888.HK","渣打集团",5230.24,239.6,"多元化银行"],
+      [32,"0388.HK","香港交易所",5223.49,412,"金融交易所和数据"],
+      [33,"2513.HK","智谱",5154.45,1107,"系统软件"],
+      [34,"3690.HK","美团-W",5011.4,81.15,"餐厅"],
+      [35,"9633.HK","农夫山泉",4786.5,42.56,"水和软饮料"],
+      [36,"0998.HK","中信银行",4724.27,8.49,"多元化银行"],
+      [37,"2475.HK","立讯精密",4580.79,59.2,"电子元件"],
+      [38,"2259.HK","紫金黄金国际",4343.7,162.3,"黄金"],
+      [39,"6030.HK","中信证券",4312.3,27.6,"投资银行和经纪"],
+      [40,"0728.HK","中国电信",4277.96,4.675,"电信服务"],
+      [41,"0267.HK","中信股份",4017.37,13.81,"工业企业集团"],
+      [42,"0992.HK","联想集团",3974.45,32.04,"硬件、存储及外设"],
+      [43,"2328.HK","中国财险",3930.3,17.67,"财产和意外保险"],
+      [44,"3993.HK","洛阳钼业",3547.18,16.58,"多元化金属与采矿"],
+      [45,"0016.HK","新鸿基地产",3486.03,120.3,"多元化房地产活动"],
+      [46,"6160.HK","百济神州",3436.21,222.8,"生物技术"],
+      [47,"3986.HK","兆易创新",3249.53,461.6,"半导体厂商"],
+      [48,"6809.HK","澜起科技",3178.28,260.4,"半导体厂商"],
+      [49,"1276.HK","恒瑞医药",3108.86,46.84,"制药"],
+      [50,"2601.HK","中国太保",3030.41,31.5,"多险种保险"],
+      [51,"9618.HK","京东-SW",2994.43,111.4,"零售商"],
+      [52,"1339.HK","中国人民保险集团",2781.69,6.29,"财产和意外保险"],
+      [53,"2338.HK","潍柴动力",2752.77,31.86,"工程机械和重型运输设备"],
+      [54,"2378.HK","保诚",2722.26,109.1,"人寿和健康保险"],
+      [55,"2611.HK","国泰海通",2718.03,15.46,"投资银行和经纪"],
+      [56,"0001.HK","长和",2690.61,70.25,"工业企业集团"],
+      [57,"9888.HK","百度集团-W",2595.45,95.35,"互联网内容与信息"],
+      [58,"0669.HK","创科实业",2469.02,135.1,"工业机械"],
+      [59,"1919.HK","中远海控",2462.75,16.13,"海运-货运和客运"],
+      [60,"1378.HK","中国宏桥",2287.92,23.3,"铝"],
+      [61,"2714.HK","牧原股份",2251.09,39,"包装食品和肉类"],
+      [62,"3692.HK","翰森制药",2215.84,36.54,"制药"],
+      [63,"1109.HK","华润置地",2214.87,31.06,"房地产开发"],
+      [64,"6951.HK","三环集团",2200.38,110.2,"电子元件"],
+      [65,"2020.HK","安踏体育",2140.84,76.55,"服装、配饰及奢侈品"],
+      [66,"9992.HK","泡泡玛特",2069.58,155.4,"珠宝/玩具/文具等零售商"],
+      [67,"9961.HK","携程集团-S",2067.95,328.4,"酒店、度假村和游轮"],
+      [68,"0066.HK","港铁公司",2051.7,32.96,"铁路-货运和客运"],
+      [69,"2269.HK","药明生物",2051.63,49.44,"生命科学工具与服务"],
+      [70,"6690.HK","海尔智家",2002.02,21.52,"家用电器"],
+      [71,"0002.HK","中电控股",1956.74,77.45,"电力公司"],
+      [72,"2476.HK","胜宏科技",1949.85,198.4,"电子元件"],
+      [73,"1347.HK","华虹宏力",1920.19,110.5,"半导体厂商"],
+      [74,"0175.HK","吉利汽车",1888.54,17.51,"汽车制造商"],
+      [75,"6031.HK","三一重工",1848.2,20.1,"工程机械和重型运输设备"],
+      [76,"1801.HK","信达生物",1785.72,102.4,"生物技术"],
+      [77,"0762.HK","中国联通",1728.79,5.65,"电信服务"],
+      [78,"6818.HK","中国光大银行",1707.57,2.89,"多元化银行"],
+      [79,"0625.HK","希音-W",1702.73,40.1,"服装零售商"],
+      [80,"1113.HK","长实集团",1663.79,47.54,"房地产开发"],
+      [81,"3288.HK","海天味业",1661.7,28.4,"包装食品和肉类"],
+      [82,"6936.HK","顺丰控股",1650.06,31.4,"航空-货运和物流"],
+      [83,"1038.HK","长江基建集团",1646.57,65.35,"电力公司"],
+      [84,"6886.HK","华泰证券",1613.1,17.87,"投资银行和经纪"],
+      [85,"2423.HK","贝壳-W",1602.37,48.3,"房地产服务"],
+      [86,"0788.HK","中国铁塔",1595.52,9.065,"电信服务"],
+      [87,"1988.HK","民生银行",1584.92,3.62,"多元化银行"],
+      [88,"1336.HK","新华保险",1583.17,50.75,"人寿和健康保险"],
+      [89,"1816.HK","中广核电力",1552.84,3.075,"独立电力和可再生能源电力生产商"],
+      [90,"1766.HK","中国中车",1535.39,5.35,"工程机械和重型运输设备"],
+      [91,"1776.HK","广发证券",1496.11,19.12,"投资银行和经纪"],
+      [92,"2600.HK","中国铝业",1495.06,8.715,"铝"],
+      [93,"0027.HK","银河娱乐",1493.32,34.1,"赌场及博彩业"],
+      [94,"3606.HK","福耀玻璃",1492.77,57.2,"汽车零部件及设备"],
+      [95,"9973.HK","奇瑞汽车",1488.16,25.62,"汽车制造商"],
+      [96,"1898.HK","中煤能源",1487.62,11.22,"煤炭和消耗性燃料"],
+      [97,"1024.HK","快手-W",1469.44,33.96,"互联网内容与信息"],
+      [98,"0688.HK","中国海外发展",1463.33,13.37,"房地产开发"],
+      [99,"0019.HK","太古股份公司A",1440.49,106.8,"工业企业集团"],
+      [100,"1972.HK","太古地产",1431.31,24.86,"房地产经营公司"],
+      [101,"1888.HK","建滔积层板",1406.81,44.64,"电子元件"],
+      [102,"6099.HK","招商证券",1382.75,15.9,"投资银行和经纪"],
+      [103,"0003.HK","香港中华煤气",1329.52,7.125,"燃气公司"],
+      [104,"1377.HK","鼎泰高科",1326.41,312.8,"工业机械"],
+      [105,"6869.HK","长飞光纤光缆",1326.3,160.2,"通信设备"],
+      [106,"1171.HK","兖矿能源",1323.86,13.19,"煤炭和消耗性燃料"],
+      [107,"0100.HK","MINIMAX-W",1322.9,378.8,"系统软件"],
+      [108,"0012.HK","恒基地产",1303.3,26.92,"房地产开发"],
+      [109,"0006.HK","电能实业",1289.32,60.5,"电力公司"],
+      [110,"0358.HK","江西铜业股份",1275.67,36.84,"铜"],
+      [111,"2057.HK","中通快递-W",1259.47,166,"航空-货运和物流"],
+      [112,"6613.HK","蓝思科技",1254.23,23.76,"电子元件"],
+      [113,"1308.HK","海丰国际",1221.27,45.04,"海运-货运和客运"],
+      [114,"1787.HK","山东黄金",1219.79,26.46,"黄金"],
+      [115,"1929.HK","周大福",1195.8,12.12,"珠宝/玩具/文具等零售商"],
+      [116,"6618.HK","京东健康",1187.78,37.24,"药品零售商"],
+      [117,"9987.HK","百胜中国",1185.12,346.8,"餐厅"],
+      [118,"6990.HK","科伦博泰生物",1182.69,494.8,"生物技术"],
+      [119,"1208.HK","五矿资源",1174.16,9.14,"多元化金属与采矿"],
+      [120,"1928.HK","金沙中国有限公司",1151.69,14.23,"赌场及博彩业"],
+      [121,"3296.HK","华勤技术",1142.92,75.4,"硬件、存储及外设"],
+      [122,"3808.HK","中国重汽",1141.95,41.36,"工程机械和重型运输设备"],
+      [123,"0763.HK","中兴通讯",1130.83,23.64,"通信设备"],
+      [124,"1093.HK","石药集团",1109.61,9.63,"制药"],
+      [125,"1179.HK","华住集团-S",1101.55,35.82,"酒店、度假村和游轮"],
+      [126,"6082.HK","壁仞科技",1089.62,42.04,"半导体厂商"],
+      [127,"1698.HK","腾讯音乐-SW",1082.93,32.8,"电影和娱乐"],
+      [128,"3908.HK","中金公司",1066.82,22.1,"投资银行和经纪"],
+      [129,"1177.HK","中国生物制药",1050.92,5.625,"制药"],
+      [130,"9903.HK","天数智芯",1045.47,388.4,"半导体厂商"],
+      [131,"2050.HK","三花智控",1041.9,24.76,"工业机械"],
+      [132,"1880.HK","中国中免",1039.94,50.05,"珠宝/玩具/文具等零售商"],
+      [133,"2099.HK","中国黄金国际",1031.47,260.2,"黄金"],
+      [134,"0087.HK","太古股份公司B",1030.46,15.28,"工业企业集团"],
+      [135,"0083.HK","信和置业",1011.34,10.55,"房地产开发"],
+      [136,"1913.HK","普拉达",1009.2,39.44,"服装、配饰及奢侈品"]
+    ];
+
+    const rows = DATA.map(([rank, code, name, cap, price, industry]) =>
+      ({ rank, code, name, cap, price, industry })
+    );
+    const total = rows.reduce((s, r) => s + r.cap, 0);
+    const median = rows[Math.floor(rows.length / 2)].cap;
+    const top10 = rows.slice(0, 10).reduce((s, r) => s + r.cap, 0);
+    const yMax = 45000; // 4.5 万亿，给腾讯留一点头顶空间
+    const PLOT_H = 360;
+
+    function yi(n) {
+      if (n >= 10000) return (n / 10000).toFixed(2) + " 万亿";
+      return n.toFixed(0) + " 亿";
+    }
+    function yiFull(n) {
+      return n.toLocaleString("zh-CN", { maximumFractionDigits: 0 }) + " 亿港元";
+    }
+    function yLabel(v) {
+      if (v === 0) return "0";
+      if (v >= 10000) return (v / 10000).toFixed(1).replace(/\.0$/, "") + " 万亿";
+      return (v / 1000) + " 千亿";
+    }
+
+    document.getElementById("kpis").innerHTML = [
+      ["覆盖正股", rows.length + " 只", "门槛 1000 亿港元"],
+      ["合计总市值", yi(total), "线性加总，含 A+H 总市值"],
+      ["中位数", yi(median), "分布右偏，头部极重"],
+      ["腾讯占比", (rows[0].cap / total * 100).toFixed(1) + "%", "前十名合计 " + (top10 / total * 100).toFixed(0) + "%"]
+    ].map(([label, value, hint]) =>
+      `<article class="kpi"><div class="label">${label}</div><div class="value">${value}</div><div class="hint">${hint}</div></article>`
+    ).join("");
+
+    const yTicks = [0, 10000, 20000, 30000, 40000];
+    const yAxis = document.getElementById("yAxis");
+    const plot = document.getElementById("plot");
+    const scroll = document.getElementById("scroll");
+    const barsEl = document.getElementById("bars");
+    const xlabs = document.getElementById("xlabs");
+    const tip = document.getElementById("tip");
+
+    yAxis.insertAdjacentHTML("beforeend", yTicks.map(v => {
+      const bottom = (v / yMax) * PLOT_H;
+      return `<div class="y-tick" style="bottom:${bottom}px">${yLabel(v)}</div>`;
+    }).join(""));
+
+    function band(rank) {
+      if (rank <= 10) return "";
+      if (rank <= 30) return "mid";
+      return "tail";
+    }
+
+    function renderChart(n) {
+      const view = n ? rows.slice(0, n) : rows;
+      const showLabel = view.length <= 40;
+      const colW = view.length <= 20 ? 54 : view.length <= 40 ? 38 : 15;
+      const innerW = Math.max(plot.clientWidth - 20, view.length * colW);
+      scroll.style.width = innerW + "px";
+
+      [...scroll.querySelectorAll(".grid-line, .ref-line")].forEach(el => el.remove());
+      const grids = yTicks.map(v => {
+        const top = PLOT_H - (v / yMax) * PLOT_H + 8;
+        return `<div class="grid-line" style="top:${top}px"></div>`;
+      }).join("");
+      const wan = PLOT_H - (10000 / yMax) * PLOT_H + 8;
+      scroll.insertAdjacentHTML("afterbegin", `
+        ${grids}
+        <div class="ref-line" style="top:${wan}px"><span class="ref-label">1 万亿</span></div>
+      `);
+
+      barsEl.innerHTML = view.map(r => {
+        const h = Math.max(3, (r.cap / yMax) * PLOT_H);
+        return `<div class="col ${band(r.rank)}" style="width:${colW}px" data-i="${r.rank - 1}">
+          <div class="fill" style="height:${h}px"></div>
+        </div>`;
+      }).join("");
+
+      xlabs.innerHTML = view.map(r =>
+        `<div class="x-lab" style="width:${colW}px">${showLabel ? r.name : ""}</div>`
+      ).join("");
+
+      barsEl.querySelectorAll(".col").forEach(col => {
+        col.addEventListener("mousemove", e => showTip(rows[+col.dataset.i], e));
+        col.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+      });
+    }
+
+    function showTip(r, e) {
+      tip.style.display = "block";
+      tip.innerHTML = `
+        <div class="t-name">${r.rank}. ${r.name}</div>
+        <div class="t-code">${r.code} · ${r.industry}</div>
+        <div class="t-row"><span>总市值</span><b>${yiFull(r.cap)}</b></div>
+        <div class="t-row"><span>现价</span><b>${r.price}</b></div>
+      `;
+      const x = Math.min(e.clientX + 14, window.innerWidth - 250);
+      const y = Math.max(12, e.clientY - 88);
+      tip.style.left = x + "px";
+      tip.style.top = y + "px";
+    }
+
+    function renderTable(filter = "") {
+      const q = filter.trim().toLowerCase();
+      const max = rows[0].cap;
+      const list = rows.filter(r =>
+        !q || r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q) || r.industry.includes(q)
+      );
+      document.getElementById("tbody").innerHTML = list.map(r => `
+        <tr>
+          <td class="rank">${r.rank}</td>
+          <td>${r.code}</td>
+          <td>${r.name}</td>
+          <td>${yiFull(r.cap)}</td>
+          <td><div class="mini"><i style="width:${(r.cap / max) * 100}%"></i></div></td>
+          <td>${r.price}</td>
+          <td>${r.industry}</td>
+        </tr>
+      `).join("");
+    }
+
+    document.getElementById("seg").addEventListener("click", e => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      document.querySelectorAll("#seg button").forEach(b => b.classList.toggle("active", b === btn));
+      renderChart(+btn.dataset.n);
+    });
+    document.getElementById("q").addEventListener("input", e => renderTable(e.target.value));
+
+    renderChart(20);
+    renderTable();
+    window.addEventListener("resize", () => {
+      const n = +document.querySelector("#seg button.active").dataset.n;
+      renderChart(n);
+    });
+  </script>
+</body>
+</html>
