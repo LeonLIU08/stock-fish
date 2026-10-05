@@ -1,8 +1,30 @@
-"""趋势结构引擎的阶段 0–1：标准序列与因果拐点。
+"""趋势结构引擎的阶段 0–5：标准序列、拐点、线段、趋势线、趋势区间和生命周期。
 
-边界、趋势区间和 HTML 报告不在当前范围内。
+HTML 报告不在当前范围内。
 """
 
+from analysis.structure.boundaries import (
+    ROLE_RESISTANCE,
+    ROLE_SUPPORT,
+    STATUS_BROKEN,
+    STATUS_CANDIDATE,
+    STATUS_EXPIRED,
+    STATUS_REJECTED,
+    STATUS_VALIDATED,
+    Boundary,
+    BoundaryResult,
+    build_boundaries,
+    format_boundaries,
+)
+from analysis.structure.lifecycle import (
+    EVENT_BREAKOUT,
+    EVENT_EXPIRED,
+    EVENT_VALIDATED,
+    LifecycleResult,
+    StructureEvent,
+    build_lifecycle,
+    format_events,
+)
 from analysis.structure.config import (
     BAR_INTERVALS,
     LONG,
@@ -24,6 +46,16 @@ from analysis.structure.pivots import (
     detect_pivots,
     format_trace,
 )
+from analysis.structure.segments import (
+    DIRECTION_DOWN,
+    DIRECTION_FLAT,
+    DIRECTION_UP,
+    Segment,
+    SegmentResult,
+    TemporarySegment,
+    build_segments,
+    format_segments,
+)
 from analysis.structure.series import (
     IDENTITY_FILENAME,
     NonPositivePriceError,
@@ -33,31 +65,77 @@ from analysis.structure.series import (
     write_series_identity,
 )
 from analysis.structure.volatility import compute_volatility, reversal_threshold
+from analysis.structure.zones import (
+    LABEL_CHANNEL,
+    LABEL_CONVERGENCE,
+    LABEL_OTHER,
+    LABEL_SIDEWAYS,
+    Zone,
+    ZoneOverlap,
+    ZoneResult,
+    build_zones,
+    format_zones,
+)
 
 __all__ = [
     "BAR_INTERVALS",
+    "DIRECTION_DOWN",
+    "DIRECTION_FLAT",
+    "DIRECTION_UP",
+    "EVENT_BREAKOUT",
+    "EVENT_EXPIRED",
+    "EVENT_VALIDATED",
     "IDENTITY_FILENAME",
+    "LABEL_CHANNEL",
+    "LABEL_CONVERGENCE",
+    "LABEL_OTHER",
+    "LABEL_SIDEWAYS",
+    "LifecycleResult",
     "LONG",
     "MID",
+    "Boundary",
+    "BoundaryResult",
     "PARAM_VERSION",
     "PRICE_AXIS_LOG",
     "PRICE_AXIS_UNIFORM",
     "PRICE_BASIS_CLOSE",
+    "ROLE_RESISTANCE",
+    "ROLE_SUPPORT",
     "SCALE_NAMES",
     "SHORT",
+    "STATUS_BROKEN",
+    "STATUS_CANDIDATE",
+    "STATUS_EXPIRED",
+    "STATUS_REJECTED",
+    "STATUS_VALIDATED",
+    "StructureEvent",
     "NonPositivePriceError",
     "Pivot",
     "PivotDetector",
     "PivotResult",
+    "Segment",
+    "SegmentResult",
     "StandardSeries",
     "StructureParams",
     "TemporaryExtreme",
+    "TemporarySegment",
+    "Zone",
+    "ZoneOverlap",
+    "ZoneResult",
+    "build_boundaries",
+    "build_lifecycle",
+    "build_segments",
     "build_series",
     "compute_volatility",
     "default_params",
     "detect_pivots",
+    "format_boundaries",
+    "format_events",
+    "format_segments",
     "format_trace",
+    "format_zones",
     "result_directory",
     "reversal_threshold",
     "write_series_identity",
+    "build_zones",
 ]

@@ -1,9 +1,10 @@
-"""合成收盘序列上的趋势结构阶段 0–1 测试。不访问网络。"""
+"""合成收盘序列上的趋势结构阶段 0–5 测试。不访问网络。"""
 from __future__ import annotations
 
 import json
 import math
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 
@@ -15,7 +16,11 @@ from analysis.structure.config import (
     SHORT,
     default_params,
 )
+from analysis.structure.boundaries import build_boundaries, format_boundaries
+from analysis.structure.lifecycle import build_lifecycle, format_events
+from analysis.structure.zones import _effective_interval, build_zones, format_zones
 from analysis.structure.pivots import PivotDetector, detect_pivots, format_trace
+from analysis.structure.segments import build_segments, format_segments
 from analysis.structure.series import (
     IDENTITY_FILENAME,
     NonPositivePriceError,
@@ -611,6 +616,404 @@ class PivotContractTests(unittest.TestCase):
         self.assertEqual(again, full)
 
 
+class SegmentTests(unittest.TestCase):
+    def test_closed_segment_count_excludes_the_open_end(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_warm() + [0.08], price_axis=price_axis)
+            pivots = detect_pivots(series)
+            before = [pivot.to_dict() for pivot in pivots.confirmed]
+            result = build_segments(series, pivots)
+            self.assertEqual(before, [pivot.to_dict() for pivot in pivots.confirmed])
+            for scale_name in SCALE_NAMES:
+                confirmed = pivots.confirmed_for(scale_name)
+                segments = result.segments_for(scale_name)
+                temporary = result.temporary_for(scale_name)
+                self.assertEqual(len(confirmed), 1, format_trace(series, pivots))
+                self.assertEqual(len(segments), 0)
+                self.assertEqual(len(temporary), 1, format_segments(result))
+                self.assertEqual(temporary[0].direction, "up")
+                self.assertEqual(temporary[0].start.role, "low")
+                self.assertEqual(temporary[0].end.role, "high")
+                self.assertIs(temporary[0].start, confirmed[0])
+                self.assertNotIn(temporary[0].end.extreme_index, [pivot.extreme_index for pivot in confirmed])
+
+    def test_segment_fields_follow_the_two_confirmed_ends(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_warm() + [0.08, 0.16, 0.08, 0.02, 0.10], price_axis=price_axis)
+            pivots = detect_pivots(series)
+            result = build_segments(series, pivots)
+            self._assert_contracts(series, pivots, result)
+            for scale_name in SCALE_NAMES:
+                confirmed = pivots.confirmed_for(scale_name)
+                segments = result.segments_for(scale_name)
+                self.assertGreaterEqual(len(confirmed), 2)
+                self.assertEqual(len(segments), len(confirmed) - 1, format_segments(result))
+                self.assertIs(segments[0].start, confirmed[0])
+                self.assertIs(segments[0].end, confirmed[1])
+
+    def test_log_change_is_log_return_and_uniform_change_is_price_gap(self):
+        levels = _warm() + [0.08, 0.02]
+        logged = build_segments(_series_from_levels(levels, price_axis="log"))
+        uniform = build_segments(_series_from_levels(levels, price_axis="uniform"))
+        for segment in logged.segments_for(SHORT):
+            self.assertAlmostEqual(segment.change, math.log(segment.end.price / segment.start.price))
+            self.assertNotEqual(segment.change, segment.end.price - segment.start.price)
+        for segment in uniform.segments_for(SHORT):
+            self.assertAlmostEqual(segment.change, segment.end.price - segment.start.price)
+            self.assertNotAlmostEqual(segment.change, math.log(segment.end.price / segment.start.price))
+
+    def test_interior_dip_sets_adverse_excursion_without_splitting(self):
+        levels = _warm()
+        levels.extend([0.03, 0.028, 0.06, 0.0])
+        series = _series_from_levels(levels, price_axis="log")
+        result = build_segments(series)
+        segment = result.segments_for(SHORT)[0]
+        self.assertEqual(segment.start.extreme_index, 0)
+        self.assertEqual(segment.end.extreme_index, len(_warm()) + 2)
+        self.assertEqual(segment.direction, "up")
+        self.assertAlmostEqual(segment.adverse_excursion, 0.002)
+        self.assertGreater(segment.max_deviation, 0.0)
+        self.assertEqual(len(result.segments_for(SHORT)), 1)
+        self.assertEqual(len(result.segments_for(LONG)), 1)
+
+    def test_one_interior_bar_off_the_chord_sets_deviation(self):
+        series = _series_from_levels([0.0, 0.02, 0.20, 0.0], price_axis="log")
+        result = build_segments(series)
+        segment = result.segments_for(SHORT)[0]
+        self.assertEqual((segment.start.extreme_index, segment.end.extreme_index), (0, 2))
+        self.assertAlmostEqual(segment.change, 0.20)
+        self.assertEqual(segment.bar_span, 2)
+        self.assertAlmostEqual(segment.slope, 0.10)
+        self.assertAlmostEqual(segment.max_deviation, 0.08)
+        self.assertAlmostEqual(segment.adverse_excursion, 0.0)
+        self.assertAlmostEqual(segment.change_multiple, segment.change / segment.end.volatility)
+
+    def test_gap_keeps_each_side_separate(self):
+        for price_axis in ("log", "uniform"):
+            (levels, extra), _peak, gap_at = _gapped_levels()
+            series = _series_from_levels(levels, extra_days=extra, price_axis=price_axis)
+            pivots = detect_pivots(series)
+            result = build_segments(series, pivots)
+            self.assertIn(gap_at, series.gap_indices)
+            for scale_name in SCALE_NAMES:
+                confirmed = pivots.confirmed_for(scale_name)
+                segments = result.segments_for(scale_name)
+                self.assertEqual(
+                    len(segments),
+                    _connectable_pairs(series, confirmed),
+                    format_segments(result),
+                )
+                self.assertNotEqual(len(segments), max(len(confirmed) - 1, 0))
+                for segment in segments:
+                    self.assertFalse(_range_crosses_gap(series, segment.start.extreme_index, segment.end.extreme_index))
+                self.assertTrue(segments)
+                self.assertTrue(any(pivot.extreme_index < gap_at for pivot in confirmed))
+                self.assertTrue(any(pivot.extreme_index >= gap_at for pivot in confirmed))
+
+    def test_finer_segments_inside_a_longer_one_are_linked_without_rewriting_pivots(self):
+        for price_axis in ("log", "uniform"):
+            levels = _warm()
+            levels.extend([0.03, 0.04, 0.032, 0.08, 0.03])
+            series = _series_from_levels(levels, price_axis=price_axis)
+            pivots = detect_pivots(series)
+            before = [pivot.to_dict() for pivot in pivots.confirmed]
+            result = build_segments(series, pivots)
+            self.assertEqual(before, [pivot.to_dict() for pivot in pivots.confirmed])
+
+            short = result.segments_for(SHORT)
+            mid = result.segments_for(MID)
+            long = result.segments_for(LONG)
+            self.assertEqual(len(short), 3, format_segments(result))
+            self.assertEqual(len(mid), 1, format_segments(result))
+            self.assertEqual(len(long), 1, format_segments(result))
+            self.assertEqual(long[0].contains, (mid[0].id,))
+            self.assertEqual(mid[0].contains, tuple(segment.id for segment in short))
+            self.assertTrue(all(segment_id.startswith("short:") for segment_id in mid[0].contains))
+            self.assertFalse(any(segment_id.startswith("short:") for segment_id in long[0].contains))
+            for segment in short:
+                self.assertEqual(segment.contains, ())
+                self.assertGreaterEqual(segment.start.extreme_index, long[0].start.extreme_index)
+                self.assertLessEqual(segment.end.extreme_index, long[0].end.extreme_index)
+            short_highs = [
+                pivot.extreme_index
+                for pivot in pivots.confirmed_for(SHORT)
+                if pivot.role == "high"
+            ]
+            long_highs = [
+                pivot.extreme_index
+                for pivot in pivots.confirmed_for(LONG)
+                if pivot.role == "high"
+            ]
+            self.assertGreater(len(short_highs), len(long_highs))
+
+    def test_prefix_segments_match_and_do_not_rewrite_earlier_ones(self):
+        samples = []
+        for price_axis in ("log", "uniform"):
+            samples.append(_series_from_levels(_warm() + [0.08, 0.16, 0.08, 0.02, 0.10], price_axis=price_axis))
+            dipped = _warm()
+            dipped.extend([0.03, 0.04, 0.032, 0.08, 0.03])
+            samples.append(_series_from_levels(dipped, price_axis=price_axis))
+            gapped, _peak, _gap_at = _gapped_levels()
+            samples.append(_series_from_levels(gapped[0], extra_days=gapped[1], price_axis=price_axis))
+        for series in samples:
+            full = build_segments(series)
+            for count in range(1, len(series) + 1):
+                partial = build_segments(series, bar_count=count)
+                again = build_segments(series.prefix(count))
+                self.assertEqual(partial, again)
+                self.assertEqual(
+                    partial.segments,
+                    tuple(segment for segment in full.segments if segment.end.confirm_index < count),
+                )
+
+    def test_flat_series_has_no_segment(self):
+        series = build_series(_daily_times(8), [100.0] * 8, price_axis="log")
+        result = build_segments(series)
+        self.assertEqual(result.segments, ())
+        self.assertEqual(result.temporary, ())
+
+    def _assert_contracts(self, series, pivots, result):
+        self.assertTrue(result.segments, format_segments(result))
+        for scale_name in SCALE_NAMES:
+            confirmed = pivots.confirmed_for(scale_name)
+            segments = result.segments_for(scale_name)
+            self.assertEqual(len(segments), _connectable_pairs(series, confirmed), format_segments(result))
+        for segment in result.segments:
+            self.assertEqual(segment.bar_span, segment.end.extreme_index - segment.start.extreme_index)
+            self.assertEqual(segment.change, segment.end.geometric_price - segment.start.geometric_price)
+            self.assertEqual(segment.slope, segment.change / segment.bar_span)
+            self.assertEqual(segment.change_multiple, segment.change / segment.volatility)
+            self.assertEqual(segment.volatility, segment.end.volatility)
+            self.assertEqual(segment.confirm_time, segment.end.confirm_time)
+            self.assertEqual(segment.available_time, segment.end.available_time)
+            self.assertEqual(segment.confirm_time, series.bars[segment.end.confirm_index].timestamp)
+            self.assertIn(segment.direction, ("up", "down"))
+            if segment.direction == "up":
+                self.assertEqual((segment.start.role, segment.end.role), ("low", "high"))
+                self.assertGreater(segment.change, 0.0)
+            else:
+                self.assertEqual((segment.start.role, segment.end.role), ("high", "low"))
+                self.assertLess(segment.change, 0.0)
+            if series.price_axis == "log":
+                self.assertAlmostEqual(segment.change, math.log(segment.end.price / segment.start.price))
+            else:
+                self.assertEqual(segment.change, segment.end.price - segment.start.price)
+            self.assertGreaterEqual(segment.max_deviation, 0.0)
+            self.assertGreaterEqual(segment.adverse_excursion, 0.0)
+            self.assertFalse(
+                _range_crosses_gap(series, segment.start.extreme_index, segment.end.extreme_index)
+            )
+        confirmed_ids = {segment.id for segment in result.segments}
+        for segment in result.temporary:
+            self.assertTrue(segment.id.startswith("tmp:"))
+            self.assertNotIn(segment.id, confirmed_ids)
+            self.assertNotIn(segment.end.extreme_index, [
+                pivot.extreme_index
+                for pivot in pivots.confirmed_for(segment.scale)
+            ])
+        for segment in result.segments:
+            self.assertTrue(set(segment.contains).issubset(confirmed_ids))
+            if segment.scale == "long":
+                self.assertTrue(all(item.startswith("mid:") for item in segment.contains))
+            elif segment.scale == "mid":
+                self.assertTrue(all(item.startswith("short:") for item in segment.contains))
+            else:
+                self.assertEqual(segment.contains, ())
+
+
+class BoundaryTests(unittest.TestCase):
+    def test_rising_lows_validate_an_upward_support(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_rising_support_levels(), price_axis=price_axis)
+            pivots = detect_pivots(series)
+            before = [pivot.to_dict() for pivot in pivots.confirmed]
+            result = build_boundaries(series, pivots)
+            self.assertEqual(before, [pivot.to_dict() for pivot in pivots.confirmed])
+            support = _boundary(result, "short", "support", 0, 53)
+            self.assertEqual(support.status, "validated", format_boundaries(result))
+            self.assertTrue(support.primary)
+            self.assertTrue(support.emits_events)
+            self.assertGreater(support.normalized_slope, 0.0)
+            self.assertEqual(support.normalized_slope, support.slope / support.volatility)
+            self.assertGreaterEqual(len(support.touch_clusters), 3)
+            self.assertEqual(support.failed_constraints, ())
+            self.assertEqual(support.simplicity_penalty, 0.0)
+            self.assertEqual(support.context_fit, "未使用")
+            self.assertIsNotNone(support.score)
+            self.assertEqual(support.score.simplicity_penalty, 0.0)
+            self.assertEqual(support.score.context_fit, "未使用")
+            parts = (
+                support.score.geometry,
+                support.score.touch_quality,
+                support.score.significance,
+                support.score.path_integrity,
+                support.score.span,
+            )
+            self.assertAlmostEqual(support.score.total, sum(parts) / len(parts))
+            shorter = _boundary(result, "short", "support", 0, 45)
+            self.assertEqual(shorter.status, "validated")
+            self.assertFalse(shorter.primary)
+            self.assertEqual(shorter.alternate_of, support.id)
+            self.assertFalse(shorter.emits_events)
+            pair = _boundary(result, "short", "support", 45, 53)
+            self.assertEqual(pair.status, "candidate")
+            self.assertEqual(pair.failed_constraints, ("min_touch_clusters",))
+            self.assertIsNone(pair.score)
+            self.assertFalse(pair.emits_events)
+
+    def test_falling_highs_validate_downward_resistance(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_falling_resistance_levels(), price_axis=price_axis)
+            result = build_boundaries(series)
+            matches = [
+                item
+                for item in result.validated("short", "resistance")
+                if item.primary and item.normalized_slope < 0.0
+            ]
+            self.assertTrue(matches, format_boundaries(result))
+            self.assertTrue(matches[0].emits_events)
+
+    def test_deep_low_between_two_higher_lows_is_not_a_validated_support(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_broken_support_levels(), price_axis=price_axis)
+            result = build_boundaries(series)
+            line = _boundary(result, "short", "support", 37, 53)
+            self.assertNotEqual(line.status, "validated", format_boundaries(result))
+            self.assertIn("hard_break", line.failed_constraints)
+            self.assertIn("no_skipped_break", line.failed_constraints)
+            self.assertGreater(line.max_break_depth, 1.0)
+            self.assertFalse(line.emits_events)
+
+    def test_break_depth_just_inside_validates_and_just_outside_names_the_constraint(self):
+        for price_axis in ("log", "uniform"):
+            clean = build_boundaries(_series_from_levels(_rising_support_levels(), price_axis=price_axis))
+            reference = _boundary(clean, "short", "support", 0, 53)
+            under = build_boundaries(_series_from_levels(
+                _rising_support_levels(_middle_level(reference, 0.99, price_axis)),
+                price_axis=price_axis,
+            ))
+            over = build_boundaries(_series_from_levels(
+                _rising_support_levels(_middle_level(reference, 1.01, price_axis)),
+                price_axis=price_axis,
+            ))
+            inside = _boundary(under, "short", "support", 0, 53)
+            outside = _boundary(over, "short", "support", 0, 53)
+            self.assertEqual(inside.status, "validated", format_boundaries(under))
+            self.assertLessEqual(inside.max_break_depth, 1.0)
+            self.assertEqual(inside.failed_constraints, ())
+            self.assertEqual(outside.status, "rejected", format_boundaries(over))
+            self.assertGreater(outside.max_break_depth, 1.0)
+            self.assertIn("hard_break", outside.failed_constraints)
+            self.assertIsNone(outside.score)
+
+    def test_gap_lets_each_side_form_a_line_without_crossing(self):
+        for price_axis in ("log", "uniform"):
+            levels, extra = _gapped_support_levels()
+            series = _series_from_levels(levels, price_axis=price_axis, extra_days=extra)
+            result = build_boundaries(series)
+            gap_at = series.gap_indices[0]
+            supports = [item for item in result.for_scale("short") if item.role == "support"]
+            self.assertTrue(supports)
+            self.assertFalse(any(item.start_index < gap_at <= item.end_index for item in result.boundaries))
+            self.assertTrue(any(item.end_index < gap_at and item.status == "validated" for item in supports))
+            self.assertTrue(any(item.start_index >= gap_at and item.status == "validated" for item in supports))
+
+    def test_prefix_keeps_slope_status_and_score(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_rising_support_levels(), price_axis=price_axis)
+            full = build_boundaries(series)
+            for count in range(1, len(series) + 1):
+                partial = build_boundaries(series, bar_count=count)
+                earlier = {item.id: item for item in full.boundaries if item.confirm_index < count}
+                self.assertEqual({item.id for item in partial.boundaries}, set(earlier))
+                for item in partial.boundaries:
+                    prior = earlier[item.id]
+                    self.assertEqual(item.slope, prior.slope)
+                    self.assertEqual(item.intercept, prior.intercept)
+                    self.assertEqual(item.normalized_slope, prior.normalized_slope)
+                    self.assertEqual(item.status, prior.status)
+                    self.assertEqual(item.failed_constraints, prior.failed_constraints)
+                    self.assertEqual(item.score, prior.score)
+                    self.assertEqual(item.pivot_indices, prior.pivot_indices)
+                    self.assertEqual(item.volatility, prior.volatility)
+
+    def test_flat_series_has_no_boundary(self):
+        series = build_series(_daily_times(8), [100.0] * 8, price_axis="log")
+        self.assertEqual(build_boundaries(series).boundaries, ())
+
+
+def _boundary(result, scale, role, start_index, end_index):
+    matches = [
+        item
+        for item in result.for_scale(scale)
+        if item.role == role and item.start_index == start_index and item.end_index == end_index
+    ]
+    if len(matches) != 1:
+        raise AssertionError(format_boundaries(result))
+    return matches[0]
+
+
+def _rising_support_levels(middle_level=None, middle_index=45):
+    """四个抬高低点落在同一条几何直线上。中间那个可以单独下移。"""
+    slope = 0.0002
+    later = (37, 45, 53)
+    levels = _warm()
+    for index in later:
+        level = slope * index
+        if middle_level is not None and index == middle_index:
+            level = middle_level
+        levels.extend([0.03] * 4)
+        levels.extend([level] * 4)
+    levels.extend([0.03] * 2)
+    return levels
+
+
+def _middle_level(reference, factor, price_axis):
+    target = reference.line_at(45) - factor * reference.volatility
+    if price_axis == "log":
+        return target - math.log(100.0)
+    return math.log(target / 100.0)
+
+
+def _broken_support_levels():
+    levels = _warm()
+    for level in (0.02, 0.0, 0.02):
+        levels.extend([0.03] * 4)
+        levels.extend([level] * 4)
+    levels.extend([0.03] * 2)
+    return levels
+
+
+def _falling_resistance_levels():
+    levels = _warm()
+    for high in (0.03, 0.02, 0.01):
+        levels.extend([high] * 4)
+        levels.extend([0.0] * 4)
+    levels.extend([0.02])
+    return levels
+
+
+def _gapped_support_levels():
+    left = _rising_support_levels()
+    right = _rising_support_levels()
+    return left + right, {len(left): 12}
+
+
+def _connectable_pairs(series, pivots):
+    count = 0
+    for left, right in zip(pivots, pivots[1:]):
+        if left.role == right.role or right.extreme_index <= left.extreme_index:
+            continue
+        if _range_crosses_gap(series, left.extreme_index, right.extreme_index):
+            continue
+        count += 1
+    return count
+
+
+def _range_crosses_gap(series, start_index, end_index):
+    return any(series.bars[index].gap_before for index in range(start_index + 1, end_index + 1))
+
+
 def _plateau_levels():
     levels = _warm()
     levels.extend([0.06, 0.06, 0.06, 0.0, 0.0, 0.0, 0.06])
@@ -637,6 +1040,284 @@ def _gapped_levels():
     gap_at = len(levels)
     levels.extend([0.0, 0.08, 0.0])
     return (levels, {gap_at: 10}), peak, gap_at
+
+
+class ZoneTests(unittest.TestCase):
+    def test_parallel_rising_rails_form_a_channel(self):
+        for price_axis in ("log", "uniform"):
+            series = _series_from_levels(_rail_levels(), price_axis=price_axis)
+            pivots = detect_pivots(series)
+            before = [pivot.to_dict() for pivot in pivots.confirmed]
+            result = build_zones(series, pivots)
+            self.assertEqual(before, [pivot.to_dict() for pivot in pivots.confirmed])
+            channel = _primary(result, "short", "channel")
+            self.assertEqual(channel.status, "validated", format_zones(result))
+            self.assertGreater(channel.lower_slope, 0.0)
+            self.assertGreater(channel.upper_slope, 0.0)
+            self.assertGreaterEqual(channel.width_ratio, 0.8)
+            self.assertLessEqual(channel.width_ratio, 1.25)
+            self.assertLess(channel.normalized_slope_gap, 0.35)
+            self.assertGreaterEqual(channel.lower_touch_clusters, 3)
+            self.assertGreaterEqual(channel.upper_touch_clusters, 3)
+            self.assertTrue(channel.draw_on_main)
+            self.assertTrue(channel.emits_events)
+            self.assertEqual(channel.simplicity_penalty, 0.0)
+            self.assertEqual(channel.context_fit, "未使用")
+            self.assertIsNotNone(channel.score)
+            parts = (
+                channel.score.geometry,
+                channel.score.touch_quality,
+                channel.score.significance,
+                channel.score.path_integrity,
+                channel.score.span,
+            )
+            self.assertAlmostEqual(channel.score.total, sum(parts) / len(parts))
+            for index in range(channel.effective_start, channel.effective_end + 1):
+                self.assertGreater(channel.width_at(index), 0.0)
+            mid = _primary(result, "mid", "channel")
+            overlap = [
+                item
+                for item in result.overlaps
+                if set(item.zone_ids) == {channel.id, mid.id}
+            ]
+            self.assertEqual(len(overlap), 1)
+            self.assertEqual(overlap[0].note, "不合并为一条证据")
+            self.assertNotEqual(channel.score.total, mid.score.total + channel.score.total)
+
+    def test_flat_parallel_rails_are_sideways_and_rising_floor_is_convergence(self):
+        sideways = _primary(build_zones(_series_from_levels(_rail_levels(a=0.0))), "short", "sideways")
+        self.assertEqual(sideways.status, "validated")
+        self.assertTrue(sideways.draw_on_main)
+        self.assertLess(abs(sideways.lower_slope), 1e-9)
+        self.assertLess(abs(sideways.upper_slope), 1e-9)
+
+        convergence = _primary(
+            build_zones(_series_from_levels(_rail_levels(upper=lambda index: 0.12, lower=lambda index: 0.001 * index))),
+            "short",
+            "convergence",
+        )
+        self.assertEqual(convergence.status, "validated")
+        self.assertLess(convergence.width_ratio, 0.8)
+        self.assertGreater(convergence.end_width, 0.0)
+        self.assertGreater(convergence.lower_slope, convergence.upper_slope)
+        self.assertNotIn(convergence.label, ("triangle", "wedge"))
+
+    def test_widening_pair_stays_an_other_boundary_pair(self):
+        other = _primary(
+            build_zones(_series_from_levels(_rail_levels(a=0.0, upper=lambda index: 0.04 + 0.003 * index, lower=lambda index: 0.0))),
+            "short",
+            "other",
+        )
+        self.assertEqual(other.status, "validated")
+        self.assertGreater(other.width_ratio, 1.25)
+        self.assertFalse(other.draw_on_main)
+        self.assertTrue(other.emits_events)
+
+    def test_nonpositive_width_stops_the_effective_interval(self):
+        series = _series_from_levels(_rail_levels())
+        zones = build_zones(series)
+        channel = _primary(zones, "short", "channel")
+        bounds = build_boundaries(series)
+        lower = next(item for item in bounds.boundaries if item.id == channel.lower_id)
+        upper = next(item for item in bounds.boundaries if item.id == channel.upper_id)
+        start, end = channel.projected_start, channel.projected_end
+        above = lower.line_at(start) + 0.05
+        below = lower.line_at(end) - 0.01
+        slope = (below - above) / (end - start)
+        tilted = replace(upper, slope=slope, intercept=above - slope * start)
+        interval = _effective_interval(series, lower, tilted, start, end, 1e9)
+        self.assertIsNotNone(interval)
+        effective_end = interval[1]
+        self.assertLess(effective_end, end)
+        self.assertGreater(tilted.line_at(effective_end) - lower.line_at(effective_end), 0.0)
+        self.assertLessEqual(tilted.line_at(effective_end + 1) - lower.line_at(effective_end + 1), 0.0)
+
+    def test_gap_keeps_zones_on_each_side(self):
+        for price_axis in ("log", "uniform"):
+            left = _rail_levels()
+            levels = left + _rail_levels()
+            series = _series_from_levels(levels, price_axis=price_axis, extra_days={len(left): 12})
+            result = build_zones(series)
+            gap_at = series.gap_indices[0]
+            self.assertFalse(any(zone.effective_start < gap_at <= zone.effective_end for zone in result.zones))
+            self.assertTrue(any(zone.effective_end < gap_at for zone in result.validated()))
+            self.assertTrue(any(zone.effective_start >= gap_at for zone in result.validated()))
+
+    def test_prefix_keeps_zone_geometry(self):
+        series = _series_from_levels(_rail_levels(), price_axis="log")
+        full = build_zones(series)
+        for count in range(1, len(series) + 1):
+            partial = build_zones(series, bar_count=count)
+            earlier = {zone.id: zone for zone in full.zones if zone.confirm_index < count}
+            self.assertEqual({zone.id for zone in partial.zones}, set(earlier))
+            for zone in partial.zones:
+                prior = earlier[zone.id]
+                self.assertEqual(zone.label, prior.label)
+                self.assertEqual(zone.status, prior.status)
+                self.assertEqual((zone.effective_start, zone.effective_end), (prior.effective_start, prior.effective_end))
+                self.assertEqual(zone.lower_slope, prior.lower_slope)
+                self.assertEqual(zone.upper_slope, prior.upper_slope)
+                self.assertEqual(zone.width_ratio, prior.width_ratio)
+                self.assertEqual(zone.score, prior.score)
+            partial_pairs = {item.zone_ids for item in partial.overlaps}
+            earlier_ids = set(earlier)
+            full_pairs = {item.zone_ids for item in full.overlaps if set(item.zone_ids).issubset(earlier_ids)}
+            self.assertEqual(partial_pairs, full_pairs)
+
+
+def _primary(result, scale, label):
+    matches = [zone for zone in result.validated(scale, label) if zone.primary]
+    if len(matches) != 1:
+        raise AssertionError(format_zones(result))
+    return matches[0]
+
+
+def _rail_levels(a=0.001, width=0.08, pairs=4, step=6, upper=None, lower=None):
+    """热身之后交替放高点和低点，中间用两条线的中线填充。"""
+    warm = _warm()
+    events = []
+    cursor = len(warm)
+    for _ in range(pairs):
+        events.append(("H", cursor))
+        cursor += step
+        events.append(("L", cursor))
+        cursor += step
+    last_low = events[-1][1]
+    confirm = last_low + step
+    levels = [None] * (confirm + 1)
+    for index, value in enumerate(warm):
+        levels[index] = value
+
+    def low_at(index):
+        return a * index if lower is None else lower(index)
+
+    def high_at(index):
+        return a * index + width if upper is None else upper(index)
+
+    for kind, index in events:
+        levels[index] = high_at(index) if kind == "H" else low_at(index)
+    levels[confirm] = high_at(confirm)
+    for index in range(len(warm), len(levels)):
+        if levels[index] is None:
+            levels[index] = (low_at(index) + high_at(index)) / 2.0
+    return levels
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_two_closes_beyond_the_buffer_break_a_support_without_rewriting_it(self):
+        base = _rising_support_levels()
+        original = build_lifecycle(_series_from_levels(base))
+        support = original.boundary("short:support:0-53")
+        self.assertEqual(support.status, "validated")
+        broken = build_lifecycle(_series_from_levels(base + _levels_from_line(support, len(base), 2, -0.8)))
+        after = broken.boundary(support.id)
+        self.assertEqual(after.status, "broken", format_events(broken))
+        self.assertEqual(after.slope, support.slope)
+        self.assertEqual(after.intercept, support.intercept)
+        self.assertEqual(after.score, support.score)
+        self.assertEqual(after.revision, support.revision)
+        events = broken.events_for(support.id)
+        self.assertEqual([event.event_type for event in events], ["validated", "breakout"])
+        self.assertEqual(events[0].price_cross_index, None)
+        self.assertGreaterEqual(events[0].available_index, support.confirm_index)
+        self.assertEqual(events[1].price_cross_index, len(base))
+        self.assertEqual(events[1].event_index, len(base) + 1)
+        self.assertGreater(events[1].available_index, events[0].available_index)
+        self.assertIn("支撑下方", events[1].reason)
+        for boundary in broken.boundaries:
+            if boundary.status == "candidate":
+                self.assertFalse(any(event.event_type == "breakout" for event in broken.events_for(boundary.id)))
+
+    def test_one_close_or_a_shallow_dip_does_not_break_the_line(self):
+        base = _rising_support_levels()
+        support = build_lifecycle(_series_from_levels(base)).boundary("short:support:0-53")
+        for extra in (
+            _levels_from_line(support, len(base), 1, -0.8),
+            _levels_from_line(support, len(base), 2, -0.2),
+        ):
+            result = build_lifecycle(_series_from_levels(base + extra))
+            self.assertEqual(result.boundary(support.id).status, "validated", format_events(result))
+            self.assertEqual(
+                [event.event_type for event in result.events_for(support.id)],
+                ["validated"],
+            )
+
+    def test_no_breakout_before_the_expiry_window_marks_the_line_expired(self):
+        base = _rising_support_levels()
+        support = build_lifecycle(_series_from_levels(base)).boundary("short:support:0-53")
+        held = build_lifecycle(_series_from_levels(base + _levels_from_line(support, len(base), 25, 0.2)))
+        after = held.boundary(support.id)
+        self.assertEqual(after.status, "expired", format_events(held))
+        self.assertEqual(after.slope, support.slope)
+        expired = held.events_for(support.id)[-1]
+        self.assertEqual(expired.event_type, "expired")
+        self.assertEqual(expired.event_index, support.end_index + 20)
+        self.assertIsNone(expired.price_cross_index)
+        self.assertNotIn("买入", expired.reason)
+        self.assertNotIn("卖出", expired.reason)
+
+    def test_zone_breakout_is_not_backfilled_and_leaves_the_main_chart(self):
+        base = _rail_levels()
+        original = build_lifecycle(_series_from_levels(base))
+        zone = next(item for item in original.zones if item.scale == "short" and item.label == "channel" and item.primary)
+        broken = build_lifecycle(_series_from_levels(base + _levels_from_line(zone, len(base), 2, -0.8, below_zone=True)))
+        after = broken.zone(zone.id)
+        self.assertEqual(after.status, "broken", format_events(broken))
+        self.assertFalse(after.draw_on_main)
+        self.assertEqual(after.lower_slope, zone.lower_slope)
+        self.assertEqual(after.upper_slope, zone.upper_slope)
+        events = broken.events_for(zone.id)
+        self.assertEqual([event.event_type for event in events], ["validated", "breakout"])
+        self.assertLess(events[1].price_cross_index, events[1].event_index)
+        self.assertGreaterEqual(events[1].event_index, zone.confirm_index)
+        self.assertEqual(events[1].object_kind, "zone")
+
+    def test_prefix_events_and_revisions_stay_put_when_later_bars_arrive(self):
+        base = _rising_support_levels()
+        extended = base + _levels_from_line(
+            build_lifecycle(_series_from_levels(base)).boundary("short:support:0-53"),
+            len(base),
+            2,
+            -0.8,
+        )
+        full = build_lifecycle(_series_from_levels(extended))
+        early = build_lifecycle(_series_from_levels(base))
+        self.assertEqual(
+            tuple(event for event in full.events if event.available_index < len(base)),
+            early.events,
+        )
+        self.assertEqual(full.boundary("short:support:0-53").revision, early.boundary("short:support:0-53").revision)
+        later = [item for item in full.boundaries if item.confirm_index >= len(base)]
+        self.assertTrue(later)
+        self.assertGreater(min(item.revision for item in later), early.boundary("short:support:0-53").revision)
+        for left, right in zip(full.boundaries, full.boundaries[1:]):
+            if left.confirm_index < right.confirm_index:
+                self.assertLessEqual(left.revision, right.revision)
+            elif left.confirm_index == right.confirm_index:
+                self.assertEqual(left.revision, right.revision)
+
+    def test_event_prefix_matches_a_shorter_replay(self):
+        series = _series_from_levels(_rising_support_levels())
+        full = build_lifecycle(series)
+        for count in (20, 40, len(series)):
+            partial = build_lifecycle(series, bar_count=count)
+            self.assertEqual(
+                partial.events,
+                tuple(event for event in full.events if event.available_index < count),
+            )
+
+
+def _levels_from_line(structure, start_index, count, volatility_multiple, below_zone=False):
+    """在已有直线的延长线上追加若干根，偏移量以该结构的波动尺度计。"""
+    levels = []
+    for step in range(count):
+        index = start_index + step
+        if below_zone:
+            geometric = structure.lower_at(index) + volatility_multiple * structure.volatility
+        else:
+            geometric = structure.line_at(index) + volatility_multiple * structure.volatility
+        levels.append(geometric - math.log(100.0))
+    return levels
 
 
 if __name__ == "__main__":
