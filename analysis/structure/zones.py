@@ -311,6 +311,8 @@ def _try_pair(series: StandardSeries, lower: Boundary, upper: Boundary) -> Optio
         width_ratio,
         lower_touches,
         upper_touches,
+        len(lower.touch_clusters),
+        len(upper.touch_clusters),
     )
     failed = tuple(check.name for check in checks if not check.passed)
     blocking = tuple(
@@ -460,26 +462,35 @@ def _constraints(
     width_ratio: float,
     lower_touches: int,
     upper_touches: int,
+    lower_total: int,
+    upper_total: int,
 ) -> Tuple[ConstraintCheck, ...]:
     expected = _label(lower_norm, upper_norm, normalized_gap, width_ratio, params)
+    lower_ok, lower_detail = _side_touch(params, lower_touches, lower_total, "下侧")
+    upper_ok, upper_detail = _side_touch(params, upper_touches, upper_total, "上侧")
     return (
         ConstraintCheck(CONSTRAINT_POSITIVE_WIDTH, width_ratio > 0.0, f"终点宽度 / 起点宽度 = {width_ratio:.3f}"),
-        ConstraintCheck(
-            CONSTRAINT_LOWER_TOUCHES,
-            lower_touches >= params.min_touch_clusters,
-            f"下侧接触簇 {lower_touches} 个，至少 {params.min_touch_clusters} 个",
-        ),
-        ConstraintCheck(
-            CONSTRAINT_UPPER_TOUCHES,
-            upper_touches >= params.min_touch_clusters,
-            f"上侧接触簇 {upper_touches} 个，至少 {params.min_touch_clusters} 个",
-        ),
+        ConstraintCheck(CONSTRAINT_LOWER_TOUCHES, lower_ok, lower_detail),
+        ConstraintCheck(CONSTRAINT_UPPER_TOUCHES, upper_ok, upper_detail),
         ConstraintCheck(
             CONSTRAINT_LABEL,
             label == expected,
             f"标签 {label}，宽度比 {width_ratio:.3f}，归一化斜率差 {normalized_gap:.3f}",
         ),
     )
+
+
+def _side_touch(params: StructureParams, inside: int, total: int, side: str) -> Tuple[bool, str]:
+    """有效区间内的簇够数，或 v1 承认这条边界全长已经达到趋势线的接触要求。"""
+    minimum = params.zone_min_touch_clusters
+    if inside >= minimum:
+        return True, f"{side}接触簇 {inside} 个，至少 {minimum} 个"
+    if params.zone_credit_full_span and inside >= 1 and total >= params.min_touch_clusters:
+        return True, (
+            f"{side}有效区间内 {inside} 个；边界全长 {total} 个，"
+            f"已达到趋势线要求的 {params.min_touch_clusters} 个"
+        )
+    return False, f"{side}接触簇 {inside} 个，至少 {minimum} 个"
 
 
 def _soft_score(
@@ -494,7 +505,7 @@ def _soft_score(
     span: int,
 ) -> SoftScore:
     geometry = _clamp(1.0 - normalized_gap / params.parallel_slope_gap)
-    touch_quality = _clamp(min(lower_touches, upper_touches) / params.min_touch_clusters)
+    touch_quality = _clamp(min(lower_touches, upper_touches) / params.zone_min_touch_clusters)
     significance = _clamp(start_width / volatility)
     path_integrity = _clamp(1.0 - max_break / params.hard_break_ratio)
     span_score = _clamp(span / params.scale(scale).max_span)

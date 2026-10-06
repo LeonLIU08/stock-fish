@@ -10,6 +10,13 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Dict, Tuple
 
 PARAM_VERSION = "structure-params-v0"
+PARAM_VERSION_V1 = "structure-params-v1"
+PARAM_VERSIONS = (PARAM_VERSION, PARAM_VERSION_V1)
+# (有效区间内每侧最少接触簇, 是否承认边界全长已经凑满的接触簇)
+_ZONE_TOUCH_BY_VERSION = {
+    PARAM_VERSION: (3, False),
+    PARAM_VERSION_V1: (2, True),
+}
 
 SHORT = "short"
 MID = "mid"
@@ -93,6 +100,8 @@ class StructureParams:
     touch_distance_ratio: float = 0.5
     touch_cluster_window: int = 3
     min_touch_clusters: int = 3
+    zone_min_touch_clusters: int = 3
+    zone_credit_full_span: bool = False
     hard_break_ratio: float = 1.0
     breakout_buffer_ratio: float = 0.5
     breakout_bars: int = 2
@@ -110,9 +119,16 @@ class StructureParams:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
-        if self.version != PARAM_VERSION:
+        if self.version not in _ZONE_TOUCH_BY_VERSION:
+            raise ValueError(f"参数版本必须是 {PARAM_VERSIONS} 之一，收到 {self.version!r}")
+        expected_min, expected_credit = _ZONE_TOUCH_BY_VERSION[self.version]
+        if (
+            self.zone_min_touch_clusters != expected_min
+            or self.zone_credit_full_span != expected_credit
+        ):
             raise ValueError(
-                f"当前代码只发出 {PARAM_VERSION}，收到 {self.version!r}"
+                f"{self.version} 的区间接触规则固定为每侧至少 {expected_min} 个，"
+                f"全长折算{'开启' if expected_credit else '关闭'}"
             )
         if self.ewma_span < 1:
             raise ValueError("ewma_span 必须 >= 1")
@@ -135,6 +151,8 @@ class StructureParams:
             raise ValueError("touch_cluster_window 必须 >= 1")
         if self.min_touch_clusters < 2:
             raise ValueError("min_touch_clusters 必须 >= 2")
+        if self.zone_min_touch_clusters < 1:
+            raise ValueError("zone_min_touch_clusters 必须 >= 1")
         if self.hard_break_ratio <= 0 or self.breakout_buffer_ratio <= 0:
             raise ValueError("破坏深度和突破缓冲必须为正")
         if self.breakout_bars < 1 or self.expire_bars < 1:
@@ -174,6 +192,24 @@ class StructureParams:
         return payload
 
 
-def default_params(price_axis: str = PRICE_AXIS_LOG) -> StructureParams:
-    """返回一份新的 v0 参数。价格轴只影响几何坐标，不改变版本号。"""
-    return StructureParams(price_axis=normalize_price_axis(price_axis))
+def normalize_param_version(version: str) -> str:
+    text = str(version or "").strip()
+    if text not in PARAM_VERSIONS:
+        raise ValueError(f"参数版本必须是 {PARAM_VERSIONS} 之一，收到 {version!r}")
+    return text
+
+
+def default_params(
+    price_axis: str = PRICE_AXIS_LOG,
+    *,
+    version: str = PARAM_VERSION,
+) -> StructureParams:
+    """返回一份冻结参数包。价格轴只改几何坐标，不改该版本里的阈值。"""
+    resolved = normalize_param_version(version)
+    zone_min, credit = _ZONE_TOUCH_BY_VERSION[resolved]
+    return StructureParams(
+        version=resolved,
+        price_axis=normalize_price_axis(price_axis),
+        zone_min_touch_clusters=zone_min,
+        zone_credit_full_span=credit,
+    )

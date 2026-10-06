@@ -1,6 +1,6 @@
-"""趋势结构引擎的阶段 0–5：标准序列、拐点、线段、趋势线、趋势区间和生命周期。
+"""趋势结构引擎。
 
-HTML 报告不在当前范围内。
+阶段 0–6：标准序列、拐点、线段、趋势线、趋势区间、生命周期，以及离线 HTML 报告。
 """
 
 from analysis.structure.boundaries import (
@@ -65,6 +65,20 @@ from analysis.structure.series import (
     write_series_identity,
 )
 from analysis.structure.volatility import compute_volatility, reversal_threshold
+from analysis.structure.html_report import render_report, write_result
+from analysis.structure.snapshot import (
+    build_snapshot,
+    normalize_visible_scales,
+    resolve_requested_window,
+)
+from analysis.structure.view_model import (
+    READING_NOTE,
+    SCALE_DEFINITION_NOTE,
+    build_view_model,
+    display_snapshot,
+    price_axis_distance,
+    price_on_line,
+)
 from analysis.structure.zones import (
     LABEL_CHANNEL,
     LABEL_CONVERGENCE,
@@ -122,20 +136,31 @@ __all__ = [
     "Zone",
     "ZoneOverlap",
     "ZoneResult",
+    "READING_NOTE",
+    "SCALE_DEFINITION_NOTE",
     "build_boundaries",
+    "build_snapshot",
+    "build_view_model",
     "build_lifecycle",
     "build_segments",
     "build_series",
     "compute_volatility",
     "default_params",
     "detect_pivots",
+    "display_snapshot",
     "format_boundaries",
     "format_events",
     "format_segments",
     "format_trace",
     "format_zones",
+    "normalize_visible_scales",
+    "price_axis_distance",
+    "price_on_line",
+    "render_report",
+    "resolve_requested_window",
     "result_directory",
     "reversal_threshold",
+    "write_result",
     "write_series_identity",
     "build_zones",
 ]

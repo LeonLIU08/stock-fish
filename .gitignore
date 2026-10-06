@@ -25,6 +25,9 @@ batch_results/
 backtest_results/
 data/backtest_cache/
 
+# 趋势结构运行结果
+structure_results/
+
 # 虚拟环境
 venv/
 .venv/

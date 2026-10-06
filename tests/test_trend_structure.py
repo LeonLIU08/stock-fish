@@ -6,18 +6,28 @@ import math
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from analysis.structure.config import (
     LONG,
     MID,
     PARAM_VERSION,
+    PARAM_VERSION_V1,
     SCALE_NAMES,
     SHORT,
     default_params,
 )
 from analysis.structure.boundaries import build_boundaries, format_boundaries
+from analysis.structure.html_report import render_report, write_result
 from analysis.structure.lifecycle import build_lifecycle, format_events
+from analysis.structure.snapshot import build_snapshot, resolve_requested_window
+from analysis.structure.view_model import (
+    READING_NOTE,
+    SCALE_DEFINITION_NOTE,
+    build_view_model,
+    price_axis_distance,
+)
 from analysis.structure.zones import _effective_interval, build_zones, format_zones
 from analysis.structure.pivots import PivotDetector, detect_pivots, format_trace
 from analysis.structure.segments import build_segments, format_segments
@@ -44,13 +54,14 @@ def _daily_times(count, start=date(2024, 1, 2), extra_days=None):
     return times
 
 
-def _series_from_levels(levels, *, price_axis="log", extra_days=None, start=100.0):
+def _series_from_levels(levels, *, price_axis="log", extra_days=None, start=100.0, params=None):
     closes = [start * math.exp(level) for level in levels]
     return build_series(
         _daily_times(len(levels), extra_days=extra_days),
         closes,
         interval="1d",
         price_axis=price_axis,
+        params=params,
     )
 
 
@@ -98,6 +109,8 @@ class ParamsTests(unittest.TestCase):
         self.assertEqual(params.touch_distance_ratio, 0.5)
         self.assertEqual(params.touch_cluster_window, 3)
         self.assertEqual(params.min_touch_clusters, 3)
+        self.assertEqual(params.zone_min_touch_clusters, 3)
+        self.assertFalse(params.zone_credit_full_span)
         self.assertEqual(params.hard_break_ratio, 1.0)
         self.assertEqual(params.breakout_buffer_ratio, 0.5)
         self.assertEqual(params.breakout_bars, 2)
@@ -112,6 +125,19 @@ class ParamsTests(unittest.TestCase):
         self.assertEqual(params.intraday_gap_median_multiple, 3.0)
         self.assertEqual(params.max_zones_per_scale, 3)
         self.assertEqual(default_params("uniform").price_axis, "uniform")
+
+    def test_v1_only_relaxes_zone_touch_counts(self):
+        original = default_params()
+        relaxed = default_params(version=PARAM_VERSION_V1)
+        self.assertEqual(relaxed.version, "structure-params-v1")
+        self.assertEqual(relaxed.min_touch_clusters, 3)
+        self.assertEqual(relaxed.zone_min_touch_clusters, 2)
+        self.assertTrue(relaxed.zone_credit_full_span)
+        self.assertEqual(relaxed.touch_distance_ratio, original.touch_distance_ratio)
+        self.assertEqual(relaxed.touch_cluster_window, original.touch_cluster_window)
+        self.assertEqual([scale.to_dict() for scale in relaxed.scales], [scale.to_dict() for scale in original.scales])
+        with self.assertRaises(ValueError):
+            default_params(version="structure-params-v2")
 
     def test_unknown_price_axis_rejected(self):
         with self.assertRaises(ValueError):
@@ -1043,6 +1069,35 @@ def _gapped_levels():
 
 
 class ZoneTests(unittest.TestCase):
+    def test_v1_validates_a_channel_whose_overlap_keeps_only_some_touches(self):
+        levels = _rail_levels(pairs=2)
+        for price_axis in ("log", "uniform"):
+            strict = build_zones(_series_from_levels(levels, price_axis=price_axis))
+            relaxed = build_zones(
+                _series_from_levels(
+                    levels,
+                    price_axis=price_axis,
+                    params=default_params(price_axis, version=PARAM_VERSION_V1),
+                )
+            )
+            before = next(zone for zone in strict.for_scale("short") if zone.primary and zone.label == "channel")
+            after = next(zone for zone in relaxed.for_scale("short") if zone.primary and zone.label == "channel")
+            self.assertIn("lower_touches", before.failed_constraints)
+            self.assertEqual(before.status, "candidate")
+            self.assertEqual(after.lower_touch_clusters, before.lower_touch_clusters)
+            self.assertEqual(after.upper_touch_clusters, before.upper_touch_clusters)
+            self.assertEqual(after.status, "validated", format_zones(relaxed))
+            self.assertTrue(after.draw_on_main)
+            lines = build_boundaries(
+                _series_from_levels(
+                    levels,
+                    price_axis=price_axis,
+                    params=default_params(price_axis, version=PARAM_VERSION_V1),
+                )
+            )
+            thin = next(item for item in lines.for_scale("short") if len(item.touch_clusters) < 3)
+            self.assertNotEqual(thin.status, "validated")
+
     def test_parallel_rising_rails_form_a_channel(self):
         for price_axis in ("log", "uniform"):
             series = _series_from_levels(_rail_levels(), price_axis=price_axis)
@@ -1318,6 +1373,353 @@ def _levels_from_line(structure, start_index, count, volatility_multiple, below_
             geometric = structure.line_at(index) + volatility_multiple * structure.volatility
         levels.append(geometric - math.log(100.0))
     return levels
+
+
+class ReportTests(unittest.TestCase):
+    def test_hand_built_snapshot_renders_without_adding_lines(self):
+        slope = 0.01
+        intercept = math.log(100.0)
+        snapshot = _one_support_snapshot(slope, intercept)
+        snapshot["boundaries"].append(_rejected_boundary())
+        model = build_view_model(snapshot)
+        html = render_report(snapshot)
+        embedded = _embedded_json(html, "structure-snapshot")
+        view = _embedded_json(html, "structure-view-model")
+        self.assertEqual(embedded["identity"]["data_hash"], snapshot["identity"]["data_hash"])
+        validated = [
+            item
+            for item in embedded["boundaries"]
+            if item["primary"] and item["status"] == "validated" and item["role"] == "support"
+        ]
+        self.assertEqual(len(validated), 1)
+        drawn = [item for item in view["boundaries"] if item["role"] == "support" and item["status"] == "validated"]
+        self.assertEqual(drawn, model["boundaries"])
+        self.assertEqual(len(drawn), 1)
+        self.assertEqual(drawn[0]["id"], "mid:support:0-10")
+        self.assertEqual(len(drawn[0]["solid"]), 2)
+        for index, price in drawn[0]["solid"]:
+            self.assertAlmostEqual(price, math.exp(slope * index + intercept))
+        self.assertEqual(html.count('data-table="primary" data-status="validated" data-role="support"'), 1)
+        self.assertIn('id="validated-support-count" data-count="1"', html)
+        self.assertIn("TrendChart.mount(chartRoot, viewModel)", html)
+        self.assertIn(READING_NOTE, html)
+        self.assertIn(SCALE_DEFINITION_NOTE, html)
+        self.assertIn("横向区间", html)
+        self.assertIn("归一化斜率差小于", html)
+
+    def test_chart_keeps_broken_and_extra_trend_zones(self):
+        snapshot = _one_support_snapshot(0.01, math.log(100.0))
+        snapshot["zones"] = [
+            _hand_zone("quota", "channel", "validated", main_chart=False),
+            _hand_zone("broken", "convergence", "broken"),
+            _hand_zone("ended", "sideways", "expired"),
+            _hand_zone("aside", "other", "validated"),
+            _hand_zone("alt", "channel", "validated", primary=False),
+            _hand_zone("wait", "channel", "candidate"),
+        ]
+        drawn = {item["id"]: item["status"] for item in build_view_model(snapshot)["zones"]}
+        self.assertEqual(drawn, {"quota": "validated", "broken": "broken", "ended": "expired"})
+        html = render_report(snapshot)
+        self.assertEqual(html.count(">主图</td>"), 3)
+        self.assertEqual(html.count(">主图不画</td>"), 3)
+        self.assertIn('class="swatch channel"', html)
+        self.assertIn('class="swatch convergence"', html)
+        self.assertIn('class="swatch sideways"', html)
+        root = Path(__file__).resolve().parents[1]
+        for name in ("detect_pivots", "build_boundaries", "build_zones", "build_lifecycle", "build_segments"):
+            self.assertNotIn(name, (root / "analysis/structure/view_model.py").read_text(encoding="utf-8"))
+            self.assertNotIn(name, (root / "analysis/structure/html_report.py").read_text(encoding="utf-8"))
+            self.assertNotIn(name, (root / "analysis/structure/assets/structure-chart.js").read_text(encoding="utf-8"))
+
+    def test_uniform_endpoints_use_the_price_itself(self):
+        snapshot = _one_support_snapshot(1.5, 100.0, price_axis="uniform")
+        line = build_view_model(snapshot)["boundaries"][0]
+        self.assertEqual(line["solid"], [[0, 100.0], [10, 115.0]])
+
+    def test_price_axis_distance_matches_the_axis(self):
+        self.assertAlmostEqual(price_axis_distance(100, 200, "log"), price_axis_distance(200, 400, "log"))
+        self.assertAlmostEqual(price_axis_distance(100, 110, "uniform"), price_axis_distance(400, 410, "uniform"))
+        self.assertGreater(price_axis_distance(100, 200, "uniform"), price_axis_distance(200, 400, "log"))
+
+    def test_requested_window_does_not_change_scale_definitions(self):
+        short = build_snapshot(
+            _series_from_levels(_warm(12)),
+            symbol="WIN",
+            requested_start="2024-01-01",
+            requested_end="2024-02-01",
+            visible_scales=["long"],
+            engine_version="test",
+        )
+        long = build_snapshot(
+            _series_from_levels(_rising_support_levels()),
+            symbol="WIN",
+            requested_start="2020-01-01",
+            requested_end="2024-12-31",
+            visible_scales=["short", "mid"],
+            engine_version="test",
+        )
+        self.assertEqual(short["params"], long["params"])
+        self.assertEqual(short["identity"]["scale_definition"], long["identity"]["scale_definition"])
+        self.assertEqual([item["k"] for item in short["identity"]["scale_definition"]["scales"]], [1.5, 3.0, 6.0])
+        self.assertEqual([item["max_span"] for item in short["identity"]["scale_definition"]["scales"]], [60, 120, 250])
+        self.assertNotEqual(short["identity"]["requested_start"], long["identity"]["requested_start"])
+        self.assertEqual(short["identity"]["visible_scales"], ["long"])
+        self.assertEqual([item["name"] for item in short["params"]["scales"]], ["short", "mid", "long"])
+        self.assertEqual(
+            resolve_requested_window(start=date(2024, 1, 1), end=date(2024, 3, 1), years=None, today=date(2024, 6, 1)),
+            (date(2024, 1, 1), date(2024, 3, 1)),
+        )
+        self.assertEqual(
+            resolve_requested_window(start=None, end=None, years=1, today=date(2024, 6, 1))[0],
+            date(2023, 6, 2),
+        )
+        with self.assertRaises(ValueError):
+            resolve_requested_window(start=date(2024, 1, 1), end=None, years=2, today=date(2024, 6, 1))
+
+    def test_as_of_hides_later_structures_without_dropping_closes(self):
+        series = _series_from_levels(_rising_support_levels())
+        snapshot = build_snapshot(series, symbol="ASOF", engine_version="test")
+        support = next(item for item in snapshot["boundaries"] if item["id"] == "short:support:0-53")
+        earlier = datetime.fromisoformat(support["available_time"]) - timedelta(seconds=1)
+        snapshot["identity"]["as_of"] = earlier.isoformat()
+        model = build_view_model(snapshot)
+        self.assertNotIn(support["id"], [item["id"] for item in model["boundaries"]])
+        self.assertEqual(len(model["closes"]), len(snapshot["closes"]))
+        self.assertTrue(all(item["id"] in {row["id"] for row in snapshot["boundaries"]} for item in model["boundaries"]))
+
+    def test_as_of_rolls_a_later_breakout_back_to_validated(self):
+        base = _rising_support_levels()
+        support = build_lifecycle(_series_from_levels(base)).boundary("short:support:0-53")
+        snapshot = build_snapshot(
+            _series_from_levels(base + _levels_from_line(support, len(base), 2, -0.8)),
+            symbol="ROLL",
+            engine_version="test",
+        )
+        validated = next(
+            item
+            for item in snapshot["events"]
+            if item["object_id"] == support.id and item["event_type"] == "validated"
+        )
+        snapshot["identity"]["as_of"] = validated["available_time"]
+        line = next(item for item in build_view_model(snapshot)["boundaries"] if item["id"] == support.id)
+        self.assertEqual(line["status"], "validated")
+        self.assertIsNone(line["breakout"])
+
+    def test_gap_lowers_quality_without_a_crossing_line(self):
+        series = _series_from_levels([0.0] * 6 + [0.01] * 6, extra_days={6: 12})
+        snapshot = build_snapshot(series, symbol="GAP", engine_version="test")
+        self.assertEqual(snapshot["quality"]["grade"], "降级")
+        self.assertGreater(snapshot["quality"]["gap_count"], 0)
+        self.assertEqual(snapshot["quality"]["crossing_ids"], [])
+        self.assertEqual(snapshot["quality"]["rejected_non_positive"], 0)
+
+    def test_report_files_follow_the_result_directory(self):
+        series = _series_from_levels(_rising_support_levels(), price_axis="log")
+        other = _series_from_levels(_rising_support_levels(), price_axis="uniform")
+        with TemporaryDirectory() as folder:
+            log_snapshot = build_snapshot(series, symbol="DIR", engine_version="test")
+            uniform_snapshot = build_snapshot(other, symbol="DIR", engine_version="test")
+            log_written = write_result(folder, log_snapshot)
+            uniform_written = write_result(folder, uniform_snapshot)
+            self.assertNotEqual(log_written["directory"], uniform_written["directory"])
+            self.assertTrue(log_written["snapshot"].is_file())
+            self.assertTrue(log_written["report"].is_file())
+            saved = json.loads(log_written["snapshot"].read_text(encoding="utf-8"))
+            self.assertEqual(saved["identity"]["data_hash"], series.data_hash)
+            self.assertEqual(saved["identity"]["price_axis"], "log")
+            self.assertIn("对数价格", log_written["report"].read_text(encoding="utf-8"))
+            again = write_result(folder, log_snapshot)
+            self.assertEqual(again["snapshot"], log_written["snapshot"])
+
+
+def _one_support_snapshot(slope, intercept, price_axis="log"):
+    params = default_params(price_axis)
+    if price_axis == "log":
+        end_price = math.exp(slope * 10 + intercept)
+        start_price = math.exp(intercept)
+    else:
+        start_price = intercept
+        end_price = slope * 10 + intercept
+    return {
+        "kind": "trend_structure_snapshot",
+        "reading": READING_NOTE,
+        "scale_definition_note": SCALE_DEFINITION_NOTE,
+        "identity": {
+            "symbol": "HAND",
+            "interval": "1d",
+            "start_time": "2024-01-02T16:00:00",
+            "end_time": "2024-01-16T16:00:00",
+            "requested_start": "2024-01-02",
+            "requested_end": "2024-01-16",
+            "param_version": PARAM_VERSION,
+            "data_hash": "hand-built",
+            "price_basis": "close",
+            "price_axis": price_axis,
+            "price_axis_label": "对数价格" if price_axis == "log" else "均匀价格",
+            "engine_version": "",
+            "engine_version_note": "取不到 git 短哈希，引擎代码版本留空。",
+            "as_of": None,
+            "visible_scales": ["mid"],
+            "data_source": "synthetic",
+            "bar_count": 2,
+            "scale_definition": {
+                "note": SCALE_DEFINITION_NOTE,
+                "param_version": PARAM_VERSION,
+                "scales": [scale.to_dict() for scale in params.scales],
+            },
+        },
+        "quality": {
+            "bar_count": 2,
+            "gap_count": 0,
+            "gaps": [],
+            "rejected_non_positive": 0,
+            "grade": "正常",
+            "grade_note": "没有间断。",
+            "crossing_ids": [],
+        },
+        "volatility": {"scales": [], "unit": "对数收益" if price_axis == "log" else "价格差"},
+        "pivot_stats": [],
+        "pivots": [],
+        "temporary_pivots": [],
+        "segments": [],
+        "temporary_segments": [],
+        "boundaries": [
+            {
+                "id": "mid:support:0-10",
+                "revision": 1,
+                "scale": "mid",
+                "role": "support",
+                "status": "validated",
+                "primary": True,
+                "alternate_of": None,
+                "start_index": 0,
+                "end_index": 10,
+                "start_time": "2024-01-02T16:00:00",
+                "end_time": "2024-01-16T16:00:00",
+                "available_time": "2024-01-18T16:00:00",
+                "slope": slope,
+                "intercept": intercept,
+                "normalized_slope": 0.2,
+                "span": 10,
+                "touch_clusters": [[0], [5], [10]],
+                "touch_error_median": 0.1,
+                "touch_error_p90": 0.2,
+                "max_break_depth": 0.3,
+                "longest_violation_bars": 0,
+                "constraints": [{"name": "two_pivots", "passed": True, "detail": "两个拐点"}],
+                "failed_constraints": [],
+                "simplicity_penalty": 0.0,
+                "context_fit": "未使用",
+                "score": {
+                    "geometry": 1.0,
+                    "touch_quality": 1.0,
+                    "significance": 1.0,
+                    "path_integrity": 1.0,
+                    "span": 1.0,
+                    "simplicity_penalty": 0.0,
+                    "context_fit": "未使用",
+                    "total": 1.0,
+                },
+            }
+        ],
+        "zones": [],
+        "events": [],
+        "relations": {
+            "boundary_groups": [],
+            "zone_groups": [],
+            "overlaps": [],
+            "segment_contains": [],
+            "overlap_note": "不合并为一条证据",
+        },
+        "closes": [
+            {"index": 0, "time": "2024-01-02T16:00:00", "close": start_price, "gap_before": False},
+            {"index": 10, "time": "2024-01-16T16:00:00", "close": end_price, "gap_before": False},
+        ],
+        "params": params.to_dict(),
+    }
+
+
+def _hand_zone(zone_id, label, status, *, primary=True, main_chart=False):
+    return {
+        "id": zone_id,
+        "revision": 1,
+        "scale": "mid",
+        "label": label,
+        "status": status,
+        "primary": primary,
+        "alternate_of": None if primary else "quota",
+        "emits_events": False,
+        "draw_on_main": False,
+        "main_chart": main_chart,
+        "lower_id": zone_id + ":lower",
+        "upper_id": zone_id + ":upper",
+        "lower_slope": 0.0,
+        "lower_intercept": math.log(90.0),
+        "upper_slope": 0.0,
+        "upper_intercept": math.log(110.0),
+        "volatility": 0.01,
+        "effective_start": 0,
+        "effective_end": 10,
+        "projected_start": 0,
+        "projected_end": 10,
+        "start_time": "2024-01-02T16:00:00",
+        "end_time": "2024-01-16T16:00:00",
+        "confirm_index": 10,
+        "confirm_time": "2024-01-16T16:00:00",
+        "available_time": "2024-01-18T16:00:00",
+        "start_width": 0.2,
+        "end_width": 0.2,
+        "width_ratio": 1.0,
+        "slope_gap": 0.0,
+        "normalized_slope_gap": 0.0,
+        "lower_touch_clusters": 3,
+        "upper_touch_clusters": 3,
+        "max_break_depth": 0.1,
+        "constraints": [],
+        "failed_constraints": [],
+        "simplicity_penalty": 0.0,
+        "context_fit": "未使用",
+        "score": None,
+    }
+
+
+def _rejected_boundary():
+    return {
+        "id": "mid:support:2-8",
+        "revision": 1,
+        "scale": "mid",
+        "role": "support",
+        "status": "rejected",
+        "primary": True,
+        "alternate_of": None,
+        "start_index": 2,
+        "end_index": 8,
+        "start_time": "2024-01-04T16:00:00",
+        "end_time": "2024-01-12T16:00:00",
+        "available_time": "2024-01-14T16:00:00",
+        "slope": 0.0,
+        "intercept": math.log(90.0),
+        "normalized_slope": -1.0,
+        "span": 6,
+        "touch_clusters": [[2], [8]],
+        "touch_error_median": None,
+        "touch_error_p90": None,
+        "max_break_depth": 2.0,
+        "longest_violation_bars": 3,
+        "constraints": [{"name": "hard_break", "passed": False, "detail": "破坏过深"}],
+        "failed_constraints": ["hard_break"],
+        "simplicity_penalty": 0.0,
+        "context_fit": "未使用",
+        "score": None,
+    }
+
+
+def _embedded_json(html, element_id):
+    marker = f'id="{element_id}"'
+    start = html.index(marker)
+    start = html.index(">", start) + 1
+    end = html.index("</script>", start)
+    return json.loads(html[start:end])
 
 
 if __name__ == "__main__":
