@@ -6,10 +6,14 @@
 
 ```bash
 python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
-python scripts/run_trend_structure.py --symbol 00700 --start 2024-01-01 --end 2024-12-31 --param-version structure-params-v1
+python scripts/run_trend_structure.py --symbol 00700,600519,AAPL --years 1 --param-version structure-params-v0
+python scripts/run_trend_structure.py --symbol 00700 --symbol 600519 --years 1
+python scripts/run_trend_structure.py --symbols-file symbols.txt --start 2024-01-01 --end 2024-12-31 --param-version structure-params-v1
 python scripts/run_trend_structure.py --symbol 00700 --years 1 --param-version structure-params-v0
 python scripts/run_trend_structure.py --samples
 ```
+
+`--symbol` 可以一次写多只股票：重复这个参数，或在同一个参数里用逗号、空格、顿号分开。`--symbols` 与 `--symbol` 相同。`--symbols-file` 读一个文本文件，每行一个或多个代码，`#` 后面是注释。这些股票共用同一段日期、周期、价格轴和参数版本，每只各自写一份结果。某一只取不到 K 线时，其余继续；只要有失败，命令以非 0 退出。每次运行都会刷新输出根目录的 `index.html`。打开它之后，点一只股票就进入该股票的 `report.html`。
 
 不写 `--param-version` 时用 `structure-params-v1`。这一版只放宽趋势区间：有效区间内每侧至少 2 个接触簇；如果这条边界全长已经有 3 个接触簇，有效区间里还留着至少 1 个也算通过。趋势线仍然要 3 个接触簇，贴线距离仍然是 0.5 倍波动。`structure-params-v0` 是原来的规则，结果写在另一个目录里。
 
@@ -37,6 +41,8 @@ python scripts/run_trend_structure.py --samples
 
 看 3 个月和看 5 年，用的是同一组 k、门槛下限和最大跨度。区间太短时，长尺度可能还凑不齐拐点，这是样本不够，定义并没有被改短。
 
+上市时间短于请求区间时，只要已完成 K 线不少于分析下限，就用实际有的那段完成拟合。下限是波动 EWMA 跨度（20 根）和短尺度最大跨度的一半（30 根）里较大的那个，目前是 30 根。少于此数会停在这只股票上，并说明根数不够。达到下限后，短尺度和中尺度按这些 K 线拟合，线的跨度不会超过已有根数。页面上会写明可得区间短于请求起点。
+
 `--scales` 也只决定页面第一次打开哪些尺度。三个尺度都会拟合。对数轴和均匀轴要各跑一次，页面不会把一种轴上的直线改画到另一种轴上。
 
 请把起止日期和回看年数分开用。写了 `--start` 再写 `--years`，命令会停下来。
@@ -52,6 +58,8 @@ structure_results/{标的}/{周期}/{参数版本}/{价格轴}/{数据哈希}/
 `report.html` 是单文件。样式、图表和快照都在里面，双击用浏览器打开，不需要本地服务，也不请求外网。
 
 同一标的、同一周期、同一参数版本、同一价格轴、同一段收盘价，再次运行会覆盖这个目录里的同名文件。改过任何一根收盘价，数据哈希就变，结果写到新目录，旧目录留着。
+
+输出根目录的 `index.html` 是全部已有报告的入口。同一标的、同一周期、同一参数版本、同一价格轴只留下最新一份的链接；点股票名就打开这份 `report.html`。同一只股票还有另一种价格轴或参数版本时，卡片里另有一次点击就能打开的链接。再跑一批会按目录里实际有的报告重写这份入口。
 
 `snapshot.json` 是引擎的完整结构化结果。页面上的表和 view model 都从它来。`--as-of` 只影响页面上显示哪些对象；文件里仍保留整段运行，方便和当时可见的图对照。
 

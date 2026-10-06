@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
-from analysis.structure.config import PARAM_VERSION, SCALE_NAMES, StructureParams
+from analysis.structure.config import PARAM_VERSION, SCALE_NAMES, StructureParams, default_params
 from analysis.structure.lifecycle import build_lifecycle
 from analysis.structure.pivots import detect_pivots
 from analysis.structure.segments import build_segments
@@ -225,6 +225,12 @@ def _identity(
         "visible_scales": list(visible_scales),
         "data_source": data_source,
         "bar_count": len(series),
+        "history_note": describe_short_history(
+            series.bars[0].timestamp.date(),
+            requested_start,
+            len(series),
+            params,
+        ),
         "scale_definition": {
             "note": SCALE_DEFINITION_NOTE,
             "param_version": params.version or PARAM_VERSION,
@@ -324,6 +330,46 @@ def _median(values: Sequence[float]) -> Optional[float]:
     if count % 2:
         return nums[mid]
     return (nums[mid - 1] + nums[mid]) / 2.0
+
+
+def describe_short_history(
+    actual_start: date,
+    requested_start,
+    bar_count: int,
+    params: Optional[StructureParams] = None,
+) -> str:
+    """上市或数据起点晚于请求起点时，说明这次按已有 K 线完成拟合。"""
+    requested = _coerce_date(requested_start)
+    if requested is None or actual_start <= requested:
+        return ""
+    if (actual_start - requested).days <= 14:
+        return ""
+    resolved = params or default_params()
+    long_span = resolved.scale("long").max_span
+    text = (
+        f"可得 K 线从 {actual_start.isoformat()} 起，共 {bar_count} 根，"
+        f"短于请求起点 {requested.isoformat()}。"
+        f"短尺度和中尺度按这些 K 线拟合。"
+    )
+    if bar_count < long_span:
+        text += f"长尺度最大跨度是 {long_span} 根，样本较短时可以没有已确认拐点。"
+    return text
+
+
+def _coerce_date(value) -> Optional[date]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if len(text) >= 10:
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _date_text(value) -> Optional[str]:

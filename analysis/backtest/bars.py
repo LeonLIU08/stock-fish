@@ -181,6 +181,9 @@ class BarLoader:
         symbol: str,
         config: BacktestConfig,
         warmup_bars: Optional[int] = None,
+        *,
+        allow_short_history: bool = False,
+        min_bars: int = 1,
     ) -> Tuple[pd.DataFrame, str]:
         bars = warmup_bars if warmup_bars is not None else 20
         padded_start = config.start - timedelta(days=config.warmup_calendar_days(bars))
@@ -201,6 +204,9 @@ class BarLoader:
             fetchers=fetchers,
             start=padded_start,
             end=config.end,
+            allow_short_history=allow_short_history,
+            min_bars=min_bars,
+            interval=config.interval,
         )
 
     def load_benchmark(
@@ -226,14 +232,60 @@ class BarLoader:
             end=config.end,
         )
 
-    def _load(self, cache_key: str, fetchers, start: date, end: date) -> Tuple[pd.DataFrame, str]:
+    def _load(
+        self,
+        cache_key: str,
+        fetchers,
+        start: date,
+        end: date,
+        *,
+        allow_short_history: bool = False,
+        min_bars: int = 1,
+        interval: str = "1d",
+    ) -> Tuple[pd.DataFrame, str]:
         path = _cache_path(cache_key)
         cached = _read_cache(path)
-        if cached is not None and len(cached) > 0 and coverage_ok(cached, start, end):
-            logger.info(f"K 线缓存命中 {cache_key}: {len(cached)} bars")
-            return cached, "cache"
-
         errors = []
+        short_choice: Optional[Tuple[pd.DataFrame, str]] = None
+        below_min: Optional[Tuple[int, date, date]] = None
+
+        def absorb(df: pd.DataFrame, source: str) -> bool:
+            """完整覆盖时直接采用。短历史先记下，等全部来源都试过再选最长的一段。"""
+            nonlocal short_choice, below_min
+            kind = classify_history(
+                df,
+                start,
+                end,
+                allow_short_history=allow_short_history,
+                min_bars=min_bars,
+                interval=interval,
+            )
+            if kind == "full":
+                _write_cache(path, df)
+                logger.info(f"K 线加载成功 {cache_key}: source={source}, bars={len(df)}")
+                return True
+            span = f"{df['datetime'].iloc[0]} ~ {df['datetime'].iloc[-1]}"
+            if kind == "short":
+                if short_choice is None or len(df) > len(short_choice[0]):
+                    short_choice = (df, source)
+                logger.info(f"K 线短于请求区间，留作候选 {source}: {span}, bars={len(df)}")
+                return False
+            if kind == "short-below-min":
+                first, last = frame_date_span(df)
+                if below_min is None or len(df) > below_min[0]:
+                    below_min = (len(df), first, last)
+                errors.append(f"{source}: coverage too short ({span}, {len(df)} bars)")
+                return False
+            errors.append(f"{source}: coverage too short ({span}, {len(df)} bars)")
+            logger.warning(f"K 线覆盖不足，跳过 {source}: {span}")
+            return False
+
+        if cached is not None and len(cached) > 0:
+            if coverage_ok(cached, start, end):
+                logger.info(f"K 线缓存命中 {cache_key}: {len(cached)} bars")
+                return cached, "cache"
+            absorb(cached, "cache")
+
         for fetcher in fetchers:
             try:
                 result = fetcher()
@@ -251,14 +303,25 @@ class BarLoader:
             if df.empty:
                 errors.append(f"{source}: empty after normalize")
                 continue
-            if not coverage_ok(df, start, end):
-                span = f"{df['datetime'].iloc[0]} ~ {df['datetime'].iloc[-1]}"
-                errors.append(f"{source}: coverage too short ({span})")
-                logger.warning(f"K 线覆盖不足，跳过 {source}: {span}")
-                continue
+            if absorb(df, source):
+                return df, source
+
+        if short_choice is not None:
+            df, source = short_choice
             _write_cache(path, df)
-            logger.info(f"K 线加载成功 {cache_key}: source={source}, bars={len(df)}")
+            first, last = frame_date_span(df)
+            logger.info(
+                f"K 线短于请求区间，改用可得区间 {cache_key}: "
+                f"source={source}, {first.isoformat()} ~ {last.isoformat()}, bars={len(df)}"
+            )
             return df, source
+
+        if below_min is not None:
+            count, first, last = below_min
+            raise RuntimeError(
+                f"可得 K 线只有 {count} 根（{first.isoformat()} 至 {last.isoformat()}），"
+                f"少于短、中尺度分析所需的 {min_bars} 根"
+            )
 
         raise RuntimeError(f"无法获取 K 线 {cache_key}: {'; '.join(errors) or 'no source'}")
 
@@ -374,14 +437,52 @@ def coverage_ok(df: pd.DataFrame, start: date, end: date, min_frac: float = 0.5)
     """Reject truncated feeds (e.g. Yahoo 1m only keeps ~7 days)."""
     if df is None or df.empty:
         return False
+    first, last = frame_date_span(df)
+    got = max((last - first).days, 1)
+    need = max((end - start).days, 1)
+    return got >= need * min_frac
+
+
+def frame_date_span(df: pd.DataFrame) -> tuple[date, date]:
+    """第一根和最后一根 K 线的日期。有时区时先换到香港时间。"""
     first = pd.Timestamp(df["datetime"].iloc[0])
     last = pd.Timestamp(df["datetime"].iloc[-1])
     if first.tzinfo is not None:
         first = first.tz_convert(HK_TZ)
         last = last.tz_convert(HK_TZ)
-    got = max((last.date() - first.date()).days, 1)
-    need = max((end - start).days, 1)
-    return got >= need * min_frac
+    return first.date(), last.date()
+
+
+def classify_history(
+    df: pd.DataFrame,
+    start: date,
+    end: date,
+    *,
+    min_frac: float = 0.5,
+    allow_short_history: bool = False,
+    min_bars: int = 1,
+    interval: str = "1d",
+) -> str:
+    """判断一段 K 线能不能用于请求区间。
+
+    `full`：日历跨度盖住请求区间。
+    `short`：开头晚于请求起点，尾部仍接近结束日，根数达到下限。上市时间较短时用这段完成分析。
+    `short-below-min`：同样是短历史，但根数低于下限。
+    `reject`：空数据、尾部太旧，或未允许短历史。
+    """
+    if df is None or df.empty:
+        return "reject"
+    if coverage_ok(df, start, end, min_frac):
+        return "full"
+    if not allow_short_history:
+        return "reject"
+    first, last = frame_date_span(df)
+    slack = 14 if interval == "1d" else 4
+    if first <= start or last < end - timedelta(days=slack):
+        return "reject"
+    if len(df) < min_bars:
+        return "short-below-min"
+    return "short"
 
 
 def slice_eval_window(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:

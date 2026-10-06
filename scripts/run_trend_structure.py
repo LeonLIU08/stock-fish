@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""对一只股票的一段已完成 K 线做趋势结构拟合，并写出离线 HTML。
+"""对一段已完成 K 线做趋势结构拟合，并写出离线 HTML。
+
+一次命令可以跑多只股票。它们共用日期、周期、价格轴和参数版本，
+每只仍写入自己的目录。每次运行都会刷新输出根目录的 index.html，
+点一只股票就打开它的 report.html。
 
 短、中、长的 k、门槛下限和最大跨度不随时间范围改变。
 默认参数版本是 structure-params-v1。对照旧规则时加上
@@ -7,6 +11,9 @@
 
 示例:
     python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
+    python scripts/run_trend_structure.py --symbol 00700,600519,AAPL --years 1 --param-version structure-params-v0
+    python scripts/run_trend_structure.py --symbol 00700 --symbol 600519 --years 1
+    python scripts/run_trend_structure.py --symbols-file symbols.txt --years 1
     python scripts/run_trend_structure.py --symbol 00700 --start 2024-01-01 --end 2024-12-31
     python scripts/run_trend_structure.py --symbol 600519 --years 2 --price-axis uniform --scales short,mid,long
     python scripts/run_trend_structure.py --symbol 00700 --years 1 --as-of 2025-06-01
@@ -15,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -41,7 +49,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="拟合短、中、长趋势线和趋势区间，写出可离线打开的 report.html",
         epilog="字段说明见 document/trend-structure-manual.md",
     )
-    parser.add_argument("--symbol", help="股票代码，例如 00700、600519、AAPL")
+    parser.add_argument(
+        "--symbol",
+        nargs="+",
+        action="append",
+        metavar="CODE",
+        help="股票代码。可重复，也可用逗号、空格或顿号分隔：00700,600519 AAPL",
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        action="append",
+        metavar="CODE",
+        help="同 --symbol",
+    )
+    parser.add_argument(
+        "--symbols-file",
+        help="股票列表文件。每行一个或多个代码，# 后为注释",
+    )
     parser.add_argument("--interval", default="1d", choices=BAR_INTERVALS, help="K 线周期，默认 1d")
     parser.add_argument("--start", help="开始日期 YYYY-MM-DD。和 --years 分开使用")
     parser.add_argument("--end", help="结束日期 YYYY-MM-DD，默认今天")
@@ -69,7 +94,8 @@ def main(argv: list | None = None) -> int:
     try:
         if args.samples:
             return _write_samples(Path(args.output_dir), args.price_axis)
-        if not args.symbol:
+        symbols = collect_symbols(args.symbol, args.symbols, args.symbols_file)
+        if not symbols:
             raise ValueError("请提供 --symbol，或用 --samples 生成合成检查页")
         start, end = resolve_requested_window(
             start=_parse_date(args.start) if args.start else None,
@@ -79,30 +105,329 @@ def main(argv: list | None = None) -> int:
         )
         params = default_params(args.price_axis, version=args.param_version)
         _print_scale_definition(start, end, params)
-        timestamps, closes, source = _load_closes(args.symbol, args.interval, start, end)
-        series = build_series(
-            timestamps,
-            closes,
-            interval=args.interval,
-            params=params,
-        )
-        snapshot = build_snapshot(
-            series,
-            symbol=args.symbol,
-            requested_start=start,
-            requested_end=end,
-            as_of=args.as_of,
-            visible_scales=args.scales,
-            data_source=source,
-        )
-        written = write_result(args.output_dir, snapshot)
-    except (ValueError, RuntimeError, NonPositivePriceError) as exc:
+    except (ValueError, RuntimeError, NonPositivePriceError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"K 线: {snapshot['identity']['bar_count']} 根，来源 {snapshot['identity']['data_source']}")
-    print(f"快照: {written['snapshot']}")
-    print(f"报告: {written['report']}")
-    return 0
+
+    outcomes = []
+    total = len(symbols)
+    for index, symbol in enumerate(symbols, start=1):
+        if total > 1:
+            print(f"[{index}/{total}] {symbol}")
+        try:
+            outcome = _run_symbol(
+                symbol,
+                interval=args.interval,
+                start=start,
+                end=end,
+                params=params,
+                as_of=args.as_of,
+                scales=args.scales,
+                output_dir=args.output_dir,
+            )
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            if not isinstance(exc, (ValueError, RuntimeError, NonPositivePriceError)):
+                message = f"{exc.__class__.__name__}: {message}"
+            print(f"{symbol}: {message}", file=sys.stderr)
+            outcomes.append({"symbol": symbol, "error": message})
+            continue
+        outcomes.append(outcome)
+        if outcome.get("history_note"):
+            print(outcome["history_note"])
+        print(f"K 线: {outcome['bar_count']} 根，来源 {outcome['source']}")
+        print(f"快照: {outcome['snapshot']}")
+        print(f"报告: {outcome['report']}")
+
+    failed = [item for item in outcomes if item.get("error")]
+    if total > 1:
+        print(f"完成 {total - len(failed)} 只，失败 {len(failed)} 只")
+    index_path = _write_catalog_index(Path(args.output_dir), failures=failed)
+    if index_path is not None:
+        print(f"索引: {index_path}")
+    return 1 if failed else 0
+
+
+def collect_symbols(symbol_groups, symbols_groups, symbols_file: str | None) -> list[str]:
+    """按出现顺序收集代码，并去掉重复。"""
+    tokens: list[str] = []
+    for groups in (symbol_groups, symbols_groups):
+        for group in groups or []:
+            for item in group:
+                tokens.extend(_split_symbol_text(item))
+    if symbols_file:
+        path = Path(symbols_file)
+        if not path.is_file():
+            raise ValueError(f"找不到股票列表: {path}")
+        tokens.extend(_split_symbol_text(path.read_text(encoding="utf-8")))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
+
+def _split_symbol_text(text: str) -> list[str]:
+    normalized = text.replace("，", ",").replace("、", ",").replace(";", ",")
+    chunks: list[str] = []
+    for line in normalized.splitlines():
+        comment = line.split("#", 1)[0]
+        for piece in comment.split(","):
+            chunks.extend(piece.split())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_dir) -> dict:
+    timestamps, closes, source = _load_closes(symbol, interval, start, end)
+    series = build_series(timestamps, closes, interval=interval, params=params)
+    snapshot = build_snapshot(
+        series,
+        symbol=symbol,
+        requested_start=start,
+        requested_end=end,
+        as_of=as_of,
+        visible_scales=scales,
+        data_source=source,
+    )
+    written = write_result(output_dir, snapshot)
+    identity = snapshot["identity"]
+    return {
+        "symbol": symbol,
+        "bar_count": identity["bar_count"],
+        "source": identity["data_source"],
+        "snapshot": written["snapshot"],
+        "report": written["report"],
+        "history_note": identity.get("history_note") or "",
+    }
+
+
+def _write_catalog_index(output_root: Path, failures=None) -> Path | None:
+    """扫描结果目录，写成点一次就打开 report.html 的入口。"""
+    grouped = _catalog_groups(output_root)
+    failure_rows = [item for item in (failures or []) if item.get("error")]
+    samples = output_root / "_samples" / "index.html"
+    if not grouped and not failure_rows and not samples.is_file():
+        return None
+    output_root.mkdir(parents=True, exist_ok=True)
+    index = output_root / "index.html"
+    cards = []
+    for symbol, reports in grouped:
+        primary = reports[0]
+        alts = reports[1:]
+        cards.append(_catalog_card(symbol, primary, alts, output_root))
+    failed_html = ""
+    if failure_rows:
+        items = "\n".join(
+            f"<li><strong>{_esc(item['symbol'])}</strong><p>{_esc(item['error'])}</p></li>"
+            for item in failure_rows
+        )
+        failed_html = f"<section class=\"failed\"><h2>这次没有写出报告</h2><ul>{items}</ul></section>"
+    sample_html = ""
+    if samples.is_file():
+        sample_html = '<p class="samples"><a href="_samples/index.html">合成检查页</a></p>'
+    count = len(grouped)
+    index.write_text(
+        f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>趋势结构</title>
+<style>
+  body {{ margin: 0; background: #14120f; color: #f3efe4; font: 16px/1.5 "PingFang SC", sans-serif; }}
+  header, main {{ margin: 0 auto; max-width: 1080px; padding: 1.5rem 1.25rem; }}
+  h1 {{ margin: 0 0 0.35rem; font-size: 1.6rem; }}
+  .lead, .meta, .note, .failed p {{ color: #a79f91; }}
+  a {{ color: #e0a45a; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.9rem; margin-top: 1.2rem; }}
+  a.card, article.card {{ display: block; background: #1e1b16; border-radius: 12px; padding: 1rem 1.05rem; text-decoration: none; color: inherit; }}
+  a.card:hover, article.card:hover {{ background: #28241c; }}
+  a.card strong, a.title {{ display: block; color: #e0a45a; font-size: 1.45rem; letter-spacing: 0.02em; }}
+  .name {{ display: block; margin-top: 0.12rem; color: #f3efe4; font-size: 1rem; font-weight: 500; letter-spacing: 0; }}
+  a.title {{ text-decoration: none; }}
+  a.card:hover strong, a.title:hover {{ text-decoration: underline; }}
+  .meta, .note {{ margin: 0.35rem 0 0; font-size: 0.92rem; }}
+  .alts {{ display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; margin-top: 0.7rem; }}
+  .alts a {{ font-size: 0.88rem; }}
+  .failed {{ margin-top: 1.6rem; }}
+  .failed li {{ margin: 0.6rem 0; }}
+  .samples {{ margin-top: 1.4rem; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>趋势结构</h1>
+  <p class="lead">点一只股票，直接打开它的报告。共 {count} 只。</p>
+</header>
+<main>
+  <div class="grid">
+{"".join(cards)}
+  </div>
+  {failed_html}
+  {sample_html}
+</main>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+    return index
+
+
+def _catalog_groups(output_root: Path) -> list[tuple[str, list[dict]]]:
+    """同一标的、周期、参数版本、价格轴只保留最新一份报告。"""
+    latest: dict[tuple, dict] = {}
+    if not output_root.is_dir():
+        return []
+    for report in output_root.rglob("report.html"):
+        if "_samples" in report.parts:
+            continue
+        entry = _catalog_entry(output_root, report)
+        if entry is None:
+            continue
+        key = (entry["symbol"], entry["interval"], entry["param_version"], entry["price_axis"])
+        current = latest.get(key)
+        if current is None or entry["mtime"] > current["mtime"]:
+            latest[key] = entry
+    by_symbol: dict[str, list[dict]] = {}
+    for entry in latest.values():
+        by_symbol.setdefault(entry["symbol"], []).append(entry)
+    ordered = []
+    for symbol in sorted(by_symbol, key=_symbol_sort_key):
+        reports = sorted(by_symbol[symbol], key=_report_sort_key)
+        ordered.append((symbol, reports))
+    return ordered
+
+
+def _catalog_entry(output_root: Path, report: Path) -> dict | None:
+    snapshot_path = report.with_name("snapshot.json")
+    identity = {}
+    if snapshot_path.is_file():
+        try:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            identity = payload.get("identity") or {}
+        except (OSError, json.JSONDecodeError):
+            identity = {}
+    parts = report.relative_to(output_root).parts
+    symbol = str(identity.get("symbol") or (parts[0] if parts else "")).strip()
+    if not symbol or symbol.startswith("SAMPLE"):
+        return None
+    interval = str(identity.get("interval") or (parts[1] if len(parts) > 1 else ""))
+    param_version = str(identity.get("param_version") or (parts[2] if len(parts) > 2 else ""))
+    price_axis = str(identity.get("price_axis") or (parts[3] if len(parts) > 3 else ""))
+    start = _day_text(identity.get("start_time") or identity.get("requested_start"))
+    end = _day_text(identity.get("end_time") or identity.get("requested_end"))
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "param_version": param_version,
+        "price_axis": price_axis,
+        "price_axis_label": identity.get("price_axis_label") or ("对数价格" if price_axis == "log" else "均匀价格" if price_axis == "uniform" else price_axis),
+        "bar_count": identity.get("bar_count"),
+        "start": start,
+        "end": end,
+        "history_note": identity.get("history_note") or "",
+        "report": report,
+        "mtime": report.stat().st_mtime,
+    }
+
+
+def _catalog_card(symbol: str, primary: dict, alts: list[dict], output_root: Path) -> str:
+    href = _report_href(primary["report"], output_root)
+    title = _esc(symbol) + _name_markup(symbol)
+    meta = _esc(_report_meta(primary))
+    note = '<p class="note">可得区间短于请求</p>' if primary.get("history_note") else ""
+    if not alts:
+        return (
+            f'<a class="card" href="{href}">'
+            f"<strong>{title}</strong>"
+            f'<p class="meta">{meta}</p>'
+            f"{note}"
+            "</a>\n"
+        )
+    links = "".join(
+        f'<a href="{_report_href(item["report"], output_root)}">{_esc(_variant_label(item))}</a>'
+        for item in alts
+    )
+    return (
+        '<article class="card">'
+        f'<a class="title" href="{href}">{title}</a>'
+        f'<p class="meta">{meta}</p>'
+        f"{note}"
+        f'<div class="alts">{links}</div>'
+        "</article>\n"
+    )
+
+
+def _name_markup(symbol: str) -> str:
+    name = _stock_display_name(symbol)
+    if not name:
+        return ""
+    return f'<span class="name">{_esc(name)}</span>'
+
+
+def _stock_display_name(symbol: str) -> str:
+    """港股数字代码和已有映射里的中文名。没有对应名称时留空。"""
+    from market_data.stock_index.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+
+    code = str(symbol or "").strip().upper()
+    if code.isdigit():
+        code = code.zfill(5)
+    name = STOCK_NAME_MAP.get(code, "")
+    if not is_meaningful_stock_name(name, code):
+        return ""
+    return name
+
+
+def _report_meta(entry: dict) -> str:
+    window = ""
+    if entry.get("start") and entry.get("end"):
+        window = f"{entry['start']} 至 {entry['end']}"
+    elif entry.get("start"):
+        window = str(entry["start"])
+    bars = f"{entry['bar_count']} 根" if entry.get("bar_count") not in (None, "") else ""
+    pieces = [entry.get("price_axis_label") or "", entry.get("param_version") or "", window, bars]
+    return " · ".join(str(piece) for piece in pieces if piece)
+
+
+def _variant_label(entry: dict) -> str:
+    return _report_meta(entry)
+
+
+def _report_href(report: Path, output_root: Path) -> str:
+    return _esc(Path(os.path.relpath(report, output_root)).as_posix())
+
+
+def _day_text(value) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _symbol_sort_key(symbol: str) -> tuple:
+    if symbol[:1].isdigit():
+        return (0, symbol)
+    return (1, symbol)
+
+
+def _report_sort_key(entry: dict) -> tuple:
+    axis_rank = 0 if entry.get("price_axis") == "log" else 1
+    version_rank = 0 if str(entry.get("param_version") or "").endswith("v0") else 1
+    return (axis_rank, version_rank, entry.get("interval") or "", -float(entry.get("mtime") or 0))
+
+
+def _esc(text) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def _print_scale_definition(start: date, end: date, params) -> None:
@@ -118,12 +443,22 @@ def _print_scale_definition(start: date, end: date, params) -> None:
 
 
 def _load_closes(symbol: str, interval: str, start: date, end: date):
-    """复用回测的行情加载，再裁回请求区间。只把时间戳和收盘价交给引擎。"""
+    """复用回测的行情加载，再裁回请求区间。只把时间戳和收盘价交给引擎。
+
+    上市时间短于请求区间时，根数达到短、中尺度下限就用已有 K 线继续。
+    """
     from analysis.backtest.bars import BarLoader, slice_eval_window
     from analysis.backtest.config import BacktestConfig
+    from analysis.structure.config import partial_history_min_bars
 
     config = BacktestConfig(symbols=[symbol], interval=interval, start=start, end=end)
-    frame, source = BarLoader().load_symbol(symbol, config, warmup_bars=0)
+    frame, source = BarLoader().load_symbol(
+        symbol,
+        config,
+        warmup_bars=0,
+        allow_short_history=True,
+        min_bars=partial_history_min_bars(),
+    )
     frame = slice_eval_window(frame, start, end)
     if frame is None or frame.empty:
         raise RuntimeError(f"{symbol} 在 {start.isoformat()} 至 {end.isoformat()} 没有已完成 K 线")

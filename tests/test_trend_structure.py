@@ -1,11 +1,14 @@
 """合成收盘序列上的趋势结构阶段 0–5 测试。不访问网络。"""
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -1738,6 +1741,262 @@ def _rejected_boundary():
         "context_fit": "未使用",
         "score": None,
     }
+
+
+def _load_trend_cli():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_trend_structure.py"
+    spec = importlib.util.spec_from_file_location("run_trend_structure_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TrendStructureCliTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = _load_trend_cli()
+
+    def test_collect_symbols_splits_repeats_and_file(self):
+        with TemporaryDirectory() as tmp:
+            listing = Path(tmp) / "symbols.txt"
+            listing.write_text("09988 01810\n# 跳过\n00700,600519\n", encoding="utf-8")
+            symbols = self.cli.collect_symbols(
+                [["00700,600519", "AAPL"], ["00700"]],
+                [["BRK.B"]],
+                str(listing),
+            )
+        self.assertEqual(
+            symbols,
+            ["00700", "600519", "AAPL", "BRK.B", "09988", "01810"],
+        )
+
+    def test_parser_accepts_one_command_for_many_symbols(self):
+        args = self.cli.build_parser().parse_args(
+            ["--symbol", "00700,600519", "AAPL", "--symbol", "09988", "--years", "1"]
+        )
+        self.assertEqual(
+            self.cli.collect_symbols(args.symbol, args.symbols, args.symbols_file),
+            ["00700", "600519", "AAPL", "09988"],
+        )
+
+    def test_batch_continues_after_one_symbol_fails(self):
+        cli = self.cli
+
+        def fake_load(symbol, interval, start, end):
+            if symbol == "BAD":
+                raise RuntimeError("没有已完成 K 线")
+            times = _daily_times(40)
+            closes = [100.0 + index * 0.5 for index in range(40)]
+            return times, closes, "test"
+
+        original = cli._load_closes
+        cli._load_closes = fake_load
+        try:
+            with TemporaryDirectory() as tmp:
+                stdout, stderr = StringIO(), StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    code = cli.main(
+                        [
+                            "--symbol",
+                            "00700,BAD",
+                            "--symbol",
+                            "600519",
+                            "--years",
+                            "1",
+                            "--param-version",
+                            "structure-params-v0",
+                            "--output-dir",
+                            tmp,
+                        ]
+                    )
+                self.assertEqual(code, 1)
+                self.assertIn("BAD: 没有已完成 K 线", stderr.getvalue())
+                text = stdout.getvalue()
+                self.assertIn("[1/3] 00700", text)
+                self.assertIn("[3/3] 600519", text)
+                self.assertIn("完成 2 只，失败 1 只", text)
+                index = Path(tmp) / "index.html"
+                self.assertTrue(index.is_file())
+                page = index.read_text(encoding="utf-8")
+                self.assertIn("00700", page)
+                self.assertIn("600519", page)
+                self.assertIn("没有已完成 K 线", page)
+                self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 2)
+        finally:
+            cli._load_closes = original
+
+    def test_single_symbol_writes_catalog_index(self):
+        cli = self.cli
+
+        def fake_load(symbol, interval, start, end):
+            return _daily_times(12), [100.0 + index for index in range(12)], "test"
+
+        original = cli._load_closes
+        cli._load_closes = fake_load
+        try:
+            with TemporaryDirectory() as tmp:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    code = cli.main(
+                        ["--symbol", "00700", "--years", "1", "--output-dir", tmp]
+                    )
+                self.assertEqual(code, 0)
+                index = Path(tmp) / "index.html"
+                self.assertTrue(index.is_file())
+                page = index.read_text(encoding="utf-8")
+                self.assertIn("00700", page)
+                self.assertIn("腾讯控股", page)
+                self.assertIn("report.html", page)
+                self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 1)
+        finally:
+            cli._load_closes = original
+
+    def test_missing_symbol_and_missing_file_stop_before_load(self):
+        cli = self.cli
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(cli.main(["--years", "1"]), 1)
+            self.assertEqual(cli.main(["--symbols-file", "missing-symbols.txt"]), 1)
+
+
+class ShortHistoryBoundTests(unittest.TestCase):
+    def test_hk_codes_show_chinese_names(self):
+        cli = _load_trend_cli()
+        self.assertEqual(cli._stock_display_name("00700"), "腾讯控股")
+        self.assertEqual(cli._stock_display_name("01398"), "工商银行")
+        self.assertEqual(cli._stock_display_name("00100"), "稀宇科技")
+        self.assertEqual(cli._stock_display_name("07709"), "XL二南方海力士")
+        self.assertEqual(cli._stock_display_name("UNKNOWN"), "")
+
+    def test_min_bars_is_the_larger_of_warmup_and_half_short_span(self):
+        from analysis.structure.config import partial_history_min_bars
+
+        self.assertEqual(partial_history_min_bars(), 30)
+
+    def test_snapshot_notes_a_listing_shorter_than_the_request(self):
+        series = _series_from_levels(_warm(40))
+        snapshot = build_snapshot(
+            series,
+            symbol="IPO",
+            requested_start=date(2023, 1, 1),
+            requested_end=series.bars[-1].timestamp.date(),
+            engine_version="test",
+        )
+        note = snapshot["identity"]["history_note"]
+        self.assertIn("短尺度和中尺度按这些 K 线拟合", note)
+        self.assertIn("2024-01-02", note)
+        html = render_report(snapshot)
+        self.assertIn("短尺度和中尺度按这些 K 线拟合", html)
+        aligned = build_snapshot(
+            series,
+            symbol="IPO",
+            requested_start=series.bars[0].timestamp.date(),
+            requested_end=series.bars[-1].timestamp.date(),
+            engine_version="test",
+        )
+        self.assertEqual(aligned["identity"]["history_note"], "")
+
+    def test_loader_keeps_a_short_listing_inside_the_bound(self):
+        from analysis.backtest import bars as bars_mod
+
+        end = date(2026, 10, 2)
+        start = date(2025, 10, 6)
+        short = _weekday_ohlcv(end, 40)
+        tiny = _weekday_ohlcv(end, 10)
+        full = _weekday_ohlcv(end, 200)
+        stale = _weekday_ohlcv(date(2026, 8, 1), 40)
+        self.assertEqual(
+            bars_mod.classify_history(short, start, end, allow_short_history=True, min_bars=30),
+            "short",
+        )
+        self.assertEqual(
+            bars_mod.classify_history(tiny, start, end, allow_short_history=True, min_bars=30),
+            "short-below-min",
+        )
+        self.assertEqual(
+            bars_mod.classify_history(full, start, end, allow_short_history=True, min_bars=30),
+            "full",
+        )
+        self.assertEqual(
+            bars_mod.classify_history(stale, start, end, allow_short_history=True, min_bars=30),
+            "reject",
+        )
+        self.assertEqual(
+            bars_mod.classify_history(short, start, end, allow_short_history=False, min_bars=30),
+            "reject",
+        )
+
+        original_cache = bars_mod.CACHE_DIR
+        try:
+            with TemporaryDirectory() as tmp:
+                bars_mod.CACHE_DIR = Path(tmp)
+                loader = bars_mod.BarLoader()
+                loaded, source = loader._load(
+                    "ipo-short",
+                    [lambda: (short, "yahoo:ipo")],
+                    start,
+                    end,
+                    allow_short_history=True,
+                    min_bars=30,
+                )
+                self.assertEqual(source, "yahoo:ipo")
+                self.assertEqual(len(loaded), 40)
+
+                loaded, source = loader._load(
+                    "ipo-prefers-full",
+                    [lambda: (short, "yahoo:ipo"), lambda: (full, "yahoo:full")],
+                    start,
+                    end,
+                    allow_short_history=True,
+                    min_bars=30,
+                )
+                self.assertEqual(source, "yahoo:full")
+                self.assertEqual(len(loaded), 200)
+
+                with self.assertRaises(RuntimeError) as caught:
+                    loader._load(
+                        "ipo-too-short",
+                        [lambda: (tiny, "yahoo:ipo")],
+                        start,
+                        end,
+                        allow_short_history=True,
+                        min_bars=30,
+                    )
+                self.assertIn("少于短、中尺度分析所需的 30 根", str(caught.exception))
+
+                with self.assertRaises(RuntimeError) as caught:
+                    loader._load(
+                        "established-truncated",
+                        [lambda: (stale, "yahoo:stale")],
+                        start,
+                        end,
+                        allow_short_history=True,
+                        min_bars=30,
+                    )
+                self.assertIn("无法获取 K 线", str(caught.exception))
+        finally:
+            bars_mod.CACHE_DIR = original_cache
+
+
+def _weekday_ohlcv(end: date, count: int):
+    import pandas as pd
+
+    days = []
+    cursor = end
+    while len(days) < count:
+        if cursor.weekday() < 5:
+            days.append(cursor)
+        cursor -= timedelta(days=1)
+    days.reverse()
+    return pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(days),
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": [10.0 + index * 0.1 for index in range(count)],
+            "volume": 1000.0,
+            "amount": 10000.0,
+        }
+    )
 
 
 def _embedded_json(html, element_id):

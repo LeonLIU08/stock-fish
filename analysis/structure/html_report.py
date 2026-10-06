@@ -141,9 +141,12 @@ def _header(snapshot: dict, shown: dict) -> str:
     requested = _join_dates(identity.get("requested_start"), identity.get("requested_end"))
     actual = _join_dates(identity.get("start_time"), identity.get("end_time"), times=True)
     as_of = identity.get("as_of")
+    history_note = identity.get("history_note") or ""
     banner = ""
+    if history_note:
+        banner = f'<p class="banner">{esc(history_note)}</p>'
     if as_of:
-        banner = (
+        banner += (
             '<p class="banner">页面按 as-of '
             f"{esc(fmt_time(as_of))} 显示：只保留当时已经可用的拐点、线和区间。"
             "收盘价仍是全部已加载 K 线。snapshot.json 保存的是整段运行，方便和这张图对照。</p>"

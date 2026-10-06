@@ -213,3 +213,13 @@ def default_params(
         zone_min_touch_clusters=zone_min,
         zone_credit_full_span=credit,
     )
+
+
+def partial_history_min_bars(params: StructureParams | None = None) -> int:
+    """上市历史短于请求区间时，至少要有这么多根才继续拟合。
+
+    取波动 EWMA 跨度与短尺度最大跨度的一半里较大的那个。
+    中尺度和长尺度的 k、门槛、最大跨度保持不变；线的跨度不会超过已有 K 线。
+    """
+    resolved = default_params() if params is None else params
+    return max(resolved.ewma_span, resolved.scale(SHORT).max_span // 2)
