@@ -473,9 +473,9 @@ def _boundary_section(shown: dict) -> str:
       <button type="button" data-mode="broken" aria-pressed="false">已突破</button>
     </div>
   </div>
-  <p>每一行是一条主结果。硬约束有一条没过，就不能标成已验证。软评分只出现在曾经通过硬约束的线上，分项和总分一起给出。简化惩罚在这一版是 0，上下文吻合标为未使用。备选线在附录里，不进主图。</p>
+  <p>每一行是一条主结果，按起点日期从早到晚排列。硬约束有一条没过，就不能标成已验证。软评分只出现在曾经通过硬约束的线上，分项和总分一起给出。简化惩罚在这一版是 0，上下文吻合标为未使用。备选线在附录里，不进主图。</p>
   {_line_table(primary, "boundary-table", "primary")}
-  <p class="muted">点击一行，图会定位到这条线。未成立的主结果默认先收起，可以用「全部主结果」打开。</p>
+  <p class="muted">点击一行，图会定位到这条线，并在线的前后各多显示两倍于这条线的走势。未成立的主结果默认先收起，可以用「全部主结果」打开。</p>
 </section>
 """
 
@@ -491,7 +491,7 @@ def _zone_section(shown: dict) -> str:
       <button type="button" data-mode="all" aria-pressed="false">全部主结果</button>
     </div>
   </div>
-  <p>一个区间是同一尺度上的下边界和上边界。有效区间是宽度为正、两侧都有接触、收盘价没有超过硬破坏深度的最长一段。横向、通道、收敛按图上的顺序判断。这三类主结果都画在主图上，突破和过期也保留。其他边界对留在表里。不同尺度的重叠不合并成一条证据。</p>
+  <p>一个区间是同一尺度上的下边界和上边界，表按有效区间的起点日期从早到晚排列。有效区间是宽度为正、两侧都有接触、收盘价没有超过硬破坏深度的最长一段。横向、通道、收敛按图上的顺序判断。这三类主结果都画在主图上，突破和过期也保留。其他边界对留在表里。不同尺度的重叠不合并成一条证据。</p>
   {_zone_table(primary, "zone-table", "primary")}
 </section>
 """
@@ -686,7 +686,7 @@ def _glossary() -> str:
 
 def _line_table(rows: list, table_id: str, table_name: str) -> str:
     body = []
-    for item in rows:
+    for item in _by_start_time(rows):
         status = item.get("status") or ""
         role = item.get("role") or ""
         hidden = table_name == "primary" and status in {"candidate", "rejected"}
@@ -752,7 +752,7 @@ def _line_table(rows: list, table_id: str, table_name: str) -> str:
 
 def _zone_table(rows: list, table_id: str, table_name: str) -> str:
     body = []
-    for item in rows:
+    for item in _by_start_time(rows):
         status = item.get("status") or ""
         hidden = table_name == "primary" and status in {"candidate", "rejected"}
         score = item.get("score") or {}
@@ -882,6 +882,23 @@ def _join_dates(start, end, times: bool = False) -> str:
         left = start or "—"
         right = end or "—"
     return f"{esc(left)} 至 {esc(right)}"
+
+
+def _by_start_time(rows: list) -> list:
+    """页面表格按起点时间从早到晚排。同一天再按起点序号和标识排，顺序稳定。"""
+    return sorted(rows, key=_start_sort_key)
+
+
+def _start_sort_key(item: dict) -> tuple:
+    start = str(item.get("start_time") or "")
+    index = item.get("start_index")
+    if index is None:
+        index = item.get("effective_start")
+    try:
+        index_value = int(index)
+    except (TypeError, ValueError):
+        index_value = 0
+    return (start, index_value, str(item.get("id") or ""))
 
 
 def _empty_row(columns: int) -> str:

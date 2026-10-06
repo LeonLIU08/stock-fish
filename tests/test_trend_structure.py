@@ -1407,6 +1407,32 @@ class ReportTests(unittest.TestCase):
         self.assertIn("横向区间", html)
         self.assertIn("归一化斜率差小于", html)
 
+    def test_tables_list_lines_and_zones_by_start_time(self):
+        snapshot = _one_support_snapshot(0.01, math.log(100.0))
+        early = snapshot["boundaries"][0]
+        late = dict(early)
+        late.update(id="mid:support:20-30", start_time="2024-02-02T16:00:00", start_index=20, end_index=30)
+        same_day = dict(early)
+        same_day.update(id="mid:support:5-12", start_time=early["start_time"], start_index=5, end_index=12)
+        alternate = dict(late)
+        alternate.update(id="mid:support:40-50", primary=False, alternate_of=early["id"], start_time="2024-01-08T16:00:00", start_index=8)
+        later_alternate = dict(late)
+        later_alternate.update(id="mid:support:60-70", primary=False, alternate_of=early["id"], start_time="2024-04-01T16:00:00", start_index=60)
+        snapshot["boundaries"] = [late, later_alternate, same_day, alternate, early]
+        early_zone = _hand_zone("zone-early", "channel", "validated")
+        late_zone = _hand_zone("zone-late", "channel", "validated")
+        late_zone["start_time"] = "2024-03-01T16:00:00"
+        late_zone["effective_start"] = 30
+        snapshot["zones"] = [late_zone, early_zone]
+        html = render_report(snapshot)
+        boundary = html.split('id="boundary-table"', 1)[1].split("</table>", 1)[0]
+        self.assertLess(boundary.index("mid:support:0-10"), boundary.index("mid:support:5-12"))
+        self.assertLess(boundary.index("mid:support:5-12"), boundary.index("mid:support:20-30"))
+        zones = html.split('id="zone-table"', 1)[1].split("</table>", 1)[0]
+        self.assertLess(zones.index("zone-early"), zones.index("zone-late"))
+        appendix = html.split('id="alternate-lines"', 1)[1].split("</table>", 1)[0]
+        self.assertLess(appendix.index("mid:support:40-50"), appendix.index("mid:support:60-70"))
+
     def test_chart_keeps_broken_and_extra_trend_zones(self):
         snapshot = _one_support_snapshot(0.01, math.log(100.0))
         snapshot["zones"] = [

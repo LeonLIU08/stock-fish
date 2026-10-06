@@ -384,8 +384,7 @@ const TrendChart = (function () {
         });
         return true;
       }
-      const end = boundary.projection ? boundary.projection[1][0] : boundary.solid[1][0];
-      zoomTo(boundary.solid[0][0], end);
+      zoomToTrendLine(boundary.solid[0][0], boundary.solid[1][0]);
       chart.setOption({
         series: [
           { id: "focus-line", data: boundary.solid.map(function (pair) { return { value: pair }; }) },
@@ -522,6 +521,22 @@ const TrendChart = (function () {
         const minSpan = Math.min((fullY.max - fullY.min) * 0.04, fullY.max - fullY.min);
         zoomLinear(ext.y[0], ext.y[1], originY, factor, fullY, minSpan, dispatchY);
       }
+    }
+
+    function zoomToTrendLine(start, end) {
+      const span = Math.max(end - start, 1);
+      const closes = viewModel.closes || [];
+      const dataMin = closes.length ? closes[0].index : fullX.min;
+      const dataMax = closes.length ? closes[closes.length - 1].index : fullX.max;
+      let left = start - span * 2;
+      let right = end + span * 2;
+      left = Math.max(dataMin, left);
+      right = Math.min(dataMax, right);
+      if (right <= left) {
+        left = dataMin;
+        right = dataMax;
+      }
+      dispatchX(left, right);
     }
 
     function zoomTo(start, end) {
