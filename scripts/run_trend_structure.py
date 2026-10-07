@@ -2,8 +2,8 @@
 """对一段已完成 K 线做趋势结构拟合，并写出离线 HTML。
 
 一次命令可以跑多只股票。它们共用日期、周期、价格轴和参数版本，
-每只仍写入自己的目录。每次运行都会刷新输出根目录的 index.html，
-点一只股票就打开它的 report.html。
+每只仍写入自己的目录。多于一只时默认同时算 10 只，可用 --workers 调整。
+每次运行都会刷新输出根目录的 index.html，点一只股票就打开它的 report.html。
 
 短、中、长的 k、门槛下限和最大跨度不随时间范围改变。
 默认参数版本是 structure-params-v1。对照旧规则时加上
@@ -13,7 +13,7 @@
     python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
     python scripts/run_trend_structure.py --symbol 00700,600519,AAPL --years 1 --param-version structure-params-v0
     python scripts/run_trend_structure.py --symbol 00700 --symbol 600519 --years 1
-    python scripts/run_trend_structure.py --symbols-file symbols.txt --years 1
+    python scripts/run_trend_structure.py --symbols-file symbols.txt --years 1 --workers 8
     python scripts/run_trend_structure.py --symbol 00700 --start 2024-01-01 --end 2024-12-31
     python scripts/run_trend_structure.py --symbol 600519 --years 2 --price-axis uniform --scales short,mid,long
     python scripts/run_trend_structure.py --symbol 00700 --years 1 --as-of 2025-06-01
@@ -25,6 +25,9 @@ import argparse
 import json
 import math
 import os
+import pickle
+import select
+import signal
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -85,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--as-of", help="只显示该时刻已经可用的拐点、线和区间。YYYY-MM-DD 或更精确的时间")
     parser.add_argument("--output-dir", default="structure_results", help="输出根目录")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="同时计算的只数。默认 10。1 表示逐只计算",
+    )
     parser.add_argument("--samples", action="store_true", help="写出四份合成检查页，不访问网络")
     return parser
 
@@ -92,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        _require_workers(args.workers)
         if args.samples:
             return _write_samples(Path(args.output_dir), args.price_axis)
         symbols = collect_symbols(args.symbol, args.symbols, args.symbols_file)
@@ -105,46 +115,29 @@ def main(argv: list | None = None) -> int:
         )
         params = default_params(args.price_axis, version=args.param_version)
         _print_scale_definition(start, end, params)
+        workers = _worker_count(args.workers, len(symbols))
     except (ValueError, RuntimeError, NonPositivePriceError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    outcomes = []
+    outcomes = _run_symbols(
+        symbols,
+        workers=workers,
+        interval=args.interval,
+        start=start,
+        end=end,
+        params=params,
+        as_of=args.as_of,
+        scales=args.scales,
+        output_dir=args.output_dir,
+    )
     total = len(symbols)
-    for index, symbol in enumerate(symbols, start=1):
-        if total > 1:
-            print(f"[{index}/{total}] {symbol}")
-        try:
-            outcome = _run_symbol(
-                symbol,
-                interval=args.interval,
-                start=start,
-                end=end,
-                params=params,
-                as_of=args.as_of,
-                scales=args.scales,
-                output_dir=args.output_dir,
-            )
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            if not isinstance(exc, (ValueError, RuntimeError, NonPositivePriceError)):
-                message = f"{exc.__class__.__name__}: {message}"
-            print(f"{symbol}: {message}", file=sys.stderr)
-            outcomes.append({"symbol": symbol, "error": message})
-            continue
-        outcomes.append(outcome)
-        if outcome.get("history_note"):
-            print(outcome["history_note"])
-        print(f"K 线: {outcome['bar_count']} 根，来源 {outcome['source']}")
-        print(f"快照: {outcome['snapshot']}")
-        print(f"报告: {outcome['report']}")
-
     failed = [item for item in outcomes if item.get("error")]
     if total > 1:
-        print(f"完成 {total - len(failed)} 只，失败 {len(failed)} 只")
+        print(f"完成 {total - len(failed)} 只，失败 {len(failed)} 只", flush=True)
     index_path = _write_catalog_index(Path(args.output_dir), failures=failed)
     if index_path is not None:
-        print(f"索引: {index_path}")
+        print(f"索引: {index_path}", flush=True)
     return 1 if failed else 0
 
 
@@ -202,6 +195,341 @@ def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_d
         "report": written["report"],
         "history_note": identity.get("history_note") or "",
     }
+
+
+def _require_workers(requested: int | None) -> None:
+    if requested is not None and requested < 1:
+        raise ValueError(f"--workers 必须是正整数，收到 {requested}")
+
+
+def _worker_count(requested: int | None, total: int) -> int:
+    """一只股票保持原来的单进程。未指定时同时算 10 只，但不超过股票数。"""
+    if total <= 1:
+        return 1
+    chosen = 10 if requested is None else requested
+    return min(chosen, total)
+
+
+def _format_error(exc: BaseException) -> str:
+    message = str(exc) or exc.__class__.__name__
+    if not isinstance(exc, (ValueError, RuntimeError, NonPositivePriceError)):
+        message = f"{exc.__class__.__name__}: {message}"
+    return message
+
+
+def _run_one(symbol, *, interval, start, end, params, as_of, scales, output_dir) -> dict:
+    """单只股票的外层包装。拟合和写文件仍走 _run_symbol。"""
+    try:
+        return _run_symbol(
+            symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            params=params,
+            as_of=as_of,
+            scales=scales,
+            output_dir=output_dir,
+        )
+    except Exception as exc:
+        return {"symbol": symbol, "error": _format_error(exc)}
+
+
+def _run_task(task: dict) -> dict:
+    return _run_one(
+        task["symbol"],
+        interval=task["interval"],
+        start=task["start"],
+        end=task["end"],
+        params=task["params"],
+        as_of=task["as_of"],
+        scales=task["scales"],
+        output_dir=task["output_dir"],
+    )
+
+
+def _print_symbol_result(outcome: dict) -> None:
+    if outcome.get("error"):
+        print(f"{outcome['symbol']}: {outcome['error']}", file=sys.stderr, flush=True)
+        return
+    if outcome.get("history_note"):
+        print(outcome["history_note"], flush=True)
+    print(f"K 线: {outcome['bar_count']} 根，来源 {outcome['source']}", flush=True)
+    print(f"快照: {outcome['snapshot']}", flush=True)
+    print(f"报告: {outcome['report']}", flush=True)
+
+
+def _run_symbols(
+    symbols,
+    *,
+    workers,
+    interval,
+    start,
+    end,
+    params,
+    as_of,
+    scales,
+    output_dir,
+) -> list[dict]:
+    """外层调度。每只股票仍调用 _run_symbol；多只同时算时用独立进程。"""
+    total = len(symbols)
+    if workers <= 1:
+        outcomes = []
+        for index, symbol in enumerate(symbols, start=1):
+            if total > 1:
+                print(f"[{index}/{total}] {symbol}", flush=True)
+            outcome = _run_one(
+                symbol,
+                interval=interval,
+                start=start,
+                end=end,
+                params=params,
+                as_of=as_of,
+                scales=scales,
+                output_dir=output_dir,
+            )
+            _print_symbol_result(outcome)
+            outcomes.append(outcome)
+        return outcomes
+
+    print(f"并行 {workers} 路，共 {total} 只", flush=True)
+    tasks = [
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "start": start,
+            "end": end,
+            "params": params,
+            "as_of": as_of,
+            "scales": scales,
+            "output_dir": output_dir,
+        }
+        for symbol in symbols
+    ]
+
+    def on_done(index: int, outcome: dict) -> None:
+        print(f"[{index + 1}/{total}] {outcome['symbol']}", flush=True)
+        _print_symbol_result(outcome)
+
+    return _map_fork(tasks, workers, on_done)
+
+
+def _map_fork(tasks: list[dict], workers: int, on_done) -> list[dict]:
+    """开固定几路子进程，算完一只再领下一只。
+
+    拟合是纯 Python，线程会被 GIL 串成一只一只算。子进程从父进程直接
+    fork 出来，沿用当前内存里的加载函数，行情库也只在每路里加载一次。
+    """
+    slots: list[dict] = []
+    outcomes: list[dict | None] = [None] * len(tasks)
+    finished_cleanly = False
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for _ in range(min(workers, len(tasks))):
+            slots.append(_start_worker(slots))
+        _feed_workers(slots, tasks, outcomes, on_done)
+        finished_cleanly = True
+    finally:
+        _close_workers(slots, kill=not finished_cleanly)
+    missing = [tasks[index]["symbol"] for index, item in enumerate(outcomes) if item is None]
+    if missing:
+        raise RuntimeError(f"没有返回结果: {', '.join(missing)}")
+    return outcomes
+
+
+def _start_worker(existing: list[dict]) -> dict:
+    task_read, task_write = os.pipe()
+    result_read, result_write = os.pipe()
+    try:
+        pid = os.fork()
+    except OSError:
+        for fd in (task_read, task_write, result_read, result_write):
+            os.close(fd)
+        raise
+    if pid == 0:
+        try:
+            os.close(task_write)
+            os.close(result_read)
+            for slot in existing:
+                for key in ("task_w", "result_r"):
+                    try:
+                        os.close(slot[key])
+                    except OSError:
+                        pass
+            _worker_loop(task_read, result_write)
+        finally:
+            os._exit(0)
+    os.close(task_read)
+    os.close(result_write)
+    return {
+        "pid": pid,
+        "task_w": task_write,
+        "result_r": result_read,
+        "alive": True,
+        "busy": False,
+        "index": None,
+    }
+
+
+def _worker_loop(task_fd: int, result_fd: int) -> None:
+    while True:
+        task = _read_msg(task_fd)
+        if not isinstance(task, dict):
+            return
+        try:
+            result = _run_task(task)
+        except Exception as exc:
+            result = {"symbol": task.get("symbol", ""), "error": _format_error(exc)}
+        try:
+            _write_msg(result_fd, result)
+        except OSError:
+            return
+
+
+def _feed_workers(slots: list[dict], tasks: list[dict], outcomes: list, on_done) -> None:
+    next_index = 0
+    inflight = 0
+
+    def submit(slot: dict) -> bool:
+        nonlocal next_index, inflight
+        if not slot["alive"] or next_index >= len(tasks):
+            return False
+        index = next_index
+        _write_msg(slot["task_w"], tasks[index])
+        slot["index"] = index
+        slot["busy"] = True
+        next_index = index + 1
+        inflight += 1
+        return True
+
+    for slot in slots:
+        submit(slot)
+
+    while inflight:
+        busy = [slot for slot in slots if slot["busy"]]
+        if not busy:
+            break
+        readable = set(_select_ready([slot["result_r"] for slot in busy]))
+        for slot in busy:
+            if slot["result_r"] not in readable:
+                continue
+            index = slot["index"]
+            slot["busy"] = False
+            inflight -= 1
+            try:
+                outcome = _read_msg(slot["result_r"])
+            except (EOFError, OSError) as exc:
+                slot["alive"] = False
+                outcome = {"symbol": tasks[index]["symbol"], "error": _format_error(exc)}
+            if not isinstance(outcome, dict) or not outcome.get("symbol"):
+                slot["alive"] = False
+                outcome = {"symbol": tasks[index]["symbol"], "error": "计算进程异常退出"}
+            outcomes[index] = outcome
+            on_done(index, outcome)
+            if not slot["alive"]:
+                continue
+            try:
+                submit(slot)
+            except OSError:
+                slot["alive"] = False
+
+    while next_index < len(tasks):
+        outcome = {"symbol": tasks[next_index]["symbol"], "error": "没有可用的计算进程"}
+        outcomes[next_index] = outcome
+        on_done(next_index, outcome)
+        next_index += 1
+
+
+def _select_ready(fds: list[int]) -> list[int]:
+    while True:
+        try:
+            readable, _, _ = select.select(fds, [], [])
+            return list(readable)
+        except InterruptedError:
+            continue
+
+
+def _write_msg(fd: int, obj) -> None:
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(data) > 32 * 1024 * 1024:
+        raise RuntimeError("进程消息过长")
+    _write_all(fd, len(data).to_bytes(4, "big") + data)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        view = view[written:]
+
+
+def _read_msg(fd: int):
+    try:
+        header = _read_exact(fd, 4)
+    except EOFError:
+        return None
+    size = int.from_bytes(header, "big")
+    if size > 32 * 1024 * 1024:
+        raise RuntimeError(f"进程消息长度异常: {size}")
+    return pickle.loads(_read_exact(fd, size))
+
+
+def _read_exact(fd: int, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        try:
+            chunk = os.read(fd, remaining)
+        except InterruptedError:
+            continue
+        if not chunk:
+            raise EOFError
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _close_workers(slots: list[dict], kill: bool) -> None:
+    if kill:
+        for slot in slots:
+            try:
+                os.kill(slot["pid"], signal.SIGTERM)
+            except OSError:
+                pass
+    for slot in slots:
+        fd = slot.get("task_w")
+        if fd is None:
+            continue
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        slot["task_w"] = None
+    for slot in slots:
+        try:
+            _wait_child(slot["pid"])
+        except ChildProcessError:
+            pass
+        fd = slot.get("result_r")
+        if fd is None:
+            continue
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        slot["result_r"] = None
+
+
+def _wait_child(pid: int) -> int:
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+            return status
+        except InterruptedError:
+            continue
 
 
 def _write_catalog_index(output_root: Path, failures=None) -> Path | None:

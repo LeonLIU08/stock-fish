@@ -1807,11 +1807,14 @@ class TrendStructureCliTests(unittest.TestCase):
                             "structure-params-v0",
                             "--output-dir",
                             tmp,
+                            "--workers",
+                            "2",
                         ]
                     )
                 self.assertEqual(code, 1)
                 self.assertIn("BAD: 没有已完成 K 线", stderr.getvalue())
                 text = stdout.getvalue()
+                self.assertIn("并行 2 路，共 3 只", text)
                 self.assertIn("[1/3] 00700", text)
                 self.assertIn("[3/3] 600519", text)
                 self.assertIn("完成 2 只，失败 1 只", text)
@@ -1849,6 +1852,47 @@ class TrendStructureCliTests(unittest.TestCase):
                 self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 1)
         finally:
             cli._load_closes = original
+
+    def test_workers_one_runs_one_after_another(self):
+        cli = self.cli
+
+        def fake_load(symbol, interval, start, end):
+            times = _daily_times(40)
+            closes = [100.0 + index * 0.5 for index in range(40)]
+            return times, closes, "test"
+
+        original = cli._load_closes
+        cli._load_closes = fake_load
+        try:
+            with TemporaryDirectory() as tmp:
+                stdout = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(StringIO()):
+                    code = cli.main(
+                        [
+                            "--symbol",
+                            "00700,600519",
+                            "--years",
+                            "1",
+                            "--output-dir",
+                            tmp,
+                            "--workers",
+                            "1",
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                text = stdout.getvalue()
+                self.assertNotIn("并行", text)
+                self.assertLess(text.index("[1/2] 00700"), text.index("[2/2] 600519"))
+                self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 2)
+        finally:
+            cli._load_closes = original
+
+    def test_workers_must_be_positive(self):
+        stderr = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(stderr):
+            code = self.cli.main(["--symbol", "00700", "--years", "1", "--workers", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("正整数", stderr.getvalue())
 
     def test_missing_symbol_and_missing_file_stop_before_load(self):
         cli = self.cli

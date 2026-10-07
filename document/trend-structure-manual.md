@@ -13,7 +13,7 @@ python scripts/run_trend_structure.py --symbol 00700 --years 1 --param-version s
 python scripts/run_trend_structure.py --samples
 ```
 
-`--symbol` 可以一次写多只股票：重复这个参数，或在同一个参数里用逗号、空格、顿号分开。`--symbols` 与 `--symbol` 相同。`--symbols-file` 读一个文本文件，每行一个或多个代码，`#` 后面是注释。这些股票共用同一段日期、周期、价格轴和参数版本，每只各自写一份结果。某一只取不到 K 线时，其余继续；只要有失败，命令以非 0 退出。每次运行都会刷新输出根目录的 `index.html`。打开它之后，点一只股票就进入该股票的 `report.html`。
+`--symbol` 可以一次写多只股票：重复这个参数，或在同一个参数里用逗号、空格、顿号分开。`--symbols` 与 `--symbol` 相同。`--symbols-file` 读一个文本文件，每行一个或多个代码，`#` 后面是注释。这些股票共用同一段日期、周期、价格轴和参数版本，每只各自写一份结果。多于一只时默认同时算 10 只，`--workers` 可改同时计算的只数，`--workers 1` 则逐只计算。某一只取不到 K 线时，其余继续；只要有失败，命令以非 0 退出。每次运行都会刷新输出根目录的 `index.html`。打开它之后，点一只股票就进入该股票的 `report.html`。
 
 不写 `--param-version` 时用 `structure-params-v1`。这一版只放宽趋势区间：有效区间内每侧至少 2 个接触簇；如果这条边界全长已经有 3 个接触簇，有效区间里还留着至少 1 个也算通过。趋势线仍然要 3 个接触簇，贴线距离仍然是 0.5 倍波动。`structure-params-v0` 是原来的规则，结果写在另一个目录里。
 
