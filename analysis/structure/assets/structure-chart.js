@@ -26,11 +26,11 @@ const TrendChart = (function () {
       pivotsByIndex.set(pivot.index, bucket);
     });
 
-    const legendScale = new Map();
+    const legendMeta = new Map();
     const wantedNames = [];
-    function track(name, scale) {
-      if (!legendScale.has(name)) {
-        legendScale.set(name, scale);
+    function track(name, scale, method) {
+      if (!legendMeta.has(name)) {
+        legendMeta.set(name, { scale: scale || null, method: method || null });
         wantedNames.push(name);
       }
     }
@@ -197,6 +197,113 @@ const TrendChart = (function () {
       });
     }
 
+    const focusMarks = new Map();
+    const laneBuckets = new Map();
+    const laneOrder = [];
+    (viewModel.marks || []).forEach(function (mark) {
+      const owned = focusMarks.get(mark.object_id) || [];
+      owned.push(mark);
+      focusMarks.set(mark.object_id, owned);
+      const onLane = mark.kind === "label_bar" || (mark.kind === "marker" && mark.anchor === "lane");
+      if (onLane) {
+        if (!laneBuckets.has(mark.legend)) {
+          laneBuckets.set(mark.legend, {
+            legend: mark.legend,
+            scale: mark.scale,
+            method: mark.method,
+            bars: [],
+          });
+          laneOrder.push(mark.legend);
+        }
+        if (mark.kind === "label_bar") laneBuckets.get(mark.legend).bars.push(mark);
+        return;
+      }
+      if (mark.show === "focus") return;
+      const name = mark.legend || mark.method || "图形";
+      track(name, mark.scale, mark.method);
+      if (mark.kind === "segment" || mark.kind === "polyline" || mark.kind === "step_line") {
+        series.push({
+          id: "mark-" + mark.kind + "-" + mark.object_id,
+          name: name,
+          type: "line",
+          step: mark.kind === "step_line" ? "end" : false,
+          data: (mark.points || []).map(function (pair) {
+            return { value: pair, objectId: mark.object_id };
+          }),
+          showSymbol: false,
+          symbol: "none",
+          lineStyle: { color: mark.color || "#E6E1D6", width: 1.4, type: mark.line_type || "solid" },
+          z: 3,
+        });
+      } else if (mark.kind === "marker") {
+        series.push({
+          id: "mark-marker-" + mark.object_id + "-" + mark.index,
+          name: name,
+          type: "scatter",
+          data: [{ value: [mark.index, mark.price], objectId: mark.object_id, hover: mark.hover || [] }],
+          symbol: "circle",
+          symbolSize: 8,
+          itemStyle: { color: mark.color || "#E6E1D6" },
+          z: 5,
+        });
+      } else if (mark.kind === "text") {
+        const point = (mark.points && mark.points[0]) || [mark.index, mark.price];
+        series.push({
+          id: "mark-text-" + mark.object_id,
+          name: name,
+          type: "scatter",
+          data: [{ value: point, objectId: mark.object_id, labelText: mark.text || "" }],
+          symbolSize: 1,
+          itemStyle: { color: "rgba(0,0,0,0)" },
+          label: {
+            show: true,
+            color: mark.color || "#E6E1D6",
+            formatter: function (params) { return (params.data && params.data.labelText) || ""; },
+          },
+          z: 6,
+        });
+      } else if (mark.kind === "band" && mark.points && mark.points.length >= 4) {
+        const pts = mark.points;
+        series.push({
+          id: "mark-band-" + mark.object_id,
+          name: name,
+          type: "custom",
+          coordinateSystem: "cartesian2d",
+          renderItem: zoneRenderItem,
+          data: [{
+            value: [pts[0][0], pts[1][0], pts[0][1], pts[1][1], pts[2][1], pts[3][1]],
+            objectId: mark.object_id,
+            itemStyle: { color: mark.color || "rgba(126,182,255,0.16)" },
+          }],
+          z: 1,
+        });
+      }
+    });
+    laneOrder.forEach(function (name, laneIndex) {
+      const lane = laneBuckets.get(name);
+      track(name, lane.scale, lane.method);
+      const laneColor = (lane.bars[0] && lane.bars[0].color) || "#8A8478";
+      series.push({
+        id: "lane-" + laneIndex,
+        name: name,
+        type: "custom",
+        coordinateSystem: "cartesian2d",
+        renderItem: function (params, api) { return laneItem(params, api, laneIndex); },
+        color: laneColor,
+        itemStyle: { color: laneColor },
+        data: lane.bars.map(function (bar) {
+          return {
+            value: [bar.start_index, bar.end_index, 0],
+            objectId: bar.object_id,
+            itemStyle: { color: bar.color || "#8A8478" },
+          };
+        }),
+        clip: false,
+        z: 3,
+      });
+    });
+    const laneCount = laneOrder.length;
+
     series.push({
       id: "focus-line",
       name: "选中",
@@ -242,7 +349,7 @@ const TrendChart = (function () {
           font: '12px "Avenir Next", "PingFang SC", sans-serif',
         },
       }],
-      grid: { left: 8, right: 36, top: 28, bottom: 112, containLabel: true },
+      grid: { left: 8, right: 36, top: 28, bottom: 112 + (laneCount ? 22 + laneCount * 16 : 0), containLabel: true },
       legend: {
         type: "scroll",
         bottom: 40,
@@ -344,7 +451,25 @@ const TrendChart = (function () {
       const zone = focusIndex.zone.get(id);
       const pivot = focusIndex.pivot.get(id);
       const segment = focusIndex.segment.get(id);
-      if (!boundary && !zone && !pivot && !segment) return false;
+      if (!boundary && !zone && !pivot && !segment) {
+        const owned = focusMarks.get(id) || [];
+        if (!owned.length) return false;
+        const bar = owned.filter(function (mark) { return mark.kind === "label_bar"; })[0];
+        const line = [];
+        owned.forEach(function (mark) {
+          if (mark.kind !== "step_line") return;
+          (mark.points || []).forEach(function (pair) { line.push({ value: pair }); });
+        });
+        const origin = owned.filter(function (mark) { return mark.kind === "marker" && mark.anchor === "price"; })[0];
+        if (bar) zoomTo(bar.start_index, bar.end_index);
+        chart.setOption({
+          series: [
+            { id: "focus-line", data: line },
+            { id: "focus-point", data: origin && origin.price != null ? [{ value: [origin.index, origin.price] }] : [] },
+          ],
+        });
+        return true;
+      }
       if (pivot) {
         zoomTo(pivot.index, pivot.index);
         chart.setOption({
@@ -426,20 +551,27 @@ const TrendChart = (function () {
     function emit() { if (listener) listener(state()); }
 
     function applySelection(target) {
+      const methodList = viewModel.default_methods;
+      const methodsRestricted = Array.isArray(methodList);
+      const methodSet = new Set(methodList || []);
       wantedNames.forEach(function (name) {
-        const scale = legendScale.get(name);
+        const meta = legendMeta.get(name) || {};
         if (name === "基础线段" || name === "已过期") target[name] = !!extras[name];
-        else if (scale == null) target[name] = true;
-        else if (name.indexOf("投影") >= 0) target[name] = scaleSet.has(scale) && projectionOn;
-        else target[name] = scaleSet.has(scale);
+        else if (meta.scale == null && !meta.method) target[name] = true;
+        else if (name.indexOf("投影") >= 0) target[name] = scaleSet.has(meta.scale) && projectionOn;
+        else {
+          let on = meta.scale == null || scaleSet.has(meta.scale);
+          if (meta.method && methodsRestricted && !methodSet.has(meta.method)) on = false;
+          target[name] = on;
+        }
       });
     }
 
     function onLegend(event) {
       const chosen = event.selected || {};
       const next = new Set();
-      legendScale.forEach(function (scale, name) {
-        if (scale && chosen[name] && name.indexOf("趋势线") >= 0) next.add(scale);
+      legendMeta.forEach(function (meta, name) {
+        if (meta.scale && chosen[name] && name.indexOf("趋势线") >= 0) next.add(meta.scale);
       });
       if (next.size) {
         scaleSet.clear();
@@ -631,6 +763,15 @@ const TrendChart = (function () {
         const label = (labels.zones && labels.zones[zone.label]) || zone.label;
         lines.push(scaleName(zone.scale) + " " + label + " · " + statusText(zone.status));
       });
+      (viewModel.marks || []).forEach(function (mark) {
+        if (lines.length > 12) return;
+        if (mark.kind === "label_bar" && index >= mark.start_index && index <= mark.end_index) {
+          lines.push((mark.hover && mark.hover[0]) || mark.category || "");
+        }
+        if (mark.kind === "marker" && mark.anchor === "lane" && mark.index === index) {
+          (mark.hover || []).slice(0, 6).forEach(function (line) { lines.push(line); });
+        }
+      });
       if (extra) lines.push("另有 " + extra + " 条结构盖住这一根");
       return lines.join("<br>");
     }
@@ -712,6 +853,30 @@ const TrendChart = (function () {
     }
 
     return { reset: reset, destroy: destroy, focus: focus, setScales: setScales, setExtra: setExtra, state: state, onChange: onChange };
+  }
+
+  function laneItem(params, api, laneIndex) {
+    const start = api.value(0);
+    const end = api.value(1);
+    const left = api.coord([start, 0]);
+    const right = api.coord([end, 0]);
+    const grid = params.coordSys;
+    const height = 12;
+    const y = grid.y + grid.height + 22 + laneIndex * 16;
+    const x = Math.min(left[0], right[0]);
+    const width = Math.max(Math.abs(right[0] - left[0]), 2);
+    const fill = (api.style() && api.style().fill) || "#8A8478";
+    return {
+      type: "group",
+      children: [
+        { type: "rect", shape: { x: x, y: y, width: width, height: height }, style: { fill: fill } },
+        {
+          type: "circle",
+          shape: { cx: left[0], cy: y + height / 2, r: 3.5 },
+          style: { fill: "#1a1814", stroke: fill, lineWidth: 1.2 },
+        },
+      ],
+    };
   }
 
   function zoneRenderItem(params, api) {

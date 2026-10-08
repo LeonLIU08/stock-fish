@@ -7,7 +7,8 @@
 
 短、中、长的 k、门槛下限和最大跨度不随时间范围改变。
 默认参数版本是 structure-params-v1。对照旧规则时加上
---param-version structure-params-v0。
+--param-version structure-params-v0。方向判断用
+--param-version structure-params-v2。
 
 示例:
     python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
@@ -36,9 +37,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.structure.config import BAR_INTERVALS, PARAM_VERSIONS, SCALE_NAMES, default_params
+from analysis.structure.config import BAR_INTERVALS, PARAM_VERSIONS, PARAM_VERSION_V2, SCALE_NAMES, default_params
 from analysis.structure.html_report import write_result
 from analysis.structure.lifecycle import build_lifecycle
+from analysis.structure.methods import method_failure_text, registered_methods
 from analysis.structure.series import NonPositivePriceError, build_series
 from analysis.structure.snapshot import (
     SCALE_DEFINITION_NOTE,
@@ -79,7 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--param-version",
         default="structure-params-v1",
         choices=PARAM_VERSIONS,
-        help="参数版本。v1 放宽区间接触簇计数，v0 是原来的规则",
+        help="参数版本。v1 放宽区间接触簇计数，v0 是原来的规则，v2 在 v1 上加方向",
+    )
+    parser.add_argument(
+        "--methods",
+        default="",
+        help="主图初次打开的判断方法，逗号分隔。不写则该版本启用的方法全部打开，不影响计算",
     )
     parser.add_argument(
         "--scales",
@@ -129,6 +136,7 @@ def main(argv: list | None = None) -> int:
         params=params,
         as_of=args.as_of,
         scales=args.scales,
+        methods=args.methods,
         output_dir=args.output_dir,
     )
     total = len(symbols)
@@ -173,7 +181,7 @@ def _split_symbol_text(text: str) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_dir) -> dict:
+def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_dir, methods=None) -> dict:
     timestamps, closes, source = _load_closes(symbol, interval, start, end)
     series = build_series(timestamps, closes, interval=interval, params=params)
     snapshot = build_snapshot(
@@ -183,10 +191,19 @@ def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_d
         requested_end=end,
         as_of=as_of,
         visible_scales=scales,
+        visible_methods=methods,
         data_source=source,
     )
     written = write_result(output_dir, snapshot)
     identity = snapshot["identity"]
+    failure = method_failure_text(snapshot)
+    if failure:
+        return {
+            "symbol": symbol,
+            "error": f"{failure}。快照仍已写出：{written['snapshot']}",
+            "snapshot": written["snapshot"],
+            "report": written["report"],
+        }
     return {
         "symbol": symbol,
         "bar_count": identity["bar_count"],
@@ -217,7 +234,7 @@ def _format_error(exc: BaseException) -> str:
     return message
 
 
-def _run_one(symbol, *, interval, start, end, params, as_of, scales, output_dir) -> dict:
+def _run_one(symbol, *, interval, start, end, params, as_of, scales, output_dir, methods=None) -> dict:
     """单只股票的外层包装。拟合和写文件仍走 _run_symbol。"""
     try:
         return _run_symbol(
@@ -229,6 +246,7 @@ def _run_one(symbol, *, interval, start, end, params, as_of, scales, output_dir)
             as_of=as_of,
             scales=scales,
             output_dir=output_dir,
+            methods=methods,
         )
     except Exception as exc:
         return {"symbol": symbol, "error": _format_error(exc)}
@@ -244,6 +262,7 @@ def _run_task(task: dict) -> dict:
         as_of=task["as_of"],
         scales=task["scales"],
         output_dir=task["output_dir"],
+        methods=task.get("methods"),
     )
 
 
@@ -269,6 +288,7 @@ def _run_symbols(
     as_of,
     scales,
     output_dir,
+    methods=None,
 ) -> list[dict]:
     """外层调度。每只股票仍调用 _run_symbol；多只同时算时用独立进程。"""
     total = len(symbols)
@@ -286,6 +306,7 @@ def _run_symbols(
                 as_of=as_of,
                 scales=scales,
                 output_dir=output_dir,
+                methods=methods,
             )
             _print_symbol_result(outcome)
             outcomes.append(outcome)
@@ -302,6 +323,7 @@ def _run_symbols(
             "as_of": as_of,
             "scales": scales,
             "output_dir": output_dir,
+            "methods": methods,
         }
         for symbol in symbols
     ]
@@ -822,6 +844,22 @@ def _write_samples(output_root: Path, price_axis: str) -> int:
         written = write_result(output_root, snapshot)
         index_rows.append((title, blurb, written["report"], axis))
         print(f"{title}: {written['report']}")
+    for method in registered_methods():
+        for sample in method.samples():
+            params = default_params(sample.price_axis, version=PARAM_VERSION_V2)
+            series = _series_from_levels(sample.levels, price_axis=sample.price_axis, params=params)
+            snapshot = build_snapshot(
+                series,
+                symbol=sample.symbol,
+                requested_start=series.bars[0].timestamp.date(),
+                requested_end=series.bars[-1].timestamp.date(),
+                visible_scales=list(SCALE_NAMES),
+                data_source="synthetic",
+                engine_version="sample",
+            )
+            written = write_result(output_root, snapshot)
+            index_rows.append((sample.title, sample.blurb, written["report"], sample.price_axis))
+            print(f"{sample.title}: {written['report']}")
     index = output_root / "_samples" / "index.html"
     index.parent.mkdir(parents=True, exist_ok=True)
     index.write_text(_sample_index(index_rows, index.parent), encoding="utf-8")
@@ -890,9 +928,15 @@ def _daily_times(count, start=date(2024, 1, 2)):
     return times
 
 
-def _series_from_levels(levels, price_axis="log"):
+def _series_from_levels(levels, price_axis="log", params=None):
     closes = [100.0 * math.exp(level) for level in levels]
-    return build_series(_daily_times(len(levels)), closes, interval="1d", price_axis=price_axis)
+    return build_series(
+        _daily_times(len(levels)),
+        closes,
+        interval="1d",
+        price_axis=price_axis,
+        params=params,
+    )
 
 
 def _warm(count=30):

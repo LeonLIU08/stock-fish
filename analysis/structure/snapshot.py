@@ -10,8 +10,16 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
-from analysis.structure.config import PARAM_VERSION, SCALE_NAMES, StructureParams, default_params
+from analysis.structure.config import (
+    PARAM_VERSION,
+    SCALE_NAMES,
+    StructureParams,
+    default_params,
+    enabled_methods,
+)
+from analysis.structure.context import build_context
 from analysis.structure.lifecycle import build_lifecycle
+from analysis.structure.methods import merge_events, registered_methods, run_methods
 from analysis.structure.pivots import detect_pivots
 from analysis.structure.segments import build_segments
 from analysis.structure.series import StandardSeries
@@ -97,6 +105,23 @@ def resolve_engine_version(explicit: Optional[str] = None) -> tuple[str, str]:
     return "", "取不到 git 短哈希，引擎代码版本留空。"
 
 
+def normalize_visible_methods(value: Optional[Sequence[str] | str], enabled: Sequence[str]) -> list[str]:
+    """页面初次打开哪些判断方法。不写时打开该版本启用的全部方法，不影响计算。"""
+    enabled_list = [str(item) for item in enabled]
+    if not enabled_list:
+        return []
+    if value is None or value == "":
+        return list(enabled_list)
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        names = [str(part).strip() for part in value if str(part).strip()]
+    unknown = [name for name in names if name not in enabled_list]
+    if unknown:
+        raise ValueError(f"判断方法必须是 {tuple(enabled_list)} 之一，收到 {unknown}")
+    return [name for name in enabled_list if name in names]
+
+
 def normalize_visible_scales(value: Optional[Sequence[str] | str]) -> list[str]:
     """主图初次打开哪些尺度。三个尺度仍会全部拟合。"""
     if value is None:
@@ -125,6 +150,7 @@ def build_snapshot(
     requested_end: Optional[date | str] = None,
     as_of=None,
     visible_scales: Optional[Sequence[str] | str] = None,
+    visible_methods: Optional[Sequence[str] | str] = None,
     data_source: str = "",
     engine_version: Optional[str] = None,
 ) -> dict:
@@ -152,6 +178,22 @@ def build_snapshot(
     segment_rows = [item.to_dict() for item in segments.segments]
     temporary_segments = [item.to_dict() for item in segments.temporary]
     events = [item.to_dict() for item in lifecycle.events]
+    method_payload = None
+    enabled = enabled_methods(params.version)
+    if enabled:
+        context = build_context(
+            series,
+            volatility=volatility,
+            pivots=pivots,
+            segments=segments,
+            boundaries=lifecycle.boundaries,
+            zones=lifecycle.zones,
+            events=lifecycle.events,
+        )
+        outcome = run_methods(context, params, enabled)
+        method_payload = outcome["records"]
+        order = [method.key for method in registered_methods() if method.key in enabled]
+        events = merge_events(events, outcome["events"], order)
     closes = [
         {
             "index": bar.index,
@@ -162,7 +204,7 @@ def build_snapshot(
         for bar in series.bars
     ]
     gap_indexes = list(series.gap_indices)
-    return {
+    payload = {
         "kind": "trend_structure_snapshot",
         "reading": READING_NOTE,
         "scale_definition_note": SCALE_DEFINITION_NOTE,
@@ -173,6 +215,7 @@ def build_snapshot(
             requested_end=requested_end,
             as_of_text=as_of_text,
             visible_scales=normalize_visible_scales(visible_scales),
+            visible_methods=normalize_visible_methods(visible_methods, enabled),
             data_source=data_source,
             engine_version=version,
             engine_version_note=version_note,
@@ -192,6 +235,9 @@ def build_snapshot(
         "closes": closes,
         "params": params.to_dict(),
     }
+    if method_payload is not None:
+        payload["methods"] = method_payload
+    return payload
 
 
 def _identity(
@@ -202,6 +248,7 @@ def _identity(
     requested_end,
     as_of_text: Optional[str],
     visible_scales: Sequence[str],
+    visible_methods: Sequence[str],
     data_source: str,
     engine_version: str,
     engine_version_note: str,
@@ -223,6 +270,7 @@ def _identity(
         "engine_version_note": engine_version_note,
         "as_of": as_of_text,
         "visible_scales": list(visible_scales),
+        **({"visible_methods": list(visible_methods)} if visible_methods else {}),
         "data_source": data_source,
         "bar_count": len(series),
         "history_note": describe_short_history(

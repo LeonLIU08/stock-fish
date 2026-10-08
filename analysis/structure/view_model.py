@@ -35,6 +35,38 @@ STATUS_LABEL = {
     "rejected": "拒绝",
     "broken": "已被收盘价突破",
     "expired": "过期",
+    "open": "进行中",
+    "closed": "已结束",
+    "completed": "完成",
+    "skipped": "跳过",
+    "failed": "失败",
+}
+TOKEN_LABEL = {
+    "higher": "抬高",
+    "lower": "降低",
+    "flat": "持平",
+    "unknown": "未知",
+    "uptrend": "上升趋势",
+    "downtrend": "下降趋势",
+    "range": "震荡趋势",
+    "undecided": "未定",
+    "mixed": "结构不一致",
+    "widening": "高点抬高、低点降低",
+    "narrowing": "高点降低、低点抬高",
+    "trend_break": "趋势被破",
+    "stall": "停滞",
+    "pivot": "拐点比较",
+    "cross": "有效穿越",
+    "progress": "推进",
+    "gap": "间断",
+    "inherit": "段初",
+    "replace": "更换",
+    "high": "高点",
+    "low": "低点",
+    "short": "短",
+    "mid": "中",
+    "long": "长",
+    **STATUS_LABEL,
 }
 ZONE_LABEL = {
     "channel": "通道",
@@ -46,6 +78,7 @@ EVENT_LABEL = {
     "validated": "已验证",
     "breakout": "突破",
     "expired": "过期",
+    "direction_change": "方向变化",
 }
 DIRECTION_LABEL = {"up": "上升", "down": "下降", "flat": "走平"}
 CONSTRAINT_LABEL = {
@@ -178,6 +211,8 @@ def display_snapshot(snapshot: dict) -> dict:
     shown["boundaries"] = boundaries
     shown["zones"] = zones
     shown["events"] = events
+    if "methods" in snapshot:
+        shown["methods"] = _filter_methods(snapshot, limit, _as_of_stop_index(snapshot), events)
     shown["relations"] = _relations(snapshot, boundaries, zones, segments)
     shown["pivot_stats"] = pivot_segment_stats(
         pivots,
@@ -224,6 +259,12 @@ def build_view_model(snapshot: dict) -> dict:
         "zones": zones,
         "segments": [_segment_view(item) for item in shown["segments"] if _segment_view(item)],
         "as_of_index": stop,
+        "marks": _method_marks(shown, price_axis, stop),
+        "default_methods": list(_visible_methods(snapshot)),
+        "method_objects": {
+            key: [item.get("id") for item in (record.get("objects") or [])]
+            for key, record in (shown.get("methods") or {}).items()
+        },
     }
 
 
@@ -459,6 +500,145 @@ def _tick_label(time_text: str, interval: str) -> str:
     if interval == "1d" or clock.startswith("00:00:00"):
         return day
     return f"{day[5:]} {clock[:5]}"
+
+
+def _filter_methods(snapshot: dict, limit: Optional[datetime], stop_index: Optional[int], events: Sequence[dict]) -> dict:
+    shown = {}
+    for key, record in (snapshot.get("methods") or {}).items():
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        objects = []
+        for item in record.get("objects") or []:
+            adapted = _adapt_method_object(item, kind, limit, stop_index, snapshot, events)
+            if adapted is not None:
+                objects.append(adapted)
+        extra = {}
+        for name, rows in (record.get("extra") or {}).items():
+            if isinstance(rows, list):
+                extra[name] = [row for row in rows if _row_visible(row, limit, stop_index)]
+            else:
+                extra[name] = rows
+        updated = dict(record)
+        updated["objects"] = objects
+        updated["extra"] = extra
+        shown[key] = updated
+    return shown
+
+
+def _adapt_method_object(record, kind, limit, stop_index, snapshot, events):
+    if not _visible(record, limit):
+        return None
+    if kind == "run":
+        return _truncate_run(record, limit, stop_index, snapshot)
+    status = _status_at(record, events, limit)
+    updated = record if status == record.get("status") else _with_status(record, status)
+    return _filter_timed_lists(updated, limit, stop_index)
+
+
+def _truncate_run(record: dict, limit: Optional[datetime], stop_index: Optional[int], snapshot: dict) -> Optional[dict]:
+    """区段型不按事件改状态。
+
+    一段被收束，是因为后面又开了一段。在下一段还不可用时，这一段仍然进行中。
+    终点晚于 as-of 就截到当时，并且不显示当时还没写完的统计。
+    """
+    if limit is None:
+        return record
+    start = int(record.get("start_index") or 0)
+    if stop_index is None or int(stop_index) < start:
+        return None
+    end = int(record.get("end_index"))
+    successor = _successor_time(snapshot, record)
+    closed_known = (
+        record.get("status") == "closed"
+        and successor is not None
+        and _not_after(successor, limit)
+    )
+    if closed_known and end <= int(stop_index):
+        return _filter_timed_lists(record, limit, stop_index)
+    updated = dict(record)
+    updated["status"] = "open"
+    if end > int(stop_index):
+        updated["end_index"] = int(stop_index)
+        updated["end_time"] = _time_at(snapshot, int(stop_index)) or record.get("end_time")
+        updated.pop("stats", None)
+    return _filter_timed_lists(updated, limit, stop_index)
+
+
+def _successor_time(snapshot: dict, record: dict) -> Optional[datetime]:
+    """同一尺度里，下一段方向区段的可用时间。没有下一段则为空。"""
+    objects = []
+    for method in (snapshot.get("methods") or {}).values():
+        for item in method.get("objects") or []:
+            if item.get("id") == record.get("id"):
+                objects = method.get("objects") or []
+                break
+    later = [
+        item
+        for item in objects
+        if item.get("scale") == record.get("scale") and int(item.get("start_index") or 0) > int(record.get("start_index") or 0)
+    ]
+    if not later:
+        return None
+    later.sort(key=lambda item: int(item["start_index"]))
+    return _parse_time(later[0].get("available_time"))
+
+
+def _filter_timed_lists(record: dict, limit: Optional[datetime], stop_index: Optional[int]) -> dict:
+    if limit is None:
+        return record
+    updated = dict(record)
+    for key, value in record.items():
+        if (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], dict)
+            and "available_index" in value[0]
+        ):
+            updated[key] = [item for item in value if _row_visible(item, limit, stop_index)]
+    return updated
+
+
+def _row_visible(row: dict, limit: Optional[datetime], stop_index: Optional[int]) -> bool:
+    if limit is None or not isinstance(row, dict):
+        return True
+    if row.get("available_time"):
+        return _visible(row, limit)
+    if "available_index" in row and stop_index is not None:
+        return int(row["available_index"]) <= int(stop_index)
+    return True
+
+
+def _time_at(snapshot: dict, index: int) -> Optional[str]:
+    for bar in _list(snapshot, "closes"):
+        if int(bar.get("index")) == int(index):
+            return bar.get("time")
+    return None
+
+
+def _method_marks(shown: dict, price_axis: str, stop: Optional[int]) -> List[dict]:
+    from analysis.structure.methods import registered_methods
+
+    methods = shown.get("methods") or {}
+    by_key = {method.key: method for method in registered_methods()}
+    view = {"price_axis": price_axis, "stop_index": stop}
+    marks = []
+    for key, record in methods.items():
+        if record.get("status") not in (None, "completed"):
+            continue
+        method = by_key.get(key)
+        if method is None:
+            continue
+        for item in record.get("objects") or []:
+            marks.extend(method.present(item, view))
+    return marks
+
+
+def _visible_methods(snapshot: dict) -> Sequence[str]:
+    identity = snapshot.get("identity") or {}
+    if "visible_methods" in identity:
+        return list(identity.get("visible_methods") or [])
+    return list((snapshot.get("methods") or {}).keys())
 
 
 def _as_of_limit(snapshot: dict) -> Optional[datetime]:

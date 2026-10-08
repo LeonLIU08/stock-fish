@@ -1,21 +1,31 @@
-"""参数版本 structure-params-v0。
+"""参数版本登记。
 
-第 9 节的默认值一旦发出就固定在这个版本里。以后调阈值要换版本号，
-不覆盖旧运行目录。`volatility_floor` 是「波动尺度有下限」的实现值，
-反转门槛的下限仍然是各尺度的 delta_min。
+每一版写明基础参数和启用的判断方法。v0 的默认值一旦发出就固定，
+以后调阈值要换版本号，不覆盖旧运行目录。`volatility_floor` 是
+「波动尺度有下限」的实现值，反转门槛的下限仍然是各尺度的 delta_min。
+
+v2 的基础参数与 v1 相同，并启用方向。区间形状留到该方法实现时再启用。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 PARAM_VERSION = "structure-params-v0"
 PARAM_VERSION_V1 = "structure-params-v1"
-PARAM_VERSIONS = (PARAM_VERSION, PARAM_VERSION_V1)
+PARAM_VERSION_V2 = "structure-params-v2"
+PARAM_VERSIONS = (PARAM_VERSION, PARAM_VERSION_V1, PARAM_VERSION_V2)
 # (有效区间内每侧最少接触簇, 是否承认边界全长已经凑满的接触簇)
 _ZONE_TOUCH_BY_VERSION = {
     PARAM_VERSION: (3, False),
     PARAM_VERSION_V1: (2, True),
+    PARAM_VERSION_V2: (2, True),
+}
+# 该版本启用的判断方法。v0、v1 不写方法参数，也不写 methods 段。
+_METHODS_BY_VERSION = {
+    PARAM_VERSION: (),
+    PARAM_VERSION_V1: (),
+    PARAM_VERSION_V2: ("direction",),
 }
 
 SHORT = "short"
@@ -84,6 +94,65 @@ class ScaleParams:
 
 
 @dataclass(frozen=True)
+class DirectionParams:
+    """方向判断的参数。只出现在启用了 direction 的参数版本里。"""
+
+    epsilon: float = 0.5
+    cross_buffer: float = 0.5
+    cross_bars: int = 2
+    stall_bars: Tuple[int, int, int] = (30, 60, 125)
+
+    def __post_init__(self) -> None:
+        self.check()
+
+    def check(self) -> None:
+        if self.epsilon <= 0 or self.cross_buffer <= 0:
+            raise ValueError("持平容差和穿越缓冲必须为正")
+        if self.cross_buffer < self.epsilon:
+            raise ValueError("穿越缓冲不得小于持平容差")
+        if self.cross_bars < 1:
+            raise ValueError("穿越连续根数必须 >= 1")
+        if len(self.stall_bars) != 3 or any(int(item) < 1 for item in self.stall_bars):
+            raise ValueError("停滞根数必须按短、中、长给出三个不小于 1 的整数")
+
+    def stall_for(self, scale: str) -> int:
+        return int(dict(zip(SCALE_NAMES, self.stall_bars))[scale])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "epsilon": self.epsilon,
+            "cross_buffer": self.cross_buffer,
+            "cross_bars": self.cross_bars,
+            "stall_bars": {
+                SHORT: int(self.stall_bars[0]),
+                MID: int(self.stall_bars[1]),
+                LONG: int(self.stall_bars[2]),
+            },
+        }
+
+
+def direction_params_from_dict(payload: Dict[str, Any] | None) -> DirectionParams:
+    """把快照里的 direction 字典收成参数。缺省用 2.1.6 的默认值。"""
+    if not payload:
+        return DirectionParams()
+    stalls = payload.get("stall_bars") or {}
+    if isinstance(stalls, dict):
+        stall_bars = (
+            int(stalls.get(SHORT, 30)),
+            int(stalls.get(MID, 60)),
+            int(stalls.get(LONG, 125)),
+        )
+    else:
+        stall_bars = tuple(int(item) for item in stalls)
+    return DirectionParams(
+        epsilon=float(payload.get("epsilon", 0.5)),
+        cross_buffer=float(payload.get("cross_buffer", 0.5)),
+        cross_bars=int(payload.get("cross_bars", 2)),
+        stall_bars=stall_bars,  # type: ignore[arg-type]
+    )
+
+
+@dataclass(frozen=True)
 class StructureParams:
     """一次运行读入的整包参数。几何、拐点和以后的边界都引用这一份。"""
 
@@ -116,6 +185,7 @@ class StructureParams:
     daily_gap_days: int = 5
     intraday_gap_median_multiple: float = 3.0
     max_zones_per_scale: int = 3
+    direction: Optional[DirectionParams] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
@@ -171,6 +241,11 @@ class StructureParams:
             raise ValueError("intraday_gap_median_multiple 必须为正")
         if self.max_zones_per_scale < 1:
             raise ValueError("max_zones_per_scale 必须 >= 1")
+        enabled = _METHODS_BY_VERSION[self.version]
+        if ("direction" in enabled) != (self.direction is not None):
+            raise ValueError("direction 参数只写在启用了方向方法的版本里")
+        if self.direction is not None:
+            self.direction.check()
 
     def scale(self, name: str) -> ScaleParams:
         for item in self.scales:
@@ -185,11 +260,20 @@ class StructureParams:
         payload: Dict[str, Any] = {}
         for item in fields(self):
             value = getattr(self, item.name)
+            if item.name == "direction":
+                if value is not None:
+                    payload[item.name] = value.to_dict()
+                continue
             if item.name == "scales":
                 payload[item.name] = [scale.to_dict() for scale in value]
             else:
                 payload[item.name] = value
         return payload
+
+
+def enabled_methods(version: str) -> Tuple[str, ...]:
+    """该参数版本要跑的判断方法。顺序与登记表一致。"""
+    return _METHODS_BY_VERSION[normalize_param_version(version)]
 
 
 def normalize_param_version(version: str) -> str:
@@ -207,11 +291,13 @@ def default_params(
     """返回一份冻结参数包。价格轴只改几何坐标，不改该版本里的阈值。"""
     resolved = normalize_param_version(version)
     zone_min, credit = _ZONE_TOUCH_BY_VERSION[resolved]
+    direction = DirectionParams() if "direction" in _METHODS_BY_VERSION[resolved] else None
     return StructureParams(
         version=resolved,
         price_axis=normalize_price_axis(price_axis),
         zone_min_touch_clusters=zone_min,
         zone_credit_full_span=credit,
+        direction=direction,
     )
 
 

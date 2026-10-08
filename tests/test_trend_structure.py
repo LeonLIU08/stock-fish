@@ -17,6 +17,7 @@ from analysis.structure.config import (
     MID,
     PARAM_VERSION,
     PARAM_VERSION_V1,
+    PARAM_VERSION_V2,
     SCALE_NAMES,
     SHORT,
     default_params,
@@ -139,8 +140,19 @@ class ParamsTests(unittest.TestCase):
         self.assertEqual(relaxed.touch_distance_ratio, original.touch_distance_ratio)
         self.assertEqual(relaxed.touch_cluster_window, original.touch_cluster_window)
         self.assertEqual([scale.to_dict() for scale in relaxed.scales], [scale.to_dict() for scale in original.scales])
+        self.assertNotIn("direction", original.to_dict())
+        self.assertNotIn("direction", relaxed.to_dict())
+        directed = default_params(version=PARAM_VERSION_V2)
+        self.assertEqual(directed.version, "structure-params-v2")
+        self.assertEqual(directed.zone_min_touch_clusters, relaxed.zone_min_touch_clusters)
+        self.assertEqual(directed.zone_credit_full_span, relaxed.zone_credit_full_span)
+        self.assertEqual(directed.direction.epsilon, 0.5)
+        self.assertEqual(directed.direction.cross_buffer, 0.5)
+        self.assertEqual(directed.direction.cross_bars, 2)
+        self.assertEqual(directed.direction.stall_bars, (30, 60, 125))
+        self.assertIn("direction", directed.to_dict())
         with self.assertRaises(ValueError):
-            default_params(version="structure-params-v2")
+            default_params(version="structure-params-v9")
 
     def test_unknown_price_axis_rejected(self):
         with self.assertRaises(ValueError):

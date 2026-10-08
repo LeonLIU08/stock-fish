@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from analysis.structure.config import PARAM_VERSION
+from analysis.structure.methods.base import lookup_path
 from analysis.structure.series import result_directory
 from analysis.structure.view_model import (
     CONSTRAINT_LABEL,
@@ -18,6 +20,7 @@ from analysis.structure.view_model import (
     SCALE_DEFINITION_NOTE,
     SCALE_LABEL,
     STATUS_LABEL,
+    TOKEN_LABEL,
     ZONE_LABEL,
     build_view_model,
     display_snapshot,
@@ -78,9 +81,10 @@ def render_report(snapshot: dict) -> str:
         _pivot_section(shown),
         _boundary_section(shown),
         _zone_section(shown),
+        _method_sections(shown, snapshot),
         _event_section(shown),
         _relation_section(shown),
-        _appendix(shown),
+        _appendix(shown, snapshot),
         _params_section(snapshot),
         _glossary(),
         f'<script type="application/json" id="structure-snapshot">{_json_for_script(snapshot)}</script>',
@@ -166,6 +170,7 @@ def _header(snapshot: dict, shown: dict) -> str:
     <a href="#pivots">拐点与线段</a>
     <a href="#boundaries">趋势线</a>
     <a href="#zones">趋势区间</a>
+    {_method_nav(snapshot)}
     <a href="#events">事件</a>
     <a href="#relations">关系</a>
     <a href="#appendix">附录</a>
@@ -511,7 +516,7 @@ def _event_section(shown: dict) -> str:
             f"<td>{esc(item.get('event_index'))}</td>"
             f"<td>{fmt_price(item.get('reference_close'))}</td>"
             f"<td>{esc(item.get('object_id'))}</td>"
-            f"<td>{esc('趋势线' if item.get('object_kind') == 'boundary' else '趋势区间')}</td>"
+            f"<td>{esc(_object_kind_label(item.get('object_kind')))}</td>"
             f"<td>{esc(item.get('revision'))}</td>"
             f"<td class=\"wrap\">{esc(item.get('reason'))}</td>"
             f"<td>{esc(cross if cross is not None else '—')}</td>"
@@ -591,7 +596,169 @@ def _relation_section(shown: dict) -> str:
 """
 
 
-def _appendix(shown: dict) -> str:
+def _method_nav(snapshot: dict) -> str:
+    links = []
+    for key, record in (snapshot.get("methods") or {}).items():
+        links.append(f'<a href="#method-{esc(key)}">{esc((record or {}).get("name") or key)}</a>')
+    return "".join(links)
+
+
+def _method_sections(shown: dict, snapshot: dict) -> str:
+    methods = shown.get("methods") or {}
+    if not methods:
+        return ""
+    from analysis.structure.methods import registered_methods
+
+    order = [method.key for method in registered_methods()]
+    keys = [key for key in order if key in methods] + [key for key in methods if key not in order]
+    return "".join(_method_section(key, methods[key], snapshot) for key in keys)
+
+
+def _method_section(key: str, record: dict, snapshot: dict) -> str:
+    from analysis.structure.methods import registered_methods
+
+    method = next((item for item in registered_methods() if item.key == key), None)
+    status = STATUS_LABEL.get(record.get("status"), record.get("status") or "")
+    notes = "".join(f"<p>{esc(note)}</p>" for note in record.get("notes") or [])
+    if key == "direction":
+        notes = (
+            "<p>同一尺度里，用已经确认的高点和低点给每根 K 线一个方向。"
+            "未定不是类别。停滞只改标签，不改结构方向。</p>"
+            + notes
+        )
+    reason = ""
+    if record.get("status") != "completed" and record.get("reason"):
+        reason = f'<p class="banner">{esc(record.get("reason"))}</p>'
+    blocks = []
+    for table in method.tables() if method else ():
+        if table.appendix:
+            continue
+        blocks.append(_declared_table(key, table, _table_source(record, table), snapshot))
+    return f"""
+<section id="method-{esc(key)}">
+  <h2>{esc(record.get("name") or key)}</h2>
+  <p class="muted">{esc(record.get("section") or "")} · {esc(record.get("version") or "")} · {esc(status)}</p>
+  {notes}
+  {reason}
+  {_method_params(record.get("params") or {})}
+  {"".join(blocks)}
+</section>
+"""
+
+
+def _method_params(params: dict) -> str:
+    if not params:
+        return ""
+    labels = {
+        "epsilon": "持平容差",
+        "cross_buffer": "穿越缓冲",
+        "cross_bars": "穿越连续根数",
+        "stall_bars": "停滞根数（短 / 中 / 长）",
+    }
+    rows = []
+    for key, value in params.items():
+        if isinstance(value, dict):
+            shown = "、".join(f"{TOKEN_LABEL.get(name, name)} {item}" for name, item in value.items())
+        else:
+            shown = value
+        rows.append(f"<tr><td>{esc(labels.get(key, key))}</td><td>{esc(shown)}</td></tr>")
+    return (
+        '<div class="table-wrap"><table><thead><tr><th>参数</th><th>取值</th></tr></thead>'
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _method_appendix(shown: dict, snapshot: dict) -> str:
+    methods = shown.get("methods") or {}
+    if not methods:
+        return ""
+    from analysis.structure.methods import registered_methods
+
+    blocks = []
+    for method in registered_methods():
+        record = methods.get(method.key)
+        if not record:
+            continue
+        for table in method.tables():
+            if not table.appendix:
+                continue
+            rows = _table_source(record, table)
+            blocks.append(
+                "<details><summary>"
+                + esc(table.title)
+                + f"（{len(rows)}）</summary>"
+                + _declared_table(method.key, table, rows, snapshot)
+                + "</details>"
+            )
+    return "".join(blocks)
+
+
+def _table_source(record: dict, table) -> list:
+    source = table.source or "objects"
+    if source == "objects":
+        return list(record.get("objects") or [])
+    if source.startswith("extra."):
+        return list((record.get("extra") or {}).get(source.split(".", 1)[1]) or [])
+    return []
+
+
+def _declared_table(method_key: str, table, rows: list, snapshot: dict) -> str:
+    price_axis = ((snapshot.get("identity") or {}).get("price_axis")) or "log"
+    head = "".join(f"<th>{esc(column.name)}</th>" for column in table.columns)
+    body = []
+    for item in rows:
+        cells = "".join(
+            f"<td>{_format_cell(lookup_path(item, column.path), column.format, price_axis)}</td>"
+            for column in table.columns
+        )
+        object_id = item.get("id") or ""
+        attr = f' data-object-id="{esc(object_id)}"' if object_id else ""
+        body.append(f"<tr{attr}>{cells}</tr>")
+    return (
+        f'<div class="table-wrap"><table id="method-{esc(method_key)}-{esc(table.key)}">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body) or _empty_row(len(table.columns))}</tbody></table></div>"
+    )
+
+
+def _format_cell(value, fmt: str, price_axis: str) -> str:
+    if value is None or value == "":
+        return "—"
+    if fmt == "time":
+        return esc(fmt_time(value))
+    if fmt == "price":
+        return fmt_price(value)
+    if fmt == "geometric":
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return esc(value)
+        if price_axis == "log":
+            number = math.exp(number)
+        return fmt_price(number)
+    if fmt in ("multiple", "index"):
+        return fmt_num(value, 4 if fmt == "multiple" else 0)
+    if fmt == "status":
+        return _status_badge(str(value))
+    if fmt == "token":
+        return esc(TOKEN_LABEL.get(value, value))
+    return esc(value)
+
+
+def _object_kind_label(kind) -> str:
+    if kind == "boundary":
+        return "趋势线"
+    if kind == "zone":
+        return "趋势区间"
+    from analysis.structure.methods import registered_methods
+
+    for method in registered_methods():
+        if method.key == kind:
+            return method.name
+    return str(kind or "—")
+
+
+def _appendix(shown: dict, snapshot: dict) -> str:
     alternates = [item for item in shown.get("boundaries") or [] if not item.get("primary")]
     zone_alternates = [item for item in shown.get("zones") or [] if not item.get("primary")]
     temporary = shown.get("temporary_segments") or []
@@ -625,6 +792,7 @@ def _appendix(shown: dict) -> str:
       <tbody>{"".join(temp_rows) or _empty_row(4)}</tbody>
     </table></div>
   </details>
+  {_method_appendix(shown, snapshot)}
 </section>
 """
 
