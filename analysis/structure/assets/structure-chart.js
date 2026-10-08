@@ -438,7 +438,6 @@ const TrendChart = (function () {
     function reset() {
       dispatchX(fullX.min, fullX.max);
       dispatchY(fullY.min, fullY.max);
-      chart.setOption({ series: [{ id: "focus-line", data: [] }, { id: "focus-point", data: [] }] });
     }
 
     function destroy() {
