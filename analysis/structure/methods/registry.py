@@ -11,10 +11,20 @@ from analysis.structure.methods.base import BASE_INPUTS, RUN_STATUSES, MethodRes
 def registered_methods() -> tuple:
     """按登记顺序返回方法。延迟导入，避免和快照、页面互相在模块顶层缠住。"""
     from analysis.structure.methods.direction import DirectionMethod
+    from analysis.structure.methods.major_trend import MajorTrendMethod
+    from analysis.structure.methods.minor_swing import MinorSwingMethod
     from analysis.structure.methods.pause import PauseMethod
+    from analysis.structure.methods.retracement import RetracementMethod
     from analysis.structure.methods.zone_shape import ZoneShapeMethod
 
-    return (DirectionMethod(), ZoneShapeMethod(), PauseMethod(),)
+    return (
+        DirectionMethod(),
+        ZoneShapeMethod(),
+        PauseMethod(),
+        MajorTrendMethod(),
+        RetracementMethod(),
+        MinorSwingMethod(),
+    )
 
 
 def validate_registry(methods: Sequence[object]) -> List[object]:

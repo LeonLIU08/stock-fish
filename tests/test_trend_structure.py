@@ -20,6 +20,7 @@ from analysis.structure.config import (
     PARAM_VERSION_V2,
     PARAM_VERSION_V3,
     PARAM_VERSION_V4,
+    PARAM_VERSION_V5,
     SCALE_NAMES,
     SHORT,
     default_params,
@@ -166,6 +167,22 @@ class ParamsTests(unittest.TestCase):
         for item, new_k in zip(older["scales"], (1.4, 2.8, 5.6)):
             item["k"] = new_k
         older["version"] = PARAM_VERSION_V4
+        self.assertEqual(newer, older)
+
+    def test_v5_adds_levels_without_changing_v4(self):
+        older = default_params(version=PARAM_VERSION_V4).to_dict()
+        newer = default_params(version=PARAM_VERSION_V5).to_dict()
+        self.assertEqual(
+            enabled_methods(PARAM_VERSION_V5),
+            ("direction", "zone_shape", "pause", "major_trend", "retracement", "minor_swing"),
+        )
+        self.assertEqual(newer["major_trend"], {})
+        self.assertEqual(newer["retracement"], {})
+        self.assertEqual(newer["minor_swing"], {})
+        for key in ("major_trend", "retracement", "minor_swing"):
+            self.assertNotIn(key, older)
+            newer.pop(key)
+        older["version"] = PARAM_VERSION_V5
         self.assertEqual(newer, older)
 
     def test_yaml_rejects_unknown_fields(self):

@@ -59,6 +59,11 @@ TOKEN_LABEL = {
     "cross": "有效穿越",
     "progress": "推进",
     "gap": "间断",
+    "structure": "结构方向变化",
+    "retracement": "次级折返",
+    "minor_swing": "短期波动",
+    "dow_inside": "1/3～2/3",
+    "dow_outside": "不在 1/3～2/3",
     "inherit": "段初",
     "replace": "更换",
     "rising": "上升",
@@ -104,6 +109,7 @@ EVENT_LABEL = {
     "breakout": "突破",
     "expired": "过期",
     "direction_change": "方向变化",
+    "major_trend_change": "主趋势变化",
 }
 DIRECTION_LABEL = {"up": "上升", "down": "下降", "flat": "走平"}
 CONSTRAINT_LABEL = {

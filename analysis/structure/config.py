@@ -6,7 +6,8 @@ v0 的文件一旦发出就固定，以后调阈值要换版本号，不覆盖�
 
 v2 的基础参数与 v1 相同，并启用方向。v3 在 v2 上启用区间形状和停顿。
 v4 与 v3 相同，只把短、中、长的反转倍数改为 1.4、2.8、5.6。
-停顿才读取最高价、最低价和成交量。
+v5 在 v4 上再启用主趋势、次级折返和短期波动。六个方法一次运行全部写出。
+停顿才读取最高价、最低价和成交量。级别不新增行情列。
 """
 from __future__ import annotations
 
@@ -22,12 +23,21 @@ PARAM_VERSION_V1 = "structure-params-v1"
 PARAM_VERSION_V2 = "structure-params-v2"
 PARAM_VERSION_V3 = "structure-params-v3"
 PARAM_VERSION_V4 = "structure-params-v4"
+PARAM_VERSION_V5 = "structure-params-v5"
 # 命令行不写 --param-version 时用这一版。库函数不传版本时仍返回 v0。
-CLI_PARAM_VERSION = PARAM_VERSION_V4
+CLI_PARAM_VERSION = PARAM_VERSION_V5
 
 _PARAMS_DIR = Path(__file__).resolve().parent / "params"
 _VERSION_FILE = re.compile(r"structure-params-v(\d+)$")
-_METHOD_NAMES = ("direction", "zone_shape", "pause")
+_METHOD_NAMES = (
+    "direction",
+    "zone_shape",
+    "pause",
+    "major_trend",
+    "retracement",
+    "minor_swing",
+)
+_LEVEL_METHODS = ("major_trend", "retracement", "minor_swing")
 
 
 def series_quote_fields(version: str) -> Tuple[str, ...]:
@@ -353,6 +363,17 @@ def zone_shape_params_from_dict(payload: Dict[str, Any] | None) -> ZoneShapePara
     )
 
 
+@dataclass(frozen=True)
+class EmptyMethodParams:
+    """没有可调阈值的方法。参数块写成空映射，只用来标明这一版启用了它。"""
+
+    def check(self) -> None:
+        return None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {}
+
+
 def direction_params_from_dict(payload: Dict[str, Any] | None) -> DirectionParams:
     """把快照里的 direction 字典收成参数。缺省用 2.1.6 的默认值。"""
     if not payload:
@@ -439,6 +460,7 @@ def _discover_versions() -> Tuple[str, ...]:
         PARAM_VERSION_V2,
         PARAM_VERSION_V3,
         PARAM_VERSION_V4,
+        PARAM_VERSION_V5,
     )
     missing = [item for item in required if item not in versions]
     if missing:
@@ -518,7 +540,7 @@ def _read_spec(version: str) -> Dict[str, Any]:
         raise ValueError(f"{source} 的方法键重复")
     ordered = tuple(name for name in _METHOD_NAMES if name in methods)
     if tuple(methods) != ordered:
-        raise ValueError(f"{source} 的 methods 请按 direction、zone_shape、pause 的顺序写")
+        raise ValueError(f"{source} 的 methods 请按 {'、'.join(_METHOD_NAMES)} 的顺序写")
     for name in _METHOD_NAMES:
         present = name in methods
         has_block = name in payload and payload[name] is not None
@@ -577,6 +599,13 @@ def _zone_shape_from_spec(payload: Any, source: str) -> ZoneShapeParams:
     return ZoneShapeParams(**{name: _as_float(row[name], f"{label}.{name}") for name in names})
 
 
+def _empty_from_spec(payload: Any, source: str, name: str) -> EmptyMethodParams:
+    label = f"{source} 的 {name}"
+    row = _require_mapping(payload, label)
+    _exact_keys(row, (), label)
+    return EmptyMethodParams()
+
+
 def _pause_from_spec(payload: Any, source: str) -> PauseParams:
     label = f"{source} 的 pause"
     row = _require_mapping(payload, label)
@@ -630,6 +659,8 @@ def params_kwargs_from_payload(payload: Dict[str, Any], source: str, price_axis:
     }
     for name, builder in builders.items():
         kwargs[name] = builder(row[name], source) if name in method_names else None
+    for name in _LEVEL_METHODS:
+        kwargs[name] = _empty_from_spec(row[name], source, name) if name in method_names else None
     return kwargs
 
 
@@ -673,6 +704,9 @@ class StructureParams:
     direction: Optional[DirectionParams] = _V0_KWARGS["direction"]
     zone_shape: Optional[ZoneShapeParams] = _V0_KWARGS["zone_shape"]
     pause: Optional[PauseParams] = _V0_KWARGS["pause"]
+    major_trend: Optional[EmptyMethodParams] = None
+    retracement: Optional[EmptyMethodParams] = None
+    minor_swing: Optional[EmptyMethodParams] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
@@ -726,12 +760,20 @@ class StructureParams:
             raise ValueError("zone_shape 参数只写在启用了区间形状的版本里")
         if ("pause" in enabled) != (self.pause is not None):
             raise ValueError("pause 参数只写在启用了停顿的版本里")
+        for name in _LEVEL_METHODS:
+            present = getattr(self, name) is not None
+            if (name in enabled) != present:
+                raise ValueError(f"{name} 参数只写在启用了该方法的版本里")
         if self.direction is not None:
             self.direction.check()
         if self.zone_shape is not None:
             self.zone_shape.check()
         if self.pause is not None:
             self.pause.check()
+        for name in _LEVEL_METHODS:
+            value = getattr(self, name)
+            if value is not None:
+                value.check()
 
     def scale(self, name: str) -> ScaleParams:
         for item in self.scales:
@@ -746,7 +788,7 @@ class StructureParams:
         payload: Dict[str, Any] = {}
         for item in fields(self):
             value = getattr(self, item.name)
-            if item.name in ("direction", "zone_shape", "pause"):
+            if item.name in _METHOD_NAMES:
                 if value is not None:
                     payload[item.name] = value.to_dict()
                 continue
