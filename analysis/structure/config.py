@@ -1,47 +1,38 @@
 """参数版本登记。
 
-每一版写明基础参数和启用的判断方法。v0 的默认值一旦发出就固定，
-以后调阈值要换版本号，不覆盖旧运行目录。`volatility_floor` 是
-「波动尺度有下限」的实现值，反转门槛的下限仍然是各尺度的 delta_min。
+每一版的数值写在 `analysis/structure/params/structure-params-vN.yaml`。
+v0 的文件一旦发出就固定，以后调阈值要换版本号，不覆盖旧运行目录。
+`volatility_floor` 是「波动尺度有下限」的实现值，反转门槛的下限仍然是各尺度的 delta_min。
 
-v2 的基础参数与 v1 相同，并启用方向。v2 已经有运行结果，不改这一版。
-v3 的基础参数与 v2 相同，一次启用方向、区间形状和停顿。三个方法分开计算。
+v2 的基础参数与 v1 相同，并启用方向。v3 在 v2 上启用区间形状和停顿。
+v4 与 v3 相同，只把短、中、长的反转倍数改为 1.4、2.8、5.6。
 停顿才读取最高价、最低价和成交量。
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+import yaml
 
 PARAM_VERSION = "structure-params-v0"
 PARAM_VERSION_V1 = "structure-params-v1"
 PARAM_VERSION_V2 = "structure-params-v2"
 PARAM_VERSION_V3 = "structure-params-v3"
-PARAM_VERSIONS = (
-    PARAM_VERSION,
-    PARAM_VERSION_V1,
-    PARAM_VERSION_V2,
-    PARAM_VERSION_V3,
-)
-# (有效区间内每侧最少接触簇, 是否承认边界全长已经凑满的接触簇)
-_ZONE_TOUCH_BY_VERSION = {
-    PARAM_VERSION: (3, False),
-    PARAM_VERSION_V1: (2, True),
-    PARAM_VERSION_V2: (2, True),
-    PARAM_VERSION_V3: (2, True),
-}
-# 该版本启用的判断方法。v0、v1 不写方法参数，也不写 methods 段。
-_METHODS_BY_VERSION = {
-    PARAM_VERSION: (),
-    PARAM_VERSION_V1: (),
-    PARAM_VERSION_V2: ("direction",),
-    PARAM_VERSION_V3: ("direction", "zone_shape", "pause"),
-}
+PARAM_VERSION_V4 = "structure-params-v4"
+# 命令行不写 --param-version 时用这一版。库函数不传版本时仍返回 v0。
+CLI_PARAM_VERSION = PARAM_VERSION_V4
+
+_PARAMS_DIR = Path(__file__).resolve().parent / "params"
+_VERSION_FILE = re.compile(r"structure-params-v(\d+)$")
+_METHOD_NAMES = ("direction", "zone_shape", "pause")
 
 
 def series_quote_fields(version: str) -> Tuple[str, ...]:
     """该参数版本的数据哈希要覆盖的行情字段。没有则仍只覆盖时间戳和收盘价。"""
-    if "pause" in _METHODS_BY_VERSION[normalize_param_version(version)]:
+    if "pause" in enabled_methods(version):
         return ("high", "low", "volume")
     return ()
 
@@ -383,56 +374,310 @@ def direction_params_from_dict(payload: Dict[str, Any] | None) -> DirectionParam
     )
 
 
+_BASE_KEYS = (
+    "ewma_span",
+    "vol_clip_multiple",
+    "volatility_floor",
+    "scales",
+    "touch_distance_ratio",
+    "touch_cluster_window",
+    "min_touch_clusters",
+    "zone_min_touch_clusters",
+    "zone_credit_full_span",
+    "hard_break_ratio",
+    "breakout_buffer_ratio",
+    "breakout_bars",
+    "max_pivots_per_line",
+    "channel_width_ratio_min",
+    "channel_width_ratio_max",
+    "convergence_width_ratio",
+    "sideways_normalized_slope",
+    "parallel_slope_gap",
+    "expire_bars",
+    "daily_gap_days",
+    "intraday_gap_median_multiple",
+    "max_zones_per_scale",
+)
+_INT_BASE = {
+    "ewma_span",
+    "touch_cluster_window",
+    "min_touch_clusters",
+    "zone_min_touch_clusters",
+    "breakout_bars",
+    "max_pivots_per_line",
+    "expire_bars",
+    "daily_gap_days",
+    "max_zones_per_scale",
+}
+_PAUSE_INTS = {
+    "pole_min",
+    "pole_max",
+    "consolidation_min",
+    "consolidation_max",
+    "atr_lookback",
+    "pivot_half_width",
+    "min_highs",
+    "min_lows",
+    "pullback_bars",
+}
+_PAUSE_BOOLS = {"volume_filter", "breakout_volume_filter"}
+_RAW_SPECS: Dict[str, Dict[str, Any]] = {}
+
+
+def _discover_versions() -> Tuple[str, ...]:
+    if not _PARAMS_DIR.is_dir():
+        raise RuntimeError(f"找不到参数目录 {_PARAMS_DIR}")
+    found = [
+        path.stem
+        for path in _PARAMS_DIR.glob("structure-params-v*.yaml")
+        if _VERSION_FILE.fullmatch(path.stem)
+    ]
+    versions = tuple(sorted(set(found), key=lambda name: int(_VERSION_FILE.fullmatch(name).group(1))))
+    required = (
+        PARAM_VERSION,
+        PARAM_VERSION_V1,
+        PARAM_VERSION_V2,
+        PARAM_VERSION_V3,
+        PARAM_VERSION_V4,
+    )
+    missing = [item for item in required if item not in versions]
+    if missing:
+        raise RuntimeError("缺少参数文件: " + ", ".join(missing))
+    return versions
+
+
+PARAM_VERSIONS = _discover_versions()
+
+
+def normalize_param_version(version: str) -> str:
+    text = str(version or "").strip()
+    if text not in PARAM_VERSIONS:
+        raise ValueError(f"参数版本必须是 {PARAM_VERSIONS} 之一，收到 {version!r}")
+    return text
+
+
+def _as_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} 必须是整数")
+    return value
+
+
+def _as_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} 必须是数字")
+    return float(value)
+
+
+def _as_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} 必须是 true 或 false")
+    return value
+
+
+def _require_mapping(payload: Any, label: str) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} 必须是映射")
+    return payload
+
+
+def _exact_keys(
+    payload: Dict[str, Any],
+    required: Tuple[str, ...] | set,
+    label: str,
+    optional: Tuple[str, ...] = (),
+) -> None:
+    allowed = set(required) | set(optional)
+    extra = sorted(set(payload) - allowed)
+    missing = [name for name in required if name not in payload]
+    if extra:
+        raise ValueError(f"{label} 有未登记的字段: {', '.join(extra)}")
+    if missing:
+        raise ValueError(f"{label} 缺少字段: {', '.join(missing)}")
+
+
+def _read_spec(version: str) -> Dict[str, Any]:
+    cached = _RAW_SPECS.get(version)
+    if cached is not None:
+        return cached
+    path = _PARAMS_DIR / f"{version}.yaml"
+    if not path.is_file():
+        raise ValueError(f"找不到参数文件 {path}")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    source = path.name
+    payload = _require_mapping(payload, source)
+    if payload.get("version") != version:
+        raise ValueError(f"{source} 的 version 必须是 {version}")
+    _exact_keys(payload, ("version", "methods", *_BASE_KEYS), source, optional=_METHOD_NAMES)
+    methods = payload.get("methods")
+    if not isinstance(methods, list) or any(not isinstance(item, str) for item in methods):
+        raise ValueError(f"{source} 的 methods 必须是方法键列表")
+    unknown = [item for item in methods if item not in _METHOD_NAMES]
+    if unknown:
+        raise ValueError(f"{source} 有未知方法: {', '.join(unknown)}")
+    if len(methods) != len(set(methods)):
+        raise ValueError(f"{source} 的方法键重复")
+    ordered = tuple(name for name in _METHOD_NAMES if name in methods)
+    if tuple(methods) != ordered:
+        raise ValueError(f"{source} 的 methods 请按 direction、zone_shape、pause 的顺序写")
+    for name in _METHOD_NAMES:
+        present = name in methods
+        has_block = name in payload and payload[name] is not None
+        if present != has_block:
+            raise ValueError(f"{source} 里方法 {name} 与它的参数块不一致")
+    payload = dict(payload)
+    payload["methods"] = ordered
+    _RAW_SPECS[version] = payload
+    return payload
+
+
+def enabled_methods(version: str) -> Tuple[str, ...]:
+    """该参数版本要跑的判断方法。顺序与登记表一致。"""
+    return tuple(_read_spec(normalize_param_version(version))["methods"])
+
+
+def _scales_from_spec(items: Any, source: str) -> Tuple["ScaleParams", ...]:
+    if not isinstance(items, list) or len(items) != len(SCALE_NAMES):
+        raise ValueError(f"{source} 的 scales 必须按 short、mid、long 写三项")
+    scales = []
+    for expected, item in zip(SCALE_NAMES, items):
+        row = _require_mapping(item, f"{source} 的 scales")
+        _exact_keys(row, ("name", "k", "delta_min", "max_span"), f"{source} 的 {expected}")
+        if row.get("name") != expected:
+            raise ValueError(f"{source} 的 scales 第 {len(scales) + 1} 项必须是 {expected}")
+        scales.append(
+            ScaleParams(
+                expected,
+                _as_float(row["k"], f"{source} 的 {expected}.k"),
+                _as_float(row["delta_min"], f"{source} 的 {expected}.delta_min"),
+                _as_int(row["max_span"], f"{source} 的 {expected}.max_span"),
+            )
+        )
+    return tuple(scales)
+
+
+def _direction_from_spec(payload: Any, source: str) -> DirectionParams:
+    label = f"{source} 的 direction"
+    row = _require_mapping(payload, label)
+    _exact_keys(row, ("epsilon", "cross_buffer", "cross_bars", "stall_bars"), label)
+    stalls = _require_mapping(row["stall_bars"], f"{label}.stall_bars")
+    _exact_keys(stalls, set(SCALE_NAMES), f"{label}.stall_bars")
+    return DirectionParams(
+        epsilon=_as_float(row["epsilon"], f"{label}.epsilon"),
+        cross_buffer=_as_float(row["cross_buffer"], f"{label}.cross_buffer"),
+        cross_bars=_as_int(row["cross_bars"], f"{label}.cross_bars"),
+        stall_bars=tuple(_as_int(stalls[name], f"{label}.stall_bars.{name}") for name in SCALE_NAMES),
+    )
+
+
+def _zone_shape_from_spec(payload: Any, source: str) -> ZoneShapeParams:
+    label = f"{source} 的 zone_shape"
+    row = _require_mapping(payload, label)
+    names = tuple(item.name for item in fields(ZoneShapeParams))
+    _exact_keys(row, names, label)
+    return ZoneShapeParams(**{name: _as_float(row[name], f"{label}.{name}") for name in names})
+
+
+def _pause_from_spec(payload: Any, source: str) -> PauseParams:
+    label = f"{source} 的 pause"
+    row = _require_mapping(payload, label)
+    names = tuple(item.name for item in fields(PauseParams))
+    _exact_keys(row, names, label)
+    kwargs: Dict[str, Any] = {}
+    for name in names:
+        value = row[name]
+        field_label = f"{label}.{name}"
+        if name in _PAUSE_INTS:
+            kwargs[name] = _as_int(value, field_label)
+        elif name in _PAUSE_BOOLS:
+            kwargs[name] = _as_bool(value, field_label)
+        else:
+            kwargs[name] = _as_float(value, field_label)
+    return PauseParams(**kwargs)
+
+
+def _base_value(key: str, value: Any, source: str) -> Any:
+    label = f"{source} 的 {key}"
+    if key == "scales":
+        return _scales_from_spec(value, source)
+    if key in _INT_BASE:
+        return _as_int(value, label)
+    if key == "zone_credit_full_span":
+        return _as_bool(value, label)
+    return _as_float(value, label)
+
+
+def params_kwargs_from_payload(payload: Dict[str, Any], source: str, price_axis: str) -> Dict[str, Any]:
+    """把一份已经核对过字段的版本映射收成 StructureParams 的构造参数。"""
+    row = _require_mapping(payload, source)
+    _exact_keys(row, ("version", "methods", *_BASE_KEYS), source, optional=_METHOD_NAMES)
+    methods = row.get("methods")
+    if isinstance(methods, tuple):
+        method_names = methods
+    elif isinstance(methods, list):
+        method_names = tuple(methods)
+    else:
+        raise ValueError(f"{source} 的 methods 必须是方法键列表")
+    kwargs: Dict[str, Any] = {
+        "version": str(row["version"]),
+        "price_axis": normalize_price_axis(price_axis),
+    }
+    for key in _BASE_KEYS:
+        kwargs[key] = _base_value(key, row[key], source)
+    builders = {
+        "direction": _direction_from_spec,
+        "zone_shape": _zone_shape_from_spec,
+        "pause": _pause_from_spec,
+    }
+    for name, builder in builders.items():
+        kwargs[name] = builder(row[name], source) if name in method_names else None
+    return kwargs
+
+
+def _params_kwargs(version: str, price_axis: str = PRICE_AXIS_LOG) -> Dict[str, Any]:
+    resolved = normalize_param_version(version)
+    return params_kwargs_from_payload(_read_spec(resolved), f"{resolved}.yaml", price_axis)
+
+
+_V0_KWARGS = _params_kwargs(PARAM_VERSION)
+
+
 @dataclass(frozen=True)
 class StructureParams:
-    """一次运行读入的整包参数。几何、拐点和以后的边界都引用这一份。"""
+    """一次运行读入的整包参数。数值来自 `analysis/structure/params/<version>.yaml`。"""
 
-    version: str = PARAM_VERSION
-    price_axis: str = PRICE_AXIS_LOG
-    ewma_span: int = 20
-    vol_clip_multiple: float = 4.0
-    volatility_floor: float = 1e-8
-    scales: Tuple[ScaleParams, ...] = (
-        ScaleParams(SHORT, 1.5, 0.005, 60),
-        ScaleParams(MID, 3.0, 0.01, 120),
-        ScaleParams(LONG, 6.0, 0.02, 250),
-    )
-    touch_distance_ratio: float = 0.5
-    touch_cluster_window: int = 3
-    min_touch_clusters: int = 3
-    zone_min_touch_clusters: int = 3
-    zone_credit_full_span: bool = False
-    hard_break_ratio: float = 1.0
-    breakout_buffer_ratio: float = 0.5
-    breakout_bars: int = 2
-    max_pivots_per_line: int = 8
-    channel_width_ratio_min: float = 0.8
-    channel_width_ratio_max: float = 1.25
-    convergence_width_ratio: float = 0.8
-    sideways_normalized_slope: float = 0.25
-    parallel_slope_gap: float = 0.35
-    expire_bars: int = 20
+    version: str = _V0_KWARGS["version"]
+    price_axis: str = _V0_KWARGS["price_axis"]
+    ewma_span: int = _V0_KWARGS["ewma_span"]
+    vol_clip_multiple: float = _V0_KWARGS["vol_clip_multiple"]
+    volatility_floor: float = _V0_KWARGS["volatility_floor"]
+    scales: Tuple[ScaleParams, ...] = _V0_KWARGS["scales"]
+    touch_distance_ratio: float = _V0_KWARGS["touch_distance_ratio"]
+    touch_cluster_window: int = _V0_KWARGS["touch_cluster_window"]
+    min_touch_clusters: int = _V0_KWARGS["min_touch_clusters"]
+    zone_min_touch_clusters: int = _V0_KWARGS["zone_min_touch_clusters"]
+    zone_credit_full_span: bool = _V0_KWARGS["zone_credit_full_span"]
+    hard_break_ratio: float = _V0_KWARGS["hard_break_ratio"]
+    breakout_buffer_ratio: float = _V0_KWARGS["breakout_buffer_ratio"]
+    breakout_bars: int = _V0_KWARGS["breakout_bars"]
+    max_pivots_per_line: int = _V0_KWARGS["max_pivots_per_line"]
+    channel_width_ratio_min: float = _V0_KWARGS["channel_width_ratio_min"]
+    channel_width_ratio_max: float = _V0_KWARGS["channel_width_ratio_max"]
+    convergence_width_ratio: float = _V0_KWARGS["convergence_width_ratio"]
+    sideways_normalized_slope: float = _V0_KWARGS["sideways_normalized_slope"]
+    parallel_slope_gap: float = _V0_KWARGS["parallel_slope_gap"]
+    expire_bars: int = _V0_KWARGS["expire_bars"]
     # 相邻日线之间的交易日数（周一至周五）严格大于该值时记间断。
-    daily_gap_days: int = 5
-    intraday_gap_median_multiple: float = 3.0
-    max_zones_per_scale: int = 3
-    direction: Optional[DirectionParams] = None
-    zone_shape: Optional[ZoneShapeParams] = None
-    pause: Optional[PauseParams] = None
+    daily_gap_days: int = _V0_KWARGS["daily_gap_days"]
+    intraday_gap_median_multiple: float = _V0_KWARGS["intraday_gap_median_multiple"]
+    max_zones_per_scale: int = _V0_KWARGS["max_zones_per_scale"]
+    direction: Optional[DirectionParams] = _V0_KWARGS["direction"]
+    zone_shape: Optional[ZoneShapeParams] = _V0_KWARGS["zone_shape"]
+    pause: Optional[PauseParams] = _V0_KWARGS["pause"]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
-        if self.version not in _ZONE_TOUCH_BY_VERSION:
+        if self.version not in PARAM_VERSIONS:
             raise ValueError(f"参数版本必须是 {PARAM_VERSIONS} 之一，收到 {self.version!r}")
-        expected_min, expected_credit = _ZONE_TOUCH_BY_VERSION[self.version]
-        if (
-            self.zone_min_touch_clusters != expected_min
-            or self.zone_credit_full_span != expected_credit
-        ):
-            raise ValueError(
-                f"{self.version} 的区间接触规则固定为每侧至少 {expected_min} 个，"
-                f"全长折算{'开启' if expected_credit else '关闭'}"
-            )
         if self.ewma_span < 1:
             raise ValueError("ewma_span 必须 >= 1")
         if self.vol_clip_multiple <= 0:
@@ -474,7 +719,7 @@ class StructureParams:
             raise ValueError("intraday_gap_median_multiple 必须为正")
         if self.max_zones_per_scale < 1:
             raise ValueError("max_zones_per_scale 必须 >= 1")
-        enabled = _METHODS_BY_VERSION[self.version]
+        enabled = enabled_methods(self.version)
         if ("direction" in enabled) != (self.direction is not None):
             raise ValueError("direction 参数只写在启用了方向方法的版本里")
         if ("zone_shape" in enabled) != (self.zone_shape is not None):
@@ -512,39 +757,13 @@ class StructureParams:
         return payload
 
 
-def enabled_methods(version: str) -> Tuple[str, ...]:
-    """该参数版本要跑的判断方法。顺序与登记表一致。"""
-    return _METHODS_BY_VERSION[normalize_param_version(version)]
-
-
-def normalize_param_version(version: str) -> str:
-    text = str(version or "").strip()
-    if text not in PARAM_VERSIONS:
-        raise ValueError(f"参数版本必须是 {PARAM_VERSIONS} 之一，收到 {version!r}")
-    return text
-
-
 def default_params(
     price_axis: str = PRICE_AXIS_LOG,
     *,
     version: str = PARAM_VERSION,
 ) -> StructureParams:
-    """返回一份冻结参数包。价格轴只改几何坐标，不改该版本里的阈值。"""
-    resolved = normalize_param_version(version)
-    zone_min, credit = _ZONE_TOUCH_BY_VERSION[resolved]
-    enabled = _METHODS_BY_VERSION[resolved]
-    direction = DirectionParams() if "direction" in enabled else None
-    zone_shape = ZoneShapeParams() if "zone_shape" in enabled else None
-    pause = PauseParams() if "pause" in enabled else None
-    return StructureParams(
-        version=resolved,
-        price_axis=normalize_price_axis(price_axis),
-        zone_min_touch_clusters=zone_min,
-        zone_credit_full_span=credit,
-        direction=direction,
-        zone_shape=zone_shape,
-        pause=pause,
-    )
+    """返回一份冻结参数包。价格轴只改几何坐标，不改该版本 YAML 里的阈值。"""
+    return StructureParams(**_params_kwargs(version, price_axis))
 
 
 def partial_history_min_bars(params: StructureParams | None = None) -> int:

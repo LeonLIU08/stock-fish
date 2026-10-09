@@ -1,0 +1,87 @@
+# 与 v2 相同，并启用区间形状和停顿。
+# 三个方法分开计算，一次运行全部写出。
+version: structure-params-v3
+methods:
+  - direction
+  - zone_shape
+  - pause
+ewma_span: 20
+vol_clip_multiple: 4.0
+volatility_floor: 1.0e-8
+scales:
+  - name: short
+    k: 1.5
+    delta_min: 0.005
+    max_span: 60
+  - name: mid
+    k: 3.0
+    delta_min: 0.01
+    max_span: 120
+  - name: long
+    k: 6.0
+    delta_min: 0.02
+    max_span: 250
+touch_distance_ratio: 0.5
+touch_cluster_window: 3
+min_touch_clusters: 3
+zone_min_touch_clusters: 2
+zone_credit_full_span: true
+hard_break_ratio: 1.0
+breakout_buffer_ratio: 0.5
+breakout_bars: 2
+max_pivots_per_line: 8
+channel_width_ratio_min: 0.8
+channel_width_ratio_max: 1.25
+convergence_width_ratio: 0.8
+sideways_normalized_slope: 0.25
+parallel_slope_gap: 0.35
+expire_bars: 20
+daily_gap_days: 5
+intraday_gap_median_multiple: 3.0
+max_zones_per_scale: 3
+direction:
+  epsilon: 0.5
+  cross_buffer: 0.5
+  cross_bars: 2
+  stall_bars:
+    short: 30
+    mid: 60
+    long: 125
+zone_shape:
+  level_tolerance: 0.2
+  converging_width_ratio: 0.8
+  diverging_width_ratio: 1.25
+pause:
+  pole_min: 5
+  pole_max: 20
+  consolidation_min: 8
+  consolidation_max: 25
+  atr_lookback: 14
+  pole_rise: 4.0
+  efficiency: 0.65
+  pole_high: 1.0
+  drawdown_max: 0.5
+  amplitude_max: 0.6
+  pivot_half_width: 2
+  min_highs: 2
+  min_lows: 2
+  pivot_span: 0.5
+  fit_error: 0.35
+  coverage: 0.85
+  boundary_tolerance: 0.25
+  min_width: 0.5
+  flag_slope: 0.25
+  flag_width_min: 0.85
+  flag_width_max: 1.15
+  midline_min: -0.4
+  midline_max: 0.05
+  pennant_slope: 0.2
+  pennant_width_min: 0.3
+  pennant_width_max: 0.75
+  exit_buffer: 0.2
+  overlap: 0.5
+  volume_filter: false
+  volume_ratio: 0.8
+  breakout_volume_filter: false
+  breakout_volume: 1.3
+  pullback_bars: 2

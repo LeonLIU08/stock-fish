@@ -1,0 +1,39 @@
+# 最初一版。
+# 区间每侧至少 3 个接触簇，不把边界全长已经凑满的接触簇算进有效区间。
+# 不启用方向、区间形状和停顿。
+version: structure-params-v0
+methods: []
+ewma_span: 20
+vol_clip_multiple: 4.0
+volatility_floor: 1.0e-8
+scales:
+  - name: short
+    k: 1.5
+    delta_min: 0.005
+    max_span: 60
+  - name: mid
+    k: 3.0
+    delta_min: 0.01
+    max_span: 120
+  - name: long
+    k: 6.0
+    delta_min: 0.02
+    max_span: 250
+touch_distance_ratio: 0.5
+touch_cluster_window: 3
+min_touch_clusters: 3
+zone_min_touch_clusters: 3
+zone_credit_full_span: false
+hard_break_ratio: 1.0
+breakout_buffer_ratio: 0.5
+breakout_bars: 2
+max_pivots_per_line: 8
+channel_width_ratio_min: 0.8
+channel_width_ratio_max: 1.25
+convergence_width_ratio: 0.8
+sideways_normalized_slope: 0.25
+parallel_slope_gap: 0.35
+expire_bars: 20
+daily_gap_days: 5
+intraday_gap_median_multiple: 3.0
+max_zones_per_scale: 3

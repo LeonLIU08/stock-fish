@@ -18,9 +18,13 @@ from analysis.structure.config import (
     PARAM_VERSION,
     PARAM_VERSION_V1,
     PARAM_VERSION_V2,
+    PARAM_VERSION_V3,
+    PARAM_VERSION_V4,
     SCALE_NAMES,
     SHORT,
     default_params,
+    enabled_methods,
+    params_kwargs_from_payload,
 )
 from analysis.structure.boundaries import build_boundaries, format_boundaries
 from analysis.structure.html_report import render_report, write_result
@@ -153,6 +157,24 @@ class ParamsTests(unittest.TestCase):
         self.assertIn("direction", directed.to_dict())
         with self.assertRaises(ValueError):
             default_params(version="structure-params-v9")
+
+    def test_v4_only_lowers_reversal_multiples(self):
+        older = default_params(version=PARAM_VERSION_V3).to_dict()
+        newer = default_params(version=PARAM_VERSION_V4).to_dict()
+        self.assertEqual(enabled_methods(PARAM_VERSION_V4), enabled_methods(PARAM_VERSION_V3))
+        self.assertEqual([item["k"] for item in newer["scales"]], [1.4, 2.8, 5.6])
+        for item, new_k in zip(older["scales"], (1.4, 2.8, 5.6)):
+            item["k"] = new_k
+        older["version"] = PARAM_VERSION_V4
+        self.assertEqual(newer, older)
+
+    def test_yaml_rejects_unknown_fields(self):
+        payload = default_params().to_dict()
+        payload.pop("price_axis")
+        payload["methods"] = []
+        payload["surprise"] = 1
+        with self.assertRaises(ValueError):
+            params_kwargs_from_payload(payload, "测试", "log")
 
     def test_unknown_price_axis_rejected(self):
         with self.assertRaises(ValueError):

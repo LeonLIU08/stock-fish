@@ -5,9 +5,9 @@
 每只仍写入自己的目录。多于一只时默认同时算 10 只，可用 --workers 调整。
 每次运行都会刷新输出根目录的 index.html，点一只股票就打开它的 report.html。
 
-短、中、长的 k、门槛下限和最大跨度不随时间范围改变。
-不写 --param-version 时用 structure-params-v3，一次算出方向、区间形状和停顿。
-对照旧规则时用 structure-params-v0 或 v1。v2 只有方向。
+短、中、长的 k、门槛下限和最大跨度不随时间范围改变，写在各版本的 YAML 里。
+不写 --param-version 时用 structure-params-v4：方法与 v3 相同，反转倍数是 1.4、2.8、5.6。
+对照旧规则时用 structure-params-v0 或 v1。v2 只有方向。v3 的反转倍数仍是 1.5、3、6。
 
 示例:
     python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
@@ -38,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from analysis.structure.config import (
     BAR_INTERVALS,
+    CLI_PARAM_VERSION,
     PARAM_VERSIONS,
     SCALE_NAMES,
     default_params,
@@ -85,9 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-axis", default="log", choices=("log", "uniform"), help="价格轴，默认 log")
     parser.add_argument(
         "--param-version",
-        default="structure-params-v3",
+        default=CLI_PARAM_VERSION,
         choices=PARAM_VERSIONS,
-        help="参数版本。默认 v3，一次算出方向、区间形状和停顿。v0、v1 只有趋势线和区间，v2 只有方向",
+        help="参数版本。默认 v4，反转倍数 1.4/2.8/5.6。v3 起都有方向、区间形状和停顿；v0、v1 只有趋势线和区间，v2 只有方向",
     )
     parser.add_argument(
         "--methods",
