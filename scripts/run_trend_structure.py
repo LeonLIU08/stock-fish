@@ -6,9 +6,8 @@
 每次运行都会刷新输出根目录的 index.html，点一只股票就打开它的 report.html。
 
 短、中、长的 k、门槛下限和最大跨度不随时间范围改变。
-默认参数版本是 structure-params-v1。对照旧规则时加上
---param-version structure-params-v0。方向判断用
---param-version structure-params-v2。
+不写 --param-version 时用 structure-params-v3，一次算出方向、区间形状和停顿。
+对照旧规则时用 structure-params-v0 或 v1。v2 只有方向。
 
 示例:
     python scripts/run_trend_structure.py --symbol 00700 --interval 1d --years 1
@@ -37,7 +36,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.structure.config import BAR_INTERVALS, PARAM_VERSIONS, PARAM_VERSION_V2, SCALE_NAMES, default_params
+from analysis.structure.config import (
+    BAR_INTERVALS,
+    PARAM_VERSIONS,
+    SCALE_NAMES,
+    default_params,
+    enabled_methods,
+    series_quote_fields,
+)
 from analysis.structure.html_report import write_result
 from analysis.structure.lifecycle import build_lifecycle
 from analysis.structure.methods import method_failure_text, registered_methods
@@ -79,9 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-axis", default="log", choices=("log", "uniform"), help="价格轴，默认 log")
     parser.add_argument(
         "--param-version",
-        default="structure-params-v1",
+        default="structure-params-v3",
         choices=PARAM_VERSIONS,
-        help="参数版本。v1 放宽区间接触簇计数，v0 是原来的规则，v2 在 v1 上加方向",
+        help="参数版本。默认 v3，一次算出方向、区间形状和停顿。v0、v1 只有趋势线和区间，v2 只有方向",
     )
     parser.add_argument(
         "--methods",
@@ -101,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="同时计算的只数。默认 10。1 表示逐只计算",
     )
-    parser.add_argument("--samples", action="store_true", help="写出四份合成检查页，不访问网络")
+    parser.add_argument("--samples", action="store_true", help="写出合成检查页，不访问网络")
     return parser
 
 
@@ -182,8 +188,16 @@ def _split_symbol_text(text: str) -> list[str]:
 
 
 def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_dir, methods=None) -> dict:
-    timestamps, closes, source = _load_closes(symbol, interval, start, end)
-    series = build_series(timestamps, closes, interval=interval, params=params)
+    timestamps, closes, highs, lows, volumes, source = _load_bars(symbol, interval, start, end, params)
+    series = build_series(
+        timestamps,
+        closes,
+        interval=interval,
+        params=params,
+        highs=highs,
+        lows=lows,
+        volumes=volumes,
+    )
     snapshot = build_snapshot(
         series,
         symbol=symbol,
@@ -792,9 +806,10 @@ def _print_scale_definition(start: date, end: date, params) -> None:
     print(SCALE_DEFINITION_NOTE)
 
 
-def _load_closes(symbol: str, interval: str, start: date, end: date):
-    """复用回测的行情加载，再裁回请求区间。只把时间戳和收盘价交给引擎。
+def _load_bars(symbol: str, interval: str, start: date, end: date, params):
+    """复用回测的行情加载，再裁回请求区间。
 
+    停顿这一版才把最高价、最低价和成交量交给引擎。更早的参数版本仍只读时间戳和收盘价。
     上市时间短于请求区间时，根数达到短、中尺度下限就用已有 K 线继续。
     """
     from analysis.backtest.bars import BarLoader, slice_eval_window
@@ -814,11 +829,28 @@ def _load_closes(symbol: str, interval: str, start: date, end: date):
         raise RuntimeError(f"{symbol} 在 {start.isoformat()} 至 {end.isoformat()} 没有已完成 K 线")
     timestamps = [_as_datetime(value) for value in frame["datetime"]]
     closes = [float(value) for value in frame["close"]]
-    return timestamps, closes, source
+    if series_quote_fields(params.version):
+        highs = [float(value) for value in frame["high"]]
+        lows = [float(value) for value in frame["low"]]
+        volumes = [float(value) for value in frame["volume"]]
+    else:
+        highs = lows = volumes = None
+    return timestamps, closes, highs, lows, volumes, source
+
+
+def _version_for_method(method_key: str) -> str:
+    """检查页用启用了该方法的最新参数版本。"""
+    chosen = None
+    for version in PARAM_VERSIONS:
+        if method_key in enabled_methods(version):
+            chosen = version
+    if chosen is None:
+        raise ValueError(f"{method_key} 没有登记到任何参数版本")
+    return chosen
 
 
 def _write_samples(output_root: Path, price_axis: str) -> int:
-    """四份肉眼检查页，外加一份均匀轴对照。形状固定，不作为阈值来源。"""
+    """基础检查页，外加一份均匀轴对照，再加各判断方法自己的检查页。形状固定，不作为阈值来源。"""
     cases = [
         ("SAMPLE-RISING", "单边上升后的支撑", "抬高的低点连成支撑。", _rising_support_levels(), "log"),
         ("SAMPLE-CHANNEL", "平行上升通道", "上下轨宽度近似稳定。", _rail_levels(), "log"),
@@ -846,8 +878,19 @@ def _write_samples(output_root: Path, price_axis: str) -> int:
         print(f"{title}: {written['report']}")
     for method in registered_methods():
         for sample in method.samples():
-            params = default_params(sample.price_axis, version=PARAM_VERSION_V2)
-            series = _series_from_levels(sample.levels, price_axis=sample.price_axis, params=params)
+            params = default_params(sample.price_axis, version=_version_for_method(method.key))
+            if sample.closes:
+                series = build_series(
+                    _daily_times(len(sample.closes)),
+                    sample.closes,
+                    interval="1d",
+                    params=params,
+                    highs=sample.highs,
+                    lows=sample.lows,
+                    volumes=sample.volumes,
+                )
+            else:
+                series = _series_from_levels(sample.levels, price_axis=sample.price_axis, params=params)
             snapshot = build_snapshot(
                 series,
                 symbol=sample.symbol,

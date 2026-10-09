@@ -4,7 +4,9 @@
 以后调阈值要换版本号，不覆盖旧运行目录。`volatility_floor` 是
 「波动尺度有下限」的实现值，反转门槛的下限仍然是各尺度的 delta_min。
 
-v2 的基础参数与 v1 相同，并启用方向。区间形状留到该方法实现时再启用。
+v2 的基础参数与 v1 相同，并启用方向。v2 已经有运行结果，不改这一版。
+v3 的基础参数与 v2 相同，一次启用方向、区间形状和停顿。三个方法分开计算。
+停顿才读取最高价、最低价和成交量。
 """
 from __future__ import annotations
 
@@ -14,19 +16,34 @@ from typing import Any, Dict, Optional, Tuple
 PARAM_VERSION = "structure-params-v0"
 PARAM_VERSION_V1 = "structure-params-v1"
 PARAM_VERSION_V2 = "structure-params-v2"
-PARAM_VERSIONS = (PARAM_VERSION, PARAM_VERSION_V1, PARAM_VERSION_V2)
+PARAM_VERSION_V3 = "structure-params-v3"
+PARAM_VERSIONS = (
+    PARAM_VERSION,
+    PARAM_VERSION_V1,
+    PARAM_VERSION_V2,
+    PARAM_VERSION_V3,
+)
 # (有效区间内每侧最少接触簇, 是否承认边界全长已经凑满的接触簇)
 _ZONE_TOUCH_BY_VERSION = {
     PARAM_VERSION: (3, False),
     PARAM_VERSION_V1: (2, True),
     PARAM_VERSION_V2: (2, True),
+    PARAM_VERSION_V3: (2, True),
 }
 # 该版本启用的判断方法。v0、v1 不写方法参数，也不写 methods 段。
 _METHODS_BY_VERSION = {
     PARAM_VERSION: (),
     PARAM_VERSION_V1: (),
     PARAM_VERSION_V2: ("direction",),
+    PARAM_VERSION_V3: ("direction", "zone_shape", "pause"),
 }
+
+
+def series_quote_fields(version: str) -> Tuple[str, ...]:
+    """该参数版本的数据哈希要覆盖的行情字段。没有则仍只覆盖时间戳和收盘价。"""
+    if "pause" in _METHODS_BY_VERSION[normalize_param_version(version)]:
+        return ("high", "low", "volume")
+    return ()
 
 SHORT = "short"
 MID = "mid"
@@ -131,6 +148,220 @@ class DirectionParams:
         }
 
 
+@dataclass(frozen=True)
+class ZoneShapeParams:
+    """区间形状的参数。只出现在启用了 zone_shape 的参数版本里。"""
+
+    level_tolerance: float = 0.2
+    converging_width_ratio: float = 0.8
+    diverging_width_ratio: float = 1.25
+
+    def __post_init__(self) -> None:
+        self.check()
+
+    def check(self) -> None:
+        if self.level_tolerance <= 0:
+            raise ValueError("水平容差必须为正")
+        if self.converging_width_ratio <= 0 or self.diverging_width_ratio <= 0:
+            raise ValueError("收敛宽度比和张开宽度比必须为正")
+        if self.converging_width_ratio >= self.diverging_width_ratio:
+            raise ValueError("收敛宽度比必须小于张开宽度比")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "level_tolerance": self.level_tolerance,
+            "converging_width_ratio": self.converging_width_ratio,
+            "diverging_width_ratio": self.diverging_width_ratio,
+        }
+
+
+@dataclass(frozen=True)
+class PauseParams:
+    """停顿判断的参数。只出现在启用了 pause 的参数版本里。"""
+
+    pole_min: int = 5
+    pole_max: int = 20
+    consolidation_min: int = 8
+    consolidation_max: int = 25
+    atr_lookback: int = 14
+    pole_rise: float = 4.0
+    efficiency: float = 0.65
+    pole_high: float = 1.0
+    drawdown_max: float = 0.5
+    amplitude_max: float = 0.6
+    pivot_half_width: int = 2
+    min_highs: int = 2
+    min_lows: int = 2
+    pivot_span: float = 0.5
+    fit_error: float = 0.35
+    coverage: float = 0.85
+    boundary_tolerance: float = 0.25
+    min_width: float = 0.5
+    flag_slope: float = 0.25
+    flag_width_min: float = 0.85
+    flag_width_max: float = 1.15
+    midline_min: float = -0.4
+    midline_max: float = 0.05
+    pennant_slope: float = 0.2
+    pennant_width_min: float = 0.3
+    pennant_width_max: float = 0.75
+    exit_buffer: float = 0.2
+    overlap: float = 0.5
+    volume_filter: bool = False
+    volume_ratio: float = 0.8
+    breakout_volume_filter: bool = False
+    breakout_volume: float = 1.3
+    pullback_bars: int = 2
+
+    def __post_init__(self) -> None:
+        self.check()
+
+    def check(self) -> None:
+        pole_min = _require_int("旗杆最短", self.pole_min, 2)
+        pole_max = _require_int("旗杆最长", self.pole_max, 1)
+        cons_min = _require_int("整理最短", self.consolidation_min, 1)
+        cons_max = _require_int("整理最长", self.consolidation_max, 1)
+        _require_int("A 的回看", self.atr_lookback, 1)
+        half = _require_int("拐点半宽", self.pivot_half_width, 1)
+        _require_int("最少高点", self.min_highs, 1)
+        _require_int("最少低点", self.min_lows, 1)
+        _require_int("快速回落根数", self.pullback_bars, 1)
+        if pole_min > pole_max:
+            raise ValueError("旗杆最短不能超过最长")
+        if cons_min > cons_max:
+            raise ValueError("整理最短不能超过最长")
+        if cons_min - half < 2:
+            raise ValueError("整理最短在拐点半宽之后至少还要留下 2 根")
+        if (cons_min - 1 - half) < self.pivot_span * (cons_min - 1):
+            raise ValueError("整理最短在确认延迟之后放不下两个有跨度的高低点")
+        _require_unit("方向效率", self.efficiency)
+        _require_unit("回撤上限", self.drawdown_max)
+        _require_unit("整理振幅", self.amplitude_max)
+        _require_unit("拐点跨度", self.pivot_span)
+        _require_unit("覆盖率", self.coverage)
+        _require_unit("重叠阈值", self.overlap)
+        if not (0 < self.flag_width_min < self.flag_width_max):
+            raise ValueError("旗形宽度比必须满足 0 < 下限 < 上限")
+        if not (0 < self.pennant_width_min < self.pennant_width_max):
+            raise ValueError("三角旗宽度比必须满足 0 < 下限 < 上限")
+        if not self.pennant_width_max < self.flag_width_min:
+            raise ValueError("三角旗宽度比上限必须小于旗形宽度比下限")
+        for name, value in (
+            ("旗杆涨幅", self.pole_rise),
+            ("旗杆收在高位", self.pole_high),
+            ("最小宽度", self.min_width),
+            ("拟合误差", self.fit_error),
+            ("边界容差", self.boundary_tolerance),
+            ("离开缓冲", self.exit_buffer),
+            ("三角旗斜率", self.pennant_slope),
+            ("突破量能倍数", self.breakout_volume),
+            ("旗形斜率差", self.flag_slope),
+            ("整理量能比", self.volume_ratio),
+        ):
+            if not value > 0:
+                raise ValueError(f"{name} 必须为正")
+        if self.midline_min > self.midline_max:
+            raise ValueError("旗形中线下限不能大于上限")
+        if not isinstance(self.volume_filter, bool) or not isinstance(self.breakout_volume_filter, bool):
+            raise ValueError("量能过滤开关必须是布尔值")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pole_min": self.pole_min,
+            "pole_max": self.pole_max,
+            "consolidation_min": self.consolidation_min,
+            "consolidation_max": self.consolidation_max,
+            "atr_lookback": self.atr_lookback,
+            "pole_rise": self.pole_rise,
+            "efficiency": self.efficiency,
+            "pole_high": self.pole_high,
+            "drawdown_max": self.drawdown_max,
+            "amplitude_max": self.amplitude_max,
+            "pivot_half_width": self.pivot_half_width,
+            "min_highs": self.min_highs,
+            "min_lows": self.min_lows,
+            "pivot_span": self.pivot_span,
+            "fit_error": self.fit_error,
+            "coverage": self.coverage,
+            "boundary_tolerance": self.boundary_tolerance,
+            "min_width": self.min_width,
+            "flag_slope": self.flag_slope,
+            "flag_width_min": self.flag_width_min,
+            "flag_width_max": self.flag_width_max,
+            "midline_min": self.midline_min,
+            "midline_max": self.midline_max,
+            "pennant_slope": self.pennant_slope,
+            "pennant_width_min": self.pennant_width_min,
+            "pennant_width_max": self.pennant_width_max,
+            "exit_buffer": self.exit_buffer,
+            "overlap": self.overlap,
+            "volume_filter": self.volume_filter,
+            "volume_ratio": self.volume_ratio,
+            "breakout_volume_filter": self.breakout_volume_filter,
+            "breakout_volume": self.breakout_volume,
+            "pullback_bars": self.pullback_bars,
+        }
+
+
+def _require_int(name: str, value: Any, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} 必须是不小于 {minimum} 的整数")
+    return value
+
+
+def _require_unit(name: str, value: float) -> None:
+    if not (0 < value <= 1):
+        raise ValueError(f"{name} 必须在 (0, 1] 内")
+
+
+def pause_params_from_dict(payload: Dict[str, Any] | None) -> PauseParams:
+    """把快照里的 pause 字典收成参数。缺省用 2.3.6 的默认值。"""
+    if not payload:
+        return PauseParams()
+    defaults = PauseParams()
+    values = defaults.to_dict()
+    values.update(payload)
+    integers = {
+        "pole_min",
+        "pole_max",
+        "consolidation_min",
+        "consolidation_max",
+        "atr_lookback",
+        "pivot_half_width",
+        "min_highs",
+        "min_lows",
+        "pullback_bars",
+    }
+    kwargs = {}
+    for key, value in values.items():
+        if key not in defaults.to_dict():
+            continue
+        if key in integers:
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not float(value).is_integer()
+            ):
+                raise ValueError(f"{key} 必须是整数")
+            kwargs[key] = int(value)
+        elif key in ("volume_filter", "breakout_volume_filter"):
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} 必须是布尔值")
+            kwargs[key] = value
+        else:
+            kwargs[key] = float(value)
+    return PauseParams(**kwargs)
+
+
+def zone_shape_params_from_dict(payload: Dict[str, Any] | None) -> ZoneShapeParams:
+    """把快照里的 zone_shape 字典收成参数。缺省用 2.2.6 的默认值。"""
+    if not payload:
+        return ZoneShapeParams()
+    return ZoneShapeParams(
+        level_tolerance=float(payload.get("level_tolerance", 0.2)),
+        converging_width_ratio=float(payload.get("converging_width_ratio", 0.8)),
+        diverging_width_ratio=float(payload.get("diverging_width_ratio", 1.25)),
+    )
+
+
 def direction_params_from_dict(payload: Dict[str, Any] | None) -> DirectionParams:
     """把快照里的 direction 字典收成参数。缺省用 2.1.6 的默认值。"""
     if not payload:
@@ -186,6 +417,8 @@ class StructureParams:
     intraday_gap_median_multiple: float = 3.0
     max_zones_per_scale: int = 3
     direction: Optional[DirectionParams] = None
+    zone_shape: Optional[ZoneShapeParams] = None
+    pause: Optional[PauseParams] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
@@ -244,8 +477,16 @@ class StructureParams:
         enabled = _METHODS_BY_VERSION[self.version]
         if ("direction" in enabled) != (self.direction is not None):
             raise ValueError("direction 参数只写在启用了方向方法的版本里")
+        if ("zone_shape" in enabled) != (self.zone_shape is not None):
+            raise ValueError("zone_shape 参数只写在启用了区间形状的版本里")
+        if ("pause" in enabled) != (self.pause is not None):
+            raise ValueError("pause 参数只写在启用了停顿的版本里")
         if self.direction is not None:
             self.direction.check()
+        if self.zone_shape is not None:
+            self.zone_shape.check()
+        if self.pause is not None:
+            self.pause.check()
 
     def scale(self, name: str) -> ScaleParams:
         for item in self.scales:
@@ -260,7 +501,7 @@ class StructureParams:
         payload: Dict[str, Any] = {}
         for item in fields(self):
             value = getattr(self, item.name)
-            if item.name == "direction":
+            if item.name in ("direction", "zone_shape", "pause"):
                 if value is not None:
                     payload[item.name] = value.to_dict()
                 continue
@@ -291,13 +532,18 @@ def default_params(
     """返回一份冻结参数包。价格轴只改几何坐标，不改该版本里的阈值。"""
     resolved = normalize_param_version(version)
     zone_min, credit = _ZONE_TOUCH_BY_VERSION[resolved]
-    direction = DirectionParams() if "direction" in _METHODS_BY_VERSION[resolved] else None
+    enabled = _METHODS_BY_VERSION[resolved]
+    direction = DirectionParams() if "direction" in enabled else None
+    zone_shape = ZoneShapeParams() if "zone_shape" in enabled else None
+    pause = PauseParams() if "pause" in enabled else None
     return StructureParams(
         version=resolved,
         price_axis=normalize_price_axis(price_axis),
         zone_min_touch_clusters=zone_min,
         zone_credit_full_span=credit,
         direction=direction,
+        zone_shape=zone_shape,
+        pause=pause,
     )
 
 

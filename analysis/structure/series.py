@@ -1,7 +1,8 @@
 """标准序列：序号、收盘价、几何价格、间断和数据身份。
 
-引擎只读时间戳和收盘价。几何横轴是有效 K 线序号，不把停牌或缺失填成横盘。
-`data_hash` 只覆盖时间戳和收盘价，参数版本和价格轴放在输出目录里。
+几何横轴是有效 K 线序号，不把停牌或缺失填成横盘。
+v0 到 v3 的 `data_hash` 只覆盖时间戳和收盘价。启用停顿的版本在声明了
+最高价、最低价和成交量时，把这三项一并算进哈希。参数版本和价格轴放在输出目录里。
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from analysis.structure.config import (
     default_params,
     normalize_interval,
     normalize_price_axis,
+    series_quote_fields,
 )
 
 IDENTITY_FILENAME = "series_identity.json"
@@ -47,6 +49,11 @@ class SeriesBar:
     close: float
     geometric: float
     gap_before: bool
+    high: Optional[float] = None
+    low: Optional[float] = None
+    volume: Optional[float] = None
+    high_geometric: Optional[float] = None
+    low_geometric: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -82,11 +89,19 @@ class StandardSeries:
         if bar_count < 1 or bar_count > count:
             raise ValueError(f"bar_count 必须在 1 和 {count} 之间，收到 {bar_count}")
         head = self.bars[:bar_count]
+        quotes = {}
+        if head and head[0].high is not None:
+            quotes = {
+                "highs": [bar.high for bar in head],
+                "lows": [bar.low for bar in head],
+                "volumes": [bar.volume for bar in head],
+            }
         return build_series(
             [bar.timestamp for bar in head],
             [bar.close for bar in head],
             interval=self.interval,
             params=self.params,
+            **quotes,
         )
 
 
@@ -97,6 +112,9 @@ def build_series(
     interval: str = DAILY_INTERVAL,
     price_axis: Optional[str] = None,
     params: Optional[StructureParams] = None,
+    highs: Optional[Sequence[Any]] = None,
+    lows: Optional[Sequence[Any]] = None,
+    volumes: Optional[Sequence[Any]] = None,
 ) -> StandardSeries:
     """把已完成 K 线收成标准序列。
 
@@ -126,11 +144,23 @@ def build_series(
     _require_uniform_awareness(parsed_times)
 
     gaps = _gap_flags(parsed_times, resolved_interval, params)
-    digest = _hash_timestamps_and_closes(parsed_times, parsed_closes)
+    quote_rows = _quote_rows(params, len(parsed_closes), highs, lows, volumes)
+    digest = _hash_timestamps_and_closes(
+        parsed_times,
+        parsed_closes,
+        None if quote_rows is None else [row[0] for row in quote_rows],
+        None if quote_rows is None else [row[1] for row in quote_rows],
+        None if quote_rows is None else [row[2] for row in quote_rows],
+    )
     bars: List[SeriesBar] = []
     for index, (ts, close, gap_before) in enumerate(
         zip(parsed_times, parsed_closes, gaps)
     ):
+        high = low = volume = high_geometric = low_geometric = None
+        if quote_rows is not None:
+            high, low, volume = quote_rows[index]
+            high_geometric = _finite_positive_geometric(high, params.price_axis)
+            low_geometric = _finite_positive_geometric(low, params.price_axis)
         bars.append(
             SeriesBar(
                 index=index,
@@ -138,6 +168,11 @@ def build_series(
                 close=close,
                 geometric=_geometric(close, params.price_axis),
                 gap_before=gap_before,
+                high=high,
+                low=low,
+                volume=volume,
+                high_geometric=high_geometric,
+                low_geometric=low_geometric,
             )
         )
     return StandardSeries(
@@ -320,14 +355,63 @@ def _gap_flags(
     return flags
 
 
+def _quote_rows(
+    params: StructureParams,
+    count: int,
+    highs: Optional[Sequence[Any]],
+    lows: Optional[Sequence[Any]],
+    volumes: Optional[Sequence[Any]],
+) -> Optional[List[Tuple[float, float, float]]]:
+    """启用停顿时，三项都给了才写入序列并进入哈希。缺任何一项就当没给。"""
+    if not series_quote_fields(params.version):
+        return None
+    if highs is None or lows is None or volumes is None:
+        return None
+    if len(highs) != count or len(lows) != count or len(volumes) != count:
+        raise ValueError(
+            f"最高价、最低价、成交量必须与收盘价一一对应: "
+            f"{len(highs)}、{len(lows)}、{len(volumes)} 与 {count}"
+        )
+    return list(
+        zip(_parse_quote(highs), _parse_quote(lows), _parse_quote(volumes))
+    )
+
+
+def _parse_quote(values: Sequence[Any]) -> List[float]:
+    parsed: List[float] = []
+    for value in values:
+        if isinstance(value, bool) or value is None:
+            parsed.append(float("nan"))
+            continue
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            parsed.append(float("nan"))
+    return parsed
+
+
+def _finite_positive_geometric(value: float, price_axis: str) -> Optional[float]:
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return _geometric(value, price_axis)
+
+
 def _hash_timestamps_and_closes(
     timestamps: Sequence[datetime],
     closes: Sequence[float],
+    highs: Optional[Sequence[float]] = None,
+    lows: Optional[Sequence[float]] = None,
+    volumes: Optional[Sequence[float]] = None,
 ) -> str:
     digest = hashlib.sha256()
-    for ts, close in zip(timestamps, closes):
+    use_quotes = highs is not None and lows is not None and volumes is not None
+    for index, (ts, close) in enumerate(zip(timestamps, closes)):
         digest.update(_canonical_timestamp(ts))
         digest.update(struct.pack(">d", close))
+        if use_quotes:
+            digest.update(struct.pack(">d", float(highs[index])))
+            digest.update(struct.pack(">d", float(lows[index])))
+            digest.update(struct.pack(">d", float(volumes[index])))
     return digest.hexdigest()[:32]
 
 

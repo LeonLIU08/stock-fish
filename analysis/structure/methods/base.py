@@ -14,8 +14,23 @@ MARK_KINDS = (
     "text",
 )
 BASE_INPUTS = frozenset(
-    {"closes", "pivots", "volatility", "segments", "boundaries", "zones", "events"}
+    {
+        "closes",
+        "highs",
+        "lows",
+        "volumes",
+        "pivots",
+        "volatility",
+        "segments",
+        "boundaries",
+        "zones",
+        "events",
+    }
 )
+
+
+class MethodSkipped(Exception):
+    """原料不齐或整段不合格。不算算法失败，但依赖它的方法不再运行。"""
 KIND_RUN = "run"
 KIND_INSTANCE = "instance"
 RUN_STATUSES = ("completed", "skipped", "failed")
@@ -54,6 +69,10 @@ class MethodSample:
     blurb: str
     levels: Tuple[float, ...]
     price_axis: str = "log"
+    closes: Optional[Tuple[float, ...]] = None
+    highs: Optional[Tuple[float, ...]] = None
+    lows: Optional[Tuple[float, ...]] = None
+    volumes: Optional[Tuple[float, ...]] = None
 
 
 @dataclass

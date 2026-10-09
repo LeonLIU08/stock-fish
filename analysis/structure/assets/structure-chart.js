@@ -28,9 +28,9 @@ const TrendChart = (function () {
 
     const legendMeta = new Map();
     const wantedNames = [];
-    function track(name, scale, method) {
+    function track(name, scale, method, layer) {
       if (!legendMeta.has(name)) {
-        legendMeta.set(name, { scale: scale || null, method: method || null });
+        legendMeta.set(name, { scale: scale || null, method: method || null, layer: layer || null });
         wantedNames.push(name);
       }
     }
@@ -104,7 +104,7 @@ const TrendChart = (function () {
     (viewModel.zones || []).forEach(function (zone) {
       focusIndex.zone.set(zone.id, zone);
       const name = scaleName(zone.scale) + " " + zoneTypeName(zone.label);
-      track(name, zone.scale);
+      track(name, zone.scale, null, "zones");
       if (!zonesByName[name]) zonesByName[name] = [];
       const lower = zone.lower;
       const upper = zone.upper;
@@ -223,7 +223,7 @@ const TrendChart = (function () {
       track(name, mark.scale, mark.method);
       if (mark.kind === "segment" || mark.kind === "polyline" || mark.kind === "step_line") {
         series.push({
-          id: "mark-" + mark.kind + "-" + mark.object_id,
+          id: "mark-" + mark.kind + "-" + mark.object_id + "-" + series.length,
           name: name,
           type: "line",
           step: mark.kind === "step_line" ? "end" : false,
@@ -264,6 +264,7 @@ const TrendChart = (function () {
         });
       } else if (mark.kind === "band" && mark.points && mark.points.length >= 4) {
         const pts = mark.points;
+        const dashed = mark.line_type === "dashed";
         series.push({
           id: "mark-band-" + mark.object_id,
           name: name,
@@ -273,8 +274,14 @@ const TrendChart = (function () {
           data: [{
             value: [pts[0][0], pts[1][0], pts[0][1], pts[1][1], pts[2][1], pts[3][1]],
             objectId: mark.object_id,
-            itemStyle: { color: mark.color || "rgba(126,182,255,0.16)" },
+            itemStyle: {
+              color: mark.color || "rgba(126,182,255,0.16)",
+              borderColor: mark.color || "rgba(126,182,255,0.85)",
+              borderWidth: dashed ? 1.4 : 1,
+              borderType: dashed ? "dashed" : "solid",
+            },
           }],
+          clip: true,
           z: 1,
         });
       }
@@ -330,6 +337,8 @@ const TrendChart = (function () {
     const scaleSet = new Set(viewModel.default_scales || ["mid"]);
     let projectionOn = true;
     const extras = { "基础线段": false, "已过期": false };
+    const replacedLayers = new Set(viewModel.replaced_layers || []);
+    const layerChoice = {};
     const selected = {};
     applySelection(selected);
 
@@ -453,6 +462,29 @@ const TrendChart = (function () {
       if (!boundary && !zone && !pivot && !segment) {
         const owned = focusMarks.get(id) || [];
         if (!owned.length) return false;
+        const band = owned.filter(function (mark) {
+          return mark.kind === "band" && mark.points && mark.points.length >= 4;
+        })[0];
+        if (band) {
+          const pts = band.points;
+          zoomTo(pts[0][0], pts[1][0]);
+          chart.setOption({
+            series: [
+              {
+                id: "focus-line",
+                data: [
+                  { value: pts[0] },
+                  { value: pts[1] },
+                  null,
+                  { value: pts[3] },
+                  { value: pts[2] },
+                ],
+              },
+              { id: "focus-point", data: [] },
+            ],
+          });
+          return true;
+        }
         const bar = owned.filter(function (mark) { return mark.kind === "label_bar"; })[0];
         const line = [];
         owned.forEach(function (mark) {
@@ -561,6 +593,10 @@ const TrendChart = (function () {
         else {
           let on = meta.scale == null || scaleSet.has(meta.scale);
           if (meta.method && methodsRestricted && !methodSet.has(meta.method)) on = false;
+          if (meta.layer && replacedLayers.has(meta.layer)) {
+            if (layerChoice[name] == null) on = false;
+            else on = on && !!layerChoice[name];
+          }
           target[name] = on;
         }
       });
@@ -568,6 +604,9 @@ const TrendChart = (function () {
 
     function onLegend(event) {
       const chosen = event.selected || {};
+      legendMeta.forEach(function (meta, name) {
+        if (meta.layer && replacedLayers.has(meta.layer)) layerChoice[name] = !!chosen[name];
+      });
       const next = new Set();
       legendMeta.forEach(function (meta, name) {
         if (meta.scale && chosen[name] && name.indexOf("趋势线") >= 0) next.add(meta.scale);
@@ -749,6 +788,7 @@ const TrendChart = (function () {
         lines.push(text);
       });
       let extra = 0;
+      let bandNotes = 0;
       (viewModel.boundaries || []).forEach(function (line) {
         if (!covers(line, index)) return;
         if (lines.length > 8) { extra += 1; return; }
@@ -769,6 +809,13 @@ const TrendChart = (function () {
         }
         if (mark.kind === "marker" && mark.anchor === "lane" && mark.index === index) {
           (mark.hover || []).slice(0, 6).forEach(function (line) { lines.push(line); });
+        }
+        if (mark.kind === "band" && index >= mark.start_index && index <= mark.end_index) {
+          if (bandNotes >= 2 || lines.length > 14) return;
+          bandNotes += 1;
+          (mark.hover || []).forEach(function (line) {
+            if (lines.length <= 18) lines.push(line);
+          });
         }
       });
       if (extra) lines.push("另有 " + extra + " 条结构盖住这一根");
@@ -968,6 +1015,12 @@ const TrendChart = (function () {
     (viewModel.zones || []).forEach(function (zone) {
       (zone.lower || []).concat(zone.upper || []).forEach(function (pair) { prices.push(pair[1]); });
       if (zone.breakout) prices.push(zone.breakout.price);
+    });
+    (viewModel.marks || []).forEach(function (mark) {
+      (mark.points || []).forEach(function (pair) {
+        if (pair && pair.length > 1) prices.push(pair[1]);
+      });
+      if (mark.price != null) prices.push(mark.price);
     });
     const finite = prices.filter(function (value) { return isFinite(value) && value > 0; });
     if (!finite.length) return { min: 1, max: 2 };

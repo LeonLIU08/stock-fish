@@ -280,6 +280,15 @@ def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
             f'<button type="button" data-scale="{scale}" aria-pressed="{pressed}">{SCALE_LABEL[scale]}尺度</button>'
         )
     axis = model.get("axis_label") or ""
+    if "zones" in (model.get("replaced_layers") or []):
+        zone_sentence = (
+            "区间形状打开时，第一版的三类区间色带默认关掉，图例里可以再打开对照。"
+            "已经突破或过期的形状仍留在主图上，边线改成虚线。"
+        )
+    else:
+        zone_sentence = (
+            "下面三类区间都画在主图上，已经突破或过期的也保留，边线改成虚线。"
+        )
     return f"""
 <section class="panel" id="chart-panel">
   <div class="section-head">
@@ -296,7 +305,7 @@ def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
   <p class="muted">纵轴是{esc(axis)}。趋势线在这根轴上是直线。</p>
   <div id="chart"></div>
   <p class="muted">横轴是 K 线序号，刻度是日期。滚轮以指针位置缩放，按住拖拽平移，底部滑块选择序号区间，双击图或按复位回到全部 K 线，已选中的趋势线或方向线段仍留在图上。点击表格里的一行，会在图上定位该对象。悬停显示实际股价；拐点同时显示极值时间和确认时间。</p>
-  <p class="muted">图上默认是已验证的主结果。实线覆盖拟合用的序号，虚线是向后的投影。被收盘价突破的线保留到突破那一根，突破点用菱形标出。下面三类区间都画在主图上，已经突破或过期的也保留，边线改成虚线。候选、拒绝、备选和其他边界对不进这张图。</p>
+  <p class="muted">图上默认是已验证的主结果。实线覆盖拟合用的序号，虚线是向后的投影。被收盘价突破的线保留到突破那一根，突破点用菱形标出。{zone_sentence}候选、拒绝、备选和其他边界对不进这张图。</p>
   {_zone_key(snapshot)}
 </section>
 """
@@ -654,11 +663,19 @@ def _method_params(params: dict) -> str:
         "cross_buffer": "穿越缓冲",
         "cross_bars": "穿越连续根数",
         "stall_bars": "停滞根数（短 / 中 / 长）",
+        "level_tolerance": "水平容差",
+        "converging_width_ratio": "收敛宽度比",
+        "diverging_width_ratio": "张开宽度比",
     }
+    from analysis.structure.methods.pause import PARAM_LABELS
+
+    labels.update(PARAM_LABELS)
     rows = []
     for key, value in params.items():
         if isinstance(value, dict):
             shown = "、".join(f"{TOKEN_LABEL.get(name, name)} {item}" for name, item in value.items())
+        elif isinstance(value, bool):
+            shown = "开" if value else "关"
         else:
             shown = value
         rows.append(f"<tr><td>{esc(labels.get(key, key))}</td><td>{esc(shown)}</td></tr>")

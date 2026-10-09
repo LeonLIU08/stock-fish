@@ -5,14 +5,16 @@ from typing import Dict, List, Optional, Sequence
 
 from analysis.structure.config import StructureParams
 from analysis.structure.context import StructureContext
-from analysis.structure.methods.base import BASE_INPUTS, RUN_STATUSES, MethodResult
+from analysis.structure.methods.base import BASE_INPUTS, RUN_STATUSES, MethodResult, MethodSkipped
 
 
 def registered_methods() -> tuple:
     """按登记顺序返回方法。延迟导入，避免和快照、页面互相在模块顶层缠住。"""
     from analysis.structure.methods.direction import DirectionMethod
+    from analysis.structure.methods.pause import PauseMethod
+    from analysis.structure.methods.zone_shape import ZoneShapeMethod
 
-    return (DirectionMethod(),)
+    return (DirectionMethod(), ZoneShapeMethod(), PauseMethod(),)
 
 
 def validate_registry(methods: Sequence[object]) -> List[object]:
@@ -119,6 +121,10 @@ def run_methods(
                 raise TypeError(f"{method.key} 没有返回方法结果")
             records[method.key] = _record(method, pack, "completed", "", result)
             events.extend(result.events)
+        except MethodSkipped as exc:
+            reason = str(exc) or "跳过"
+            records[method.key] = _record(method, pack, "skipped", reason)
+            failed.add(method.key)
         except Exception as exc:
             reason = str(exc) or exc.__class__.__name__
             records[method.key] = _record(method, pack, "failed", reason)

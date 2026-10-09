@@ -1794,15 +1794,15 @@ class TrendStructureCliTests(unittest.TestCase):
     def test_batch_continues_after_one_symbol_fails(self):
         cli = self.cli
 
-        def fake_load(symbol, interval, start, end):
+        def fake_load(symbol, interval, start, end, params):
             if symbol == "BAD":
                 raise RuntimeError("没有已完成 K 线")
             times = _daily_times(40)
             closes = [100.0 + index * 0.5 for index in range(40)]
-            return times, closes, "test"
+            return times, closes, None, None, None, "test"
 
-        original = cli._load_closes
-        cli._load_closes = fake_load
+        original = cli._load_bars
+        cli._load_bars = fake_load
         try:
             with TemporaryDirectory() as tmp:
                 stdout, stderr = StringIO(), StringIO()
@@ -1838,16 +1838,24 @@ class TrendStructureCliTests(unittest.TestCase):
                 self.assertIn("没有已完成 K 线", page)
                 self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 2)
         finally:
-            cli._load_closes = original
+            cli._load_bars = original
 
     def test_single_symbol_writes_catalog_index(self):
         cli = self.cli
 
-        def fake_load(symbol, interval, start, end):
-            return _daily_times(12), [100.0 + index for index in range(12)], "test"
+        def fake_load(symbol, interval, start, end, params):
+            closes = [100.0 + index for index in range(12)]
+            return (
+                _daily_times(12),
+                closes,
+                [price + 1.0 for price in closes],
+                [price - 1.0 for price in closes],
+                [1000.0] * len(closes),
+                "test",
+            )
 
-        original = cli._load_closes
-        cli._load_closes = fake_load
+        original = cli._load_bars
+        cli._load_bars = fake_load
         try:
             with TemporaryDirectory() as tmp:
                 with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
@@ -1863,18 +1871,25 @@ class TrendStructureCliTests(unittest.TestCase):
                 self.assertIn("report.html", page)
                 self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 1)
         finally:
-            cli._load_closes = original
+            cli._load_bars = original
 
     def test_workers_one_runs_one_after_another(self):
         cli = self.cli
 
-        def fake_load(symbol, interval, start, end):
+        def fake_load(symbol, interval, start, end, params):
             times = _daily_times(40)
             closes = [100.0 + index * 0.5 for index in range(40)]
-            return times, closes, "test"
+            return (
+                times,
+                closes,
+                [price + 1.0 for price in closes],
+                [price - 1.0 for price in closes],
+                [1000.0] * len(closes),
+                "test",
+            )
 
-        original = cli._load_closes
-        cli._load_closes = fake_load
+        original = cli._load_bars
+        cli._load_bars = fake_load
         try:
             with TemporaryDirectory() as tmp:
                 stdout = StringIO()
@@ -1897,7 +1912,7 @@ class TrendStructureCliTests(unittest.TestCase):
                 self.assertLess(text.index("[1/2] 00700"), text.index("[2/2] 600519"))
                 self.assertEqual(len(list(Path(tmp).rglob("report.html"))), 2)
         finally:
-            cli._load_closes = original
+            cli._load_bars = original
 
     def test_workers_must_be_positive(self):
         stderr = StringIO()

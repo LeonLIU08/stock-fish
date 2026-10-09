@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from analysis.structure.config import PRICE_AXIS_LOG, SCALE_NAMES
 
@@ -61,6 +61,31 @@ TOKEN_LABEL = {
     "gap": "间断",
     "inherit": "段初",
     "replace": "更换",
+    "rising": "上升",
+    "falling": "下降",
+    "level": "水平",
+    "stable": "稳定",
+    "converging": "收敛",
+    "diverging": "张开",
+    "unclassified": "未归类",
+    "rising_channel": "上升通道",
+    "falling_channel": "下降通道",
+    "flat_channel": "横向通道",
+    "rising_wedge": "上升楔形",
+    "falling_wedge": "下降楔形",
+    "symmetrical_triangle": "对称三角形",
+    "ascending_triangle": "上升三角形",
+    "descending_triangle": "下降三角形",
+    "broadening": "扩张形态",
+    "flag": "旗形",
+    "pennant": "三角旗",
+    "multi": "不分尺度",
+    "up": "向上",
+    "down": "向下",
+    "channel": "通道",
+    "convergence": "收敛区间",
+    "sideways": "横向区间",
+    "other": "其他边界对",
     "high": "高点",
     "low": "低点",
     "short": "短",
@@ -261,6 +286,7 @@ def build_view_model(snapshot: dict) -> dict:
         "as_of_index": stop,
         "marks": _method_marks(shown, price_axis, stop),
         "default_methods": list(_visible_methods(snapshot)),
+        "replaced_layers": _replaced_layers(snapshot, shown),
         "method_objects": {
             key: [item.get("id") for item in (record.get("objects") or [])]
             for key, record in (shown.get("methods") or {}).items()
@@ -621,7 +647,13 @@ def _method_marks(shown: dict, price_axis: str, stop: Optional[int]) -> List[dic
 
     methods = shown.get("methods") or {}
     by_key = {method.key: method for method in registered_methods()}
-    view = {"price_axis": price_axis, "stop_index": stop}
+    view = {
+        "price_axis": price_axis,
+        "stop_index": stop,
+        "references": _reference_index(shown),
+        "events": list(shown.get("events") or []),
+        "closes": list(shown.get("closes") or []),
+    }
     marks = []
     for key, record in methods.items():
         if record.get("status") not in (None, "completed"):
@@ -632,6 +664,35 @@ def _method_marks(shown: dict, price_axis: str, stop: Optional[int]) -> List[dic
         for item in record.get("objects") or []:
             marks.extend(method.present(item, view))
     return marks
+
+
+def _reference_index(shown: dict) -> Dict[str, dict]:
+    """已按 as-of 过滤的快照里，证据可以点名的对象。"""
+    found: Dict[str, dict] = {}
+    for key in ("zones", "boundaries", "pivots", "segments"):
+        for item in shown.get(key) or []:
+            if isinstance(item, dict) and item.get("id"):
+                found[item["id"]] = item
+    for record in (shown.get("methods") or {}).values():
+        for item in (record or {}).get("objects") or []:
+            if isinstance(item, dict) and item.get("id"):
+                found[item["id"]] = item
+    return found
+
+
+def _replaced_layers(snapshot: dict, shown: dict) -> List[str]:
+    """初次打开、并且声明了替代图层的方法，让那个基础图层默认关掉。"""
+    visible = set(_visible_methods(snapshot))
+    layers: List[str] = []
+    for key, record in (shown.get("methods") or {}).items():
+        if key not in visible or not isinstance(record, dict):
+            continue
+        if record.get("status") not in (None, "completed"):
+            continue
+        for name in record.get("replaces") or []:
+            if name not in layers:
+                layers.append(name)
+    return layers
 
 
 def _visible_methods(snapshot: dict) -> Sequence[str]:
