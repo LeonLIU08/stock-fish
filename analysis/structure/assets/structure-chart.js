@@ -302,6 +302,7 @@ const TrendChart = (function () {
           return {
             value: [bar.start_index, bar.end_index, 0],
             objectId: bar.object_id,
+            tip: (bar.hover && bar.hover[0]) || "",
             itemStyle: { color: bar.color || "#8A8478" },
           };
         }),
@@ -437,6 +438,26 @@ const TrendChart = (function () {
     on(container, "dblclick", onDoubleClick);
     on(window, "resize", function () { chart.resize(); });
     chart.on("legendselectchanged", onLegend);
+    const laneTip = document.createElement("div");
+    laneTip.className = "lane-tip";
+    laneTip.hidden = true;
+    container.appendChild(laneTip);
+    chart.on("mouseover", function (params) {
+      const text = params.data && params.data.tip;
+      const event = params.event && params.event.event;
+      if (!text || !event) {
+        laneTip.hidden = true;
+        return;
+      }
+      laneTip.hidden = false;
+      laneTip.textContent = text;
+      const width = container.clientWidth || 0;
+      const left = Math.min(Math.max(event.offsetX + 12, 8), Math.max(width - 180, 8));
+      laneTip.style.left = left + "px";
+      laneTip.style.top = Math.max(event.offsetY - 28, 8) + "px";
+    });
+    chart.on("mouseout", function () { laneTip.hidden = true; });
+    chart.on("globalout", function () { laneTip.hidden = true; });
     chart.on("click", function (params) {
       const objectId = params.data && (params.data.objectId || params.data.id);
       if (objectId) focus(objectId);
@@ -451,6 +472,7 @@ const TrendChart = (function () {
 
     function destroy() {
       cleanups.forEach(function (off) { off(); });
+      if (laneTip.parentNode) laneTip.parentNode.removeChild(laneTip);
       chart.dispose();
     }
 
@@ -915,7 +937,7 @@ const TrendChart = (function () {
     return {
       type: "group",
       children: [
-        { type: "rect", shape: { x: x, y: y, width: width, height: height }, style: { fill: fill } },
+        { type: "rect", shape: { x: x, y: y, width: width, height: height }, style: { fill: fill }, cursor: "default" },
         {
           type: "circle",
           shape: { cx: left[0], cy: y + height / 2, r: 3.5 },

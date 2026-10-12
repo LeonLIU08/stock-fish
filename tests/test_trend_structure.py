@@ -185,6 +185,31 @@ class ParamsTests(unittest.TestCase):
         older["version"] = PARAM_VERSION_V5
         self.assertEqual(newer, older)
 
+    def test_v6_adds_phase_without_changing_v5(self):
+        from analysis.structure.config import PARAM_VERSION_V6
+
+        older = default_params(version=PARAM_VERSION_V5).to_dict()
+        newer = default_params(version=PARAM_VERSION_V6).to_dict()
+        self.assertEqual(
+            enabled_methods(PARAM_VERSION_V6),
+            (
+                "direction",
+                "zone_shape",
+                "pause",
+                "major_trend",
+                "retracement",
+                "minor_swing",
+                "phase",
+            ),
+        )
+        self.assertEqual(newer["direction"], older["direction"])
+        self.assertEqual(newer["phase"]["fast_span"], 10)
+        self.assertEqual(newer["phase"]["state_bars"], 2)
+        self.assertNotIn("phase", older)
+        newer.pop("phase")
+        older["version"] = PARAM_VERSION_V6
+        self.assertEqual(newer, older)
+
     def test_yaml_rejects_unknown_fields(self):
         payload = default_params().to_dict()
         payload.pop("price_axis")

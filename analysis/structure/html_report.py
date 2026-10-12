@@ -216,6 +216,37 @@ def _reading(snapshot: dict) -> str:
 """
 
 
+def _phase_key(shown: dict) -> str:
+    """主图下方的阶段颜色。只列出这次图上出现过的主状态。"""
+    record = ((shown or {}).get("methods") or {}).get("phase") or {}
+    if record.get("status") not in (None, "completed"):
+        return ""
+    present = {
+        item.get("category")
+        for item in record.get("objects") or []
+        if item.get("category")
+    }
+    chips = []
+    for item in record.get("categories") or []:
+        key = item.get("key")
+        if key not in present:
+            continue
+        chips.append(
+            "<li>"
+            f'<span class="swatch" style="background:{esc(item.get("color") or "#8A8478")}"></span>'
+            f"<span>{esc(item.get('name') or key)}</span>"
+            "</li>"
+        )
+    if not chips:
+        return ""
+    return (
+        '<p class="muted">阶段颜色。短、中、长用同一套。鼠标停在色块上也会显示这一段的名称。</p>'
+        '<ul class="phase-key" aria-label="阶段颜色">'
+        + "".join(chips)
+        + "</ul>"
+    )
+
+
 def _zone_key(snapshot: dict) -> str:
     """图例旁边的三类区间定义。数字来自这次快照的参数。"""
     params = snapshot.get("params") or {}
@@ -304,7 +335,8 @@ def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
   </div>
   <p class="muted">纵轴是{esc(axis)}。趋势线在这根轴上是直线。</p>
   <div id="chart"></div>
-  <p class="muted">横轴是 K 线序号，刻度是日期。滚轮以指针位置缩放，按住拖拽平移，底部滑块选择序号区间，双击图或按复位回到全部 K 线，已选中的趋势线或方向线段仍留在图上。点击表格里的一行，会在图上定位该对象。悬停显示实际股价；拐点同时显示极值时间和确认时间。</p>
+  {_phase_key(shown)}
+  <p class="muted">横轴是 K 线序号，刻度是日期。滚轮以指针位置缩放，按住拖拽平移，底部滑块选择序号区间，双击图或按复位回到全部 K 线，已选中的趋势线或方向线段仍留在图上。点击表格里的一行，会在图上定位该对象。悬停显示实际股价；拐点同时显示极值时间和确认时间。鼠标停在主图下方的色块上，会显示这一段的名称。</p>
   <p class="muted">图上默认是已验证的主结果。实线覆盖拟合用的序号，虚线是向后的投影。被收盘价突破的线保留到突破那一根，突破点用菱形标出。{zone_sentence}候选、拒绝、备选和其他边界对不进这张图。</p>
   {_zone_key(snapshot)}
 </section>
@@ -668,8 +700,10 @@ def _method_params(params: dict) -> str:
         "diverging_width_ratio": "张开宽度比",
     }
     from analysis.structure.methods.pause import PARAM_LABELS
+    from analysis.structure.methods.phase import PARAM_LABELS as PHASE_LABELS
 
     labels.update(PARAM_LABELS)
+    labels.update(PHASE_LABELS)
     rows = []
     for key, value in params.items():
         if isinstance(value, dict):
@@ -1206,6 +1240,30 @@ section[id], .identity { scroll-margin-top: 9.5rem; }
 .hash, .muted, .chip em { color: var(--muted); }
 .zone-key { list-style: none; padding: 0; margin: 0.2rem 0 0.8rem; }
 .zone-key li { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0.35rem 0; }
+.phase-key {
+  list-style: none;
+  padding: 0;
+  margin: 0.15rem 0 0.7rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.9rem;
+}
+.phase-key li { display: inline-flex; gap: 0.4rem; align-items: center; color: #c8c2b4; }
+.phase-key .swatch { margin-top: 0; }
+.lane-tip {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  padding: 0.18rem 0.45rem;
+  border: 1px solid #4a4338;
+  border-radius: 6px;
+  background: #262017;
+  color: #f3efe4;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.lane-tip[hidden] { display: none; }
 .swatch {
   width: 0.9rem;
   height: 0.9rem;
@@ -1257,7 +1315,7 @@ button[aria-pressed="true"] {
   border-color: var(--accent);
   color: #f6e2c2;
 }
-#chart { width: 100%; height: min(68vh, 640px); min-height: 420px; }
+#chart { position: relative; width: 100%; height: min(68vh, 640px); min-height: 420px; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
 table { border-collapse: collapse; width: max-content; min-width: 100%; }
 th, td {

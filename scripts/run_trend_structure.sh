@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 一次跑多只股票的趋势结构。
-# 固定为日线、回看 1 年、参数版本 structure-params-v5。
-# 这一版一次算出方向、区间形状、停顿，以及主趋势、次级折返、短期波动。
-# 反转倍数是短 1.4、中 2.8、长 5.6。
+# 固定为日线、回看 1 年、参数版本 structure-params-v6。
+# 这一版一次算出方向、区间形状、停顿、主趋势、次级折返、短期波动和阶段。
+# 反转倍数是短 1.4、中 2.8、长 5.6。方向在这一版多记推进参照。
 # 多只股票并行计算。默认同时算 10 只，传了 --workers 就用那个数。
 #
 # 不传股票时读取 scripts/hkconnect_06Oct.txt。
@@ -81,7 +81,7 @@ done
 cmd=(
   "$PYTHON" scripts/run_trend_structure.py
   --years 1
-  --param-version structure-params-v5
+  --param-version structure-params-v6
 )
 if [[ "$workers_given" -eq 1 ]]; then
   cmd+=(--workers "$workers_value")

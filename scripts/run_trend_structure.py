@@ -6,7 +6,7 @@
 每次运行都会刷新输出根目录的 index.html，点一只股票就打开它的 report.html。
 
 短、中、长的 k、门槛下限和最大跨度不随时间范围改变，写在各版本的 YAML 里。
-不写 --param-version 时用 structure-params-v5：在 v4 上再算主趋势、次级折返和短期波动。反转倍数仍是 1.4、2.8、5.6。
+不写 --param-version 时用 structure-params-v6：在 v5 上再算阶段。方向记为 direction-v2，只多推进参照。反转倍数仍是 1.4、2.8、5.6。
 对照旧规则时用 structure-params-v0 或 v1。v2 只有方向。v3 的反转倍数仍是 1.5、3、6。
 
 示例:

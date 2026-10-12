@@ -2,7 +2,8 @@
 
 几何横轴是有效 K 线序号，不把停牌或缺失填成横盘。
 v0 到 v3 的 `data_hash` 只覆盖时间戳和收盘价。启用停顿的版本在声明了
-最高价、最低价和成交量时，把这三项一并算进哈希。参数版本和价格轴放在输出目录里。
+最高价、最低价和成交量时，把这三项一并算进哈希。启用阶段的版本若另外传入开盘价，
+也把开盘价算进哈希；没传入时哈希不变。参数版本和价格轴放在输出目录里。
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from analysis.structure.config import (
     normalize_interval,
     normalize_price_axis,
     series_quote_fields,
+    series_uses_open,
 )
 
 IDENTITY_FILENAME = "series_identity.json"
@@ -54,6 +56,8 @@ class SeriesBar:
     volume: Optional[float] = None
     high_geometric: Optional[float] = None
     low_geometric: Optional[float] = None
+    open: Optional[float] = None
+    open_geometric: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,8 @@ class StandardSeries:
                 "lows": [bar.low for bar in head],
                 "volumes": [bar.volume for bar in head],
             }
+        if head and head[0].open is not None:
+            quotes["opens"] = [bar.open for bar in head]
         return build_series(
             [bar.timestamp for bar in head],
             [bar.close for bar in head],
@@ -115,6 +121,7 @@ def build_series(
     highs: Optional[Sequence[Any]] = None,
     lows: Optional[Sequence[Any]] = None,
     volumes: Optional[Sequence[Any]] = None,
+    opens: Optional[Sequence[Any]] = None,
 ) -> StandardSeries:
     """把已完成 K 线收成标准序列。
 
@@ -145,22 +152,28 @@ def build_series(
 
     gaps = _gap_flags(parsed_times, resolved_interval, params)
     quote_rows = _quote_rows(params, len(parsed_closes), highs, lows, volumes)
+    parsed_opens = _open_rows(params, len(parsed_closes), opens)
     digest = _hash_timestamps_and_closes(
         parsed_times,
         parsed_closes,
         None if quote_rows is None else [row[0] for row in quote_rows],
         None if quote_rows is None else [row[1] for row in quote_rows],
         None if quote_rows is None else [row[2] for row in quote_rows],
+        parsed_opens,
     )
     bars: List[SeriesBar] = []
     for index, (ts, close, gap_before) in enumerate(
         zip(parsed_times, parsed_closes, gaps)
     ):
         high = low = volume = high_geometric = low_geometric = None
+        open_price = open_geometric = None
         if quote_rows is not None:
             high, low, volume = quote_rows[index]
             high_geometric = _finite_positive_geometric(high, params.price_axis)
             low_geometric = _finite_positive_geometric(low, params.price_axis)
+        if parsed_opens is not None:
+            open_price = parsed_opens[index]
+            open_geometric = _finite_positive_geometric(open_price, params.price_axis)
         bars.append(
             SeriesBar(
                 index=index,
@@ -173,6 +186,8 @@ def build_series(
                 volume=volume,
                 high_geometric=high_geometric,
                 low_geometric=low_geometric,
+                open=open_price,
+                open_geometric=open_geometric,
             )
         )
     return StandardSeries(
@@ -377,6 +392,19 @@ def _quote_rows(
     )
 
 
+def _open_rows(
+    params: StructureParams,
+    count: int,
+    opens: Optional[Sequence[Any]],
+) -> Optional[List[float]]:
+    """启用阶段且调用方传入开盘价时才写入。其他版本即使传入也忽略。"""
+    if opens is None or not series_uses_open(params.version):
+        return None
+    if len(opens) != count:
+        raise ValueError(f"开盘价必须与收盘价一一对应: {len(opens)} 与 {count}")
+    return _parse_quote(opens)
+
+
 def _parse_quote(values: Sequence[Any]) -> List[float]:
     parsed: List[float] = []
     for value in values:
@@ -402,6 +430,7 @@ def _hash_timestamps_and_closes(
     highs: Optional[Sequence[float]] = None,
     lows: Optional[Sequence[float]] = None,
     volumes: Optional[Sequence[float]] = None,
+    opens: Optional[Sequence[float]] = None,
 ) -> str:
     digest = hashlib.sha256()
     use_quotes = highs is not None and lows is not None and volumes is not None
@@ -412,6 +441,8 @@ def _hash_timestamps_and_closes(
             digest.update(struct.pack(">d", float(highs[index])))
             digest.update(struct.pack(">d", float(lows[index])))
             digest.update(struct.pack(">d", float(volumes[index])))
+        if opens is not None:
+            digest.update(struct.pack(">d", float(opens[index])))
     return digest.hexdigest()[:32]
 
 

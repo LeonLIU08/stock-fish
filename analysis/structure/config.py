@@ -7,7 +7,8 @@ v0 的文件一旦发出就固定，以后调阈值要换版本号，不覆盖�
 v2 的基础参数与 v1 相同，并启用方向。v3 在 v2 上启用区间形状和停顿。
 v4 与 v3 相同，只把短、中、长的反转倍数改为 1.4、2.8、5.6。
 v5 在 v4 上再启用主趋势、次级折返和短期波动。六个方法一次运行全部写出。
-停顿才读取最高价、最低价和成交量。级别不新增行情列。
+v6 保留 v5 的基础层和方法，再启用阶段。方向在这一版记为 direction-v2，只追加推进参照。
+停顿才读取最高价、最低价和成交量。阶段不把这些列写成依赖；开盘价只在 v6 声明了并且调用方传入时进入序列和哈希。
 """
 from __future__ import annotations
 
@@ -24,8 +25,9 @@ PARAM_VERSION_V2 = "structure-params-v2"
 PARAM_VERSION_V3 = "structure-params-v3"
 PARAM_VERSION_V4 = "structure-params-v4"
 PARAM_VERSION_V5 = "structure-params-v5"
+PARAM_VERSION_V6 = "structure-params-v6"
 # 命令行不写 --param-version 时用这一版。库函数不传版本时仍返回 v0。
-CLI_PARAM_VERSION = PARAM_VERSION_V5
+CLI_PARAM_VERSION = PARAM_VERSION_V6
 
 _PARAMS_DIR = Path(__file__).resolve().parent / "params"
 _VERSION_FILE = re.compile(r"structure-params-v(\d+)$")
@@ -36,6 +38,7 @@ _METHOD_NAMES = (
     "major_trend",
     "retracement",
     "minor_swing",
+    "phase",
 )
 _LEVEL_METHODS = ("major_trend", "retracement", "minor_swing")
 
@@ -45,6 +48,11 @@ def series_quote_fields(version: str) -> Tuple[str, ...]:
     if "pause" in enabled_methods(version):
         return ("high", "low", "volume")
     return ()
+
+
+def series_uses_open(version: str) -> bool:
+    """启用阶段的版本才接收开盘价。没传入时不改哈希。"""
+    return "phase" in enabled_methods(version)
 
 SHORT = "short"
 MID = "mid"
@@ -395,6 +403,191 @@ def direction_params_from_dict(payload: Dict[str, Any] | None) -> DirectionParam
     )
 
 
+_PHASE_INTS = (
+    "fast_span",
+    "impulse_span",
+    "record_span",
+    "birth_bars",
+    "swing_window",
+    "wick_window",
+    "wick_count",
+    "volume_window",
+    "volume_baseline",
+    "exhaustion_score",
+    "exhaustion_bars",
+    "bias_window",
+    "false_break_window",
+    "range_score",
+    "score_gap",
+    "break_bars",
+    "state_bars",
+)
+_PHASE_UNIT = ("fade_ratio", "wick_ratio", "bias_minimum")
+_PHASE_SCORE = ("exhaustion_score", "range_score", "score_gap")
+
+
+@dataclass(frozen=True)
+class PhaseParams:
+    """阶段判断的参数。只出现在启用了 phase 的参数版本里。"""
+
+    fast_span: int = 10
+    impulse_span: int = 3
+    record_span: int = 5
+    birth_bars: int = 5
+    pullback_multiple: float = 1.0
+    pullback_impulse: float = 0.5
+    fade_progress: float = 1.0
+    fade_ratio: float = 0.3
+    swing_window: int = 3
+    swing_retrace: float = 1.5
+    wick_window: int = 5
+    wick_count: int = 2
+    wick_ratio: float = 0.5
+    wick_amplitude: float = 1.0
+    volume_window: int = 3
+    volume_baseline: int = 20
+    volume_multiple: float = 1.5
+    volume_impulse: float = 0.5
+    exhaustion_score: int = 2
+    exhaustion_bars: int = 2
+    structure_shift: float = 0.3
+    bias_window: int = 10
+    bias_minimum: float = 0.15
+    false_break: float = 0.2
+    false_break_window: int = 10
+    range_score: int = 3
+    score_gap: int = 2
+    break_bars: int = 2
+    break_buffer: float = 0.3
+    state_bars: int = 2
+
+    def __post_init__(self) -> None:
+        self.check()
+
+    def check(self) -> None:
+        for name in _PHASE_INTS:
+            _require_int(_PHASE_FIELD_LABEL[name], getattr(self, name), 1)
+        for name in _PHASE_UNIT:
+            _require_unit(_PHASE_FIELD_LABEL[name], float(getattr(self, name)))
+        for name in _PHASE_SCORE:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 4:
+                raise ValueError(f"{_PHASE_FIELD_LABEL[name]}必须是 1 到 4 的整数")
+        for name in (
+            "pullback_multiple",
+            "pullback_impulse",
+            "fade_progress",
+            "swing_retrace",
+            "wick_amplitude",
+            "volume_multiple",
+            "volume_impulse",
+            "structure_shift",
+            "false_break",
+            "break_buffer",
+        ):
+            value = float(getattr(self, name))
+            if not value > 0:
+                raise ValueError(f"{_PHASE_FIELD_LABEL[name]}必须为正")
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        for name in _PHASE_FIELDS:
+            value = getattr(self, name)
+            payload[name] = int(value) if name in _PHASE_INTS else float(value)
+        return payload
+
+
+_PHASE_FIELDS = (
+    "fast_span",
+    "impulse_span",
+    "record_span",
+    "birth_bars",
+    "pullback_multiple",
+    "pullback_impulse",
+    "fade_progress",
+    "fade_ratio",
+    "swing_window",
+    "swing_retrace",
+    "wick_window",
+    "wick_count",
+    "wick_ratio",
+    "wick_amplitude",
+    "volume_window",
+    "volume_baseline",
+    "volume_multiple",
+    "volume_impulse",
+    "exhaustion_score",
+    "exhaustion_bars",
+    "structure_shift",
+    "bias_window",
+    "bias_minimum",
+    "false_break",
+    "false_break_window",
+    "range_score",
+    "score_gap",
+    "break_bars",
+    "break_buffer",
+    "state_bars",
+)
+_PHASE_FIELD_LABEL = {
+    "fast_span": "快均线",
+    "impulse_span": "短推进",
+    "record_span": "记录用推进",
+    "birth_bars": "初生长度",
+    "pullback_multiple": "回调幅度",
+    "pullback_impulse": "回调推进",
+    "fade_progress": "衰竭旧推进",
+    "fade_ratio": "衰竭衰减",
+    "swing_window": "创高近窗",
+    "swing_retrace": "创高回撤",
+    "wick_window": "影线窗口",
+    "wick_count": "影线次数",
+    "wick_ratio": "影线比例",
+    "wick_amplitude": "影线振幅",
+    "volume_window": "放量近窗",
+    "volume_baseline": "放量基线",
+    "volume_multiple": "放量倍数",
+    "volume_impulse": "无推进",
+    "exhaustion_score": "衰竭分数",
+    "exhaustion_bars": "衰竭连续",
+    "structure_shift": "结构位移",
+    "bias_window": "量价窗口",
+    "bias_minimum": "量价阈值",
+    "false_break": "假突破深度",
+    "false_break_window": "假突破窗口",
+    "range_score": "整理分数",
+    "score_gap": "分差",
+    "break_bars": "突破连续",
+    "break_buffer": "突破缓冲",
+    "state_bars": "子状态连续",
+}
+
+
+def phase_params_from_dict(payload: Dict[str, Any] | None) -> PhaseParams:
+    """把快照里的 phase 字典收成参数。缺省用 2.5.6 的默认值。"""
+    if not payload:
+        return PhaseParams()
+    unknown = sorted(set(payload) - set(_PHASE_FIELDS))
+    missing = [name for name in _PHASE_FIELDS if name not in payload]
+    if unknown:
+        raise ValueError("阶段参数有未登记的字段: " + ", ".join(unknown))
+    if missing:
+        raise ValueError("阶段参数缺少字段: " + ", ".join(missing))
+    kwargs: Dict[str, Any] = {}
+    for name in _PHASE_FIELDS:
+        value = payload[name]
+        label = _PHASE_FIELD_LABEL[name]
+        if name in _PHASE_INTS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{label}必须是整数")
+            kwargs[name] = value
+        else:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{label}必须是数字")
+            kwargs[name] = float(value)
+    return PhaseParams(**kwargs)
+
+
 _BASE_KEYS = (
     "ewma_span",
     "vol_clip_multiple",
@@ -461,6 +654,7 @@ def _discover_versions() -> Tuple[str, ...]:
         PARAM_VERSION_V3,
         PARAM_VERSION_V4,
         PARAM_VERSION_V5,
+        PARAM_VERSION_V6,
     )
     missing = [item for item in required if item not in versions]
     if missing:
@@ -606,6 +800,13 @@ def _empty_from_spec(payload: Any, source: str, name: str) -> EmptyMethodParams:
     return EmptyMethodParams()
 
 
+def _phase_from_spec(payload: Any, source: str) -> PhaseParams:
+    label = f"{source} 的 phase"
+    row = _require_mapping(payload, label)
+    _exact_keys(row, _PHASE_FIELDS, label)
+    return phase_params_from_dict(row)
+
+
 def _pause_from_spec(payload: Any, source: str) -> PauseParams:
     label = f"{source} 的 pause"
     row = _require_mapping(payload, label)
@@ -656,6 +857,7 @@ def params_kwargs_from_payload(payload: Dict[str, Any], source: str, price_axis:
         "direction": _direction_from_spec,
         "zone_shape": _zone_shape_from_spec,
         "pause": _pause_from_spec,
+        "phase": _phase_from_spec,
     }
     for name, builder in builders.items():
         kwargs[name] = builder(row[name], source) if name in method_names else None
@@ -707,6 +909,7 @@ class StructureParams:
     major_trend: Optional[EmptyMethodParams] = None
     retracement: Optional[EmptyMethodParams] = None
     minor_swing: Optional[EmptyMethodParams] = None
+    phase: Optional[PhaseParams] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "price_axis", normalize_price_axis(self.price_axis))
@@ -764,6 +967,8 @@ class StructureParams:
             present = getattr(self, name) is not None
             if (name in enabled) != present:
                 raise ValueError(f"{name} 参数只写在启用了该方法的版本里")
+        if ("phase" in enabled) != (self.phase is not None):
+            raise ValueError("phase 参数只写在启用了阶段的版本里")
         if self.direction is not None:
             self.direction.check()
         if self.zone_shape is not None:
@@ -774,6 +979,8 @@ class StructureParams:
             value = getattr(self, name)
             if value is not None:
                 value.check()
+        if self.phase is not None:
+            self.phase.check()
 
     def scale(self, name: str) -> ScaleParams:
         for item in self.scales:

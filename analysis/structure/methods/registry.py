@@ -14,6 +14,7 @@ def registered_methods() -> tuple:
     from analysis.structure.methods.major_trend import MajorTrendMethod
     from analysis.structure.methods.minor_swing import MinorSwingMethod
     from analysis.structure.methods.pause import PauseMethod
+    from analysis.structure.methods.phase import PhaseMethod
     from analysis.structure.methods.retracement import RetracementMethod
     from analysis.structure.methods.zone_shape import ZoneShapeMethod
 
@@ -24,6 +25,7 @@ def registered_methods() -> tuple:
         MajorTrendMethod(),
         RetracementMethod(),
         MinorSwingMethod(),
+        PhaseMethod(),
     )
 
 
@@ -121,15 +123,20 @@ def run_methods(
         pack = method_param_dict(params, method)
         try:
             method.check_params(pack)
+            # 已完成的方法都放进上游。requires 只决定顺序，以及失败后要不要跳过。
             upstream = {
-                item: records[item]
-                for item in method.requires
-                if item in records
+                key: record
+                for key, record in records.items()
+                if record.get("status") == "completed"
             }
+            version = method.version
+            resolve = getattr(method, "resolve_version", None)
+            if resolve is not None:
+                version = resolve(context, pack)
             result = method.judge(context, pack, upstream)
             if not isinstance(result, MethodResult):
                 raise TypeError(f"{method.key} 没有返回方法结果")
-            records[method.key] = _record(method, pack, "completed", "", result)
+            records[method.key] = _record(method, pack, "completed", "", result, version)
             events.extend(result.events)
         except MethodSkipped as exc:
             reason = str(exc) or "跳过"
@@ -181,14 +188,21 @@ def method_failure_text(snapshot: dict) -> str:
     return "；".join(lines)
 
 
-def _record(method: object, pack: dict, status: str, reason: str, result: Optional[MethodResult] = None) -> dict:
+def _record(
+    method: object,
+    pack: dict,
+    status: str,
+    reason: str,
+    result: Optional[MethodResult] = None,
+    version: Optional[str] = None,
+) -> dict:
     if status not in RUN_STATUSES:
         raise ValueError(f"未知运行结果 {status}")
     result = result or MethodResult()
     return {
         "key": method.key,
         "name": method.name,
-        "version": method.version,
+        "version": version or method.version,
         "kind": method.kind,
         "section": method.section,
         "requires": list(method.requires),

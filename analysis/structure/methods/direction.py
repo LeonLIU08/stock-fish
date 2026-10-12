@@ -15,6 +15,7 @@ from analysis.structure.config import (
     SCALE_NAMES,
     SHORT,
     direction_params_from_dict,
+    enabled_methods,
 )
 from analysis.structure.methods.base import (
     KIND_RUN,
@@ -97,10 +98,17 @@ class DirectionMethod:
     def check_params(self, params: dict) -> None:
         direction_params_from_dict(params)
 
+    def resolve_version(self, context, params: dict) -> str:
+        del params
+        if _records_progress(context):
+            return "direction-v2"
+        return self.version
+
     def judge(self, context, params: dict, upstream: dict) -> MethodResult:
         del upstream
         pack = direction_params_from_dict(params)
         series = context.series
+        record_progress = _records_progress(context)
         volatility = context.volatility
         if volatility is None or len(volatility) != len(series):
             raise ValueError("方向判断需要与 K 线对齐的波动序列")
@@ -116,6 +124,7 @@ class DirectionMethod:
                 [pivot for pivot in confirmed if pivot.scale == scale],
                 scale,
                 pack,
+                record_progress,
             )
             if scale_objects and all(not item.get("category") for item in scale_objects):
                 notes.append(f"{SCALE_LEGEND[scale]}样本不足，整段未定。")
@@ -335,7 +344,24 @@ class _State:
         self.new_pivots = []
 
 
-def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> Tuple[List[dict], List[dict], List[dict]]:
+def _records_progress(context) -> bool:
+    """启用阶段的参数版本才追加推进参照。v0 到 v5 不写这份记录。"""
+    series = getattr(context, "series", None)
+    params = getattr(series, "params", None)
+    version = getattr(params, "version", None)
+    if not version:
+        return False
+    return "phase" in enabled_methods(version)
+
+
+def _run_scale(
+    series,
+    volatility,
+    pivots: Sequence[Any],
+    scale: str,
+    pack,
+    record_progress: bool = False,
+) -> Tuple[List[dict], List[dict], List[dict]]:
     bars = series.bars
     count = len(bars)
     geoms = [bar.geometric for bar in bars]
@@ -367,7 +393,7 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
         if trigger in ("pivot", "cross"):
             comparisons = _trigger_rows(state)
             price_cross_index = _cross_index(state, trigger)
-        return {
+        segment = {
             "id": f"direction:{scale}:{index}",
             "method": "direction",
             "scale": scale,
@@ -403,6 +429,9 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
             "_is_first": is_first,
             "_event_sent": False,
         }
+        if record_progress:
+            segment["progress"] = []
+        return segment
 
     def seal(segment: dict, end_index: int) -> None:
         if end_index < int(segment["start_index"]):
@@ -499,6 +528,7 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
         _note_failed(state, open_seg)
         transition = _transfer(state)
         transitioned = transition is not None
+        opened = None
         if transition is not None:
             _apply_transition(state, transition, index, geoms)
             open_new(
@@ -510,6 +540,7 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
                 label_before=None,
                 structure_before=None,
             )
+            opened = "transition"
         else:
             _replace_protection(state, open_seg, index, times[index])
         assert open_seg is not None
@@ -525,6 +556,7 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
                 structure_before=None,
             )
             open_seg["_progress"] = 1
+            opened = "progress"
         elif (not transitioned) and _should_stall(state, index, progressed, open_seg.get("category") or "", stall_n):
             open_new(
                 index,
@@ -535,8 +567,11 @@ def _run_scale(series, volatility, pivots: Sequence[Any], scale: str, pack) -> T
                 label_before=None,
                 structure_before=None,
             )
+            opened = "stall"
         elif progressed:
             open_seg["_progress"] = int(open_seg.get("_progress") or 0) + 1
+        if record_progress:
+            _append_progress(open_seg, opened, progressed, state, index, times[index])
         open_seg["end_index"] = index
         open_seg["end_time"] = times[index]
         open_seg["_swing_high"] = state.high.relation
@@ -711,6 +746,30 @@ def _replace_protection(state: _State, segment: dict, index: int, time_text: str
             continue
         state.protection = pivot
         segment.setdefault("protection", []).append(_protection_row(pivot, index, time_text, "replace"))
+
+
+def _append_progress(segment: dict, opened: Optional[str], progressed: bool, state: _State, index: int, time_text: str) -> None:
+    """方向 v2 才写。确立、推进、停滞继承各记一行，已写下的行不改。"""
+    if state.level is None:
+        return
+    if opened == "transition":
+        source = "establish"
+    elif opened == "progress" or (opened is None and progressed):
+        source = "progress"
+    elif opened == "stall":
+        source = "inherit"
+    else:
+        return
+    price, place = state.level
+    segment.setdefault("progress", []).append(
+        {
+            "available_index": int(index),
+            "available_time": time_text,
+            "reference_index": int(place),
+            "geometric_price": float(price),
+            "source": source,
+        }
+    )
 
 
 def _arm_progress(state: _State, index: int, geoms: Sequence[float]) -> None:
