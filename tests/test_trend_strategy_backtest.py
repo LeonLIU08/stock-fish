@@ -1,4 +1,4 @@
-"""趋势策略第一阶段：配置校验，以及合成 K 线上的空会话报告。"""
+"""趋势策略回测：配置、磁带、价格口径、账户规则和入场插件。"""
 from __future__ import annotations
 
 import copy
@@ -25,11 +25,13 @@ from analysis.backtest.trend.prices import (
     replay_holding,
     upward_gap_cancel,
 )
-from analysis.backtest.trend.runner import run_trend_backtest
+from analysis.backtest.trend.entries import create_entry, list_entries
 from analysis.backtest.trend.entries.base import EntrySignal, EntryTactic
+from analysis.backtest.trend.entries.registry import register_entry
 from analysis.backtest.trend.fills import entry_cancel_reason
 from analysis.backtest.trend.exits import long_trend_failed, next_long_stop, reduce_shares
 from analysis.backtest.trend.risk import estimate_cost_per_share, size_position
+from analysis.backtest.trend.runner import run_trend_backtest
 from analysis.backtest.trend.session import ReplayBar, run_account, run_empty_session
 from analysis.backtest.trend.tape import (
     build_tape,
@@ -39,6 +41,8 @@ from analysis.backtest.trend.tape import (
 )
 from analysis.structure.config import PARAM_VERSION_V6, default_params
 from analysis.structure.methods.phase import (
+    ACCUMULATION,
+    DISTRIBUTION,
     DOWN_BIRTH,
     DOWNTREND,
     INSUFFICIENT,
@@ -773,7 +777,7 @@ class _Script(EntryTactic):
 
 
 def _bar(time, open_, high, low, close, **kw):
-    return ReplayBar(
+    bar = ReplayBar(
         time=time,
         open=open_,
         high=high,
@@ -783,11 +787,16 @@ def _bar(time, open_, high, low, close, **kw):
         category=kw.pop("category", UP_CONTINUE),
         a_t=kw.pop("a_t", 5.0),
         factor=kw.pop("factor", 1.0),
+        ema=kw.pop("ema", None),
         dividend=kw.pop("dividend", 0.0),
         split=kw.pop("split", 1.0),
+        gap_before=kw.pop("gap_before", False),
+        phase_start_index=kw.pop("phase_start_index", None),
+        direction_start_index=kw.pop("direction_start_index", None),
     )
     if kw:
         raise TypeError(sorted(kw))
+    return bar
 
 
 def _calm(time, **kw):
@@ -1355,6 +1364,566 @@ class AccountRuleTests(unittest.TestCase):
             exchange_fee_rate=0.0,
             settlement_rate=0.0,
         )
+
+
+_KEEP = object()
+
+
+def _rb(
+    index,
+    open_,
+    high,
+    low,
+    close,
+    *,
+    structure=UPTREND,
+    category=UP_CONTINUE,
+    a_t=1.0,
+    ema=None,
+    factor=1.0,
+    gap_before=False,
+    phase_start_index=None,
+    direction_start_index=0,
+):
+    if high < low or high < max(open_, close) or low > min(open_, close):
+        raise AssertionError(f"d{index} 的 OHLC 不合法: {(open_, high, low, close)}")
+    return ReplayBar(
+        time=f"d{index:02d}",
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        structure=structure,
+        category=category,
+        a_t=a_t,
+        factor=factor,
+        ema=ema,
+        gap_before=gap_before,
+        phase_start_index=phase_start_index,
+        direction_start_index=direction_start_index,
+    )
+
+
+def _prepared(name, price_axis="log", **entry):
+    config = load_trend_config(today=date(2026, 10, 13))
+    strategy = config.strategies[name]
+    if entry:
+        strategy = replace(strategy, entry=replace(strategy.entry, **entry))
+    strategy = replace(
+        strategy,
+        order=replace(strategy.order, slippage_rate=0.0),
+        risk=replace(strategy.risk, risk_per_trade=0.02, one_lot_max_risk=0.02),
+    )
+    market = replace(
+        config.markets[MARKET_HK],
+        commission_rate=0.0,
+        min_commission=0.0,
+        platform_fee=0.0,
+        stamp_duty_rate=0.0,
+        exchange_fee_rate=0.0,
+        settlement_rate=0.0,
+    )
+    tactic = create_entry(name, strategy, price_axis=price_axis)
+    return tactic, strategy, market
+
+
+def _run_plugin(bars, name, price_axis="log", **entry):
+    tactic, strategy, market = _prepared(name, price_axis, **entry)
+    return run_account(
+        bars,
+        tactic,
+        strategy,
+        market,
+        lot_size=1,
+        capital=100_000.0,
+        price_axis=price_axis,
+    )
+
+
+def _breakout_ready(category=UP_CONTINUE, structure=UPTREND, close=101.0, a_t=1.0, signal_a_t=_KEEP):
+    bars = [_rb(index, 100, 100, 99, 100, a_t=a_t) for index in range(20)]
+    bars.append(_rb(
+        20,
+        100,
+        max(100.0, close),
+        99,
+        close,
+        structure=structure,
+        category=category,
+        a_t=a_t if signal_a_t is _KEEP else signal_a_t,
+    ))
+    return bars
+
+
+def _pullback_week(
+    pullback_index=1,
+    last_category=UP_CONTINUE,
+    last_structure=UPTREND,
+    close=101.0,
+    ema=100.0,
+    a_t=1.0,
+    last_a_t=_KEEP,
+    last_gap=False,
+    direction=0,
+):
+    """7 根里，默认第 2 根是上涨回调，最后一根用来试信号。序号从 0 起。"""
+    bars = []
+    for index in range(6):
+        pullback = index == pullback_index
+        bars.append(_rb(
+            index,
+            100,
+            100,
+            90 if pullback else 99,
+            99 if pullback else 100,
+            category=UP_PULLBACK if pullback else UP_CONTINUE,
+            a_t=a_t,
+            phase_start_index=pullback_index if pullback else None,
+            direction_start_index=direction,
+        ))
+    bars.append(_rb(
+        6,
+        100,
+        max(100.0, close),
+        99,
+        close,
+        structure=last_structure,
+        category=last_category,
+        a_t=a_t if last_a_t is _KEEP else last_a_t,
+        ema=ema,
+        gap_before=last_gap,
+        direction_start_index=direction,
+    ))
+    return bars
+
+
+class EntryPluginTests(unittest.TestCase):
+    def test_registry_refuses_a_plugin_without_a_stop(self):
+        config = load_trend_config(today=date(2026, 10, 13))
+        self.assertEqual(list_entries(), ["breakout", "pullback"])
+        first = create_entry("breakout", config.strategies["breakout"], price_axis="log")
+        second = create_entry("breakout", config.strategies["breakout"], price_axis="log")
+        self.assertIsNot(first, second)
+        self.assertTrue(first.allows_add)
+        self.assertEqual(first.entry.lookback, 20)
+        self.assertEqual(first.entry.buffer, 0.2)
+        self.assertEqual(first.entry.stop_lookback, 4)
+        self.assertEqual(first.entry.stop_buffer, 0.3)
+        pullback = create_entry("pullback", config.strategies["pullback"], price_axis="log")
+        self.assertFalse(pullback.allows_add)
+        self.assertEqual(pullback.entry.lookback, 5)
+        self.assertEqual(pullback.entry.break_lookback, 3)
+        import analysis.backtest.trend.entries.pullback as pullback_module
+        self.assertIn("跌回 EMA10", pullback_module.__doc__)
+        self.assertIn("反弹最高价", pullback_module.__doc__)
+        with self.assertRaisesRegex(KeyError, "未知入场策略"):
+            create_entry("grid", config.strategies["breakout"], price_axis="log")
+        with self.assertRaisesRegex(ValueError, "价格轴"):
+            create_entry("breakout", config.strategies["breakout"], price_axis="raw")
+        with self.assertRaises(TypeError):
+            create_entry("pullback", config.strategies["breakout"], price_axis="log")
+
+        class Bare(EntryTactic):
+            name = "bare"
+            provides_stop = False
+
+        register_entry(Bare)
+        try:
+            with self.assertRaisesRegex(ValueError, "没有止损"):
+                create_entry("bare", config.strategies["breakout"], price_axis="log")
+        finally:
+            from analysis.backtest.trend.entries.registry import _REGISTRY
+            _REGISTRY.pop("bare", None)
+
+    def test_breakout_triggers_only_in_uptrend_birth_or_continuation(self):
+        tactic, _, _ = _prepared("breakout", "uniform")
+        birth = tactic.propose(_breakout_ready(UP_BIRTH))
+        continuation = tactic.propose(_breakout_ready(UP_CONTINUE))
+        self.assertIsNotNone(birth)
+        self.assertIsNotNone(continuation)
+        self.assertIn("上涨初生", birth.text)
+        self.assertIn("上涨延续", continuation.text)
+        blocked = (
+            (UPTREND, UP_PULLBACK),
+            (UPTREND, UP_EXHAUSTION),
+            (DOWNTREND, DOWN_BIRTH),
+            (DOWNTREND, UP_CONTINUE),
+        )
+        for structure, category in blocked:
+            with self.subTest(structure=structure, category=category):
+                self.assertIsNone(tactic.propose(_breakout_ready(category, structure)))
+        ready = _breakout_ready()
+        self.assertIsNone(tactic.propose(ready[1:]))
+        self.assertIsNone(tactic.propose(_breakout_ready(signal_a_t=None)))
+
+    def test_pullback_needs_a_prior_pullback_in_the_same_uptrend(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        signal = tactic.propose(_pullback_week())
+        self.assertIsNotNone(signal)
+        self.assertIn("上涨延续", signal.text)
+        self.assertIn("起点序号 1", signal.text)
+        self.assertAlmostEqual(signal.adjusted_stop, 89.7)
+        self.assertIsNone(tactic.propose(_pullback_week(pullback_index=0)))
+        self.assertIsNone(tactic.propose(_pullback_week(last_category=UP_BIRTH)))
+        self.assertIsNone(tactic.propose(_pullback_week(last_category=UP_EXHAUSTION)))
+        self.assertIsNone(tactic.propose(_pullback_week(last_a_t=None)))
+        self.assertIsNone(tactic.propose(_pullback_week(ema=None)))
+        first = [
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 99, 100),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 101, 96, 101, category=UP_PULLBACK, phase_start_index=3, ema=100),
+        ]
+        self.assertIsNone(tactic.propose(first))
+
+    def test_pullback_can_trigger_while_the_pullback_is_still_underway(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        bars = [
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 99, 100),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 100, 96, 99, category=UP_PULLBACK, phase_start_index=3),
+            _rb(4, 100, 101, 97, 101, category=UP_PULLBACK, phase_start_index=3, ema=100),
+        ]
+        signal = tactic.propose(bars)
+        self.assertIsNotNone(signal)
+        self.assertIn("上涨回调", signal.text)
+        self.assertAlmostEqual(signal.adjusted_stop, 95.7)
+
+    def test_pullback_forgets_a_pullback_after_the_uptrend_breaks(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        self.assertIsNotNone(tactic.propose(self._rejoined(False)))
+        self.assertIsNone(tactic.propose(self._rejoined(True)))
+        self.assertIsNotNone(tactic.propose(self._relabeled(False)))
+        self.assertIsNone(tactic.propose(self._relabeled(True)))
+
+    def test_gap_clears_pullback_memory(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        cleared = self._after_gap(remember=False)
+        self.assertIsNone(tactic.propose(cleared))
+        fresh = self._after_gap(remember=True)
+        signal = tactic.propose(fresh)
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(signal.adjusted_stop, 95.7)
+        self.assertIn("起点序号 2", signal.text)
+        prefix = fresh[:-1]
+        self.assertIsNone(tactic.propose(prefix + [_rb(
+            6, 100, 101, 99, 101, ema=100, gap_before=True,
+        )]))
+
+    def test_pullback_stop_uses_the_latest_segment_start(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        latest = tactic.propose([
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 80, 99, category=UP_PULLBACK, phase_start_index=1),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 100, 99, 100),
+            _rb(4, 100, 100, 96, 99, category=UP_PULLBACK, phase_start_index=4),
+            _rb(5, 100, 100, 98, 100),
+            _rb(6, 100, 101, 97, 101, ema=100),
+        ])
+        self.assertAlmostEqual(latest.adjusted_stop, 95.7)
+        self.assertIn("起点序号 4", latest.text)
+
+        earlier_than_window = tactic.propose([
+            _rb(0, 100, 100, 80, 99, category=UP_PULLBACK, phase_start_index=0),
+            _rb(1, 100, 100, 95, 99, category=UP_PULLBACK, phase_start_index=0),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 100, 99, 100),
+            _rb(4, 100, 100, 99, 100),
+            _rb(5, 100, 100, 99, 100),
+            _rb(6, 100, 101, 99, 101, ema=100),
+        ])
+        self.assertAlmostEqual(earlier_than_window.adjusted_stop, 79.7)
+        self.assertIn("起点序号 0", earlier_than_window.text)
+
+        bounded = tactic.propose([
+            _rb(0, 100, 100, 70, 100),
+            _rb(1, 100, 100, 90, 99, category=UP_PULLBACK, phase_start_index=1),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 100, 99, 100),
+            _rb(4, 100, 100, 99, 100),
+            _rb(5, 100, 100, 99, 100),
+            _rb(6, 100, 101, 99, 101, ema=100),
+        ])
+        self.assertAlmostEqual(bounded.adjusted_stop, 89.7)
+        self.assertIn("起点序号 1", bounded.text)
+
+    def test_range_and_pending_states_do_not_open(self):
+        breakout, _, _ = _prepared("breakout", "uniform")
+        pullback, _, _ = _prepared("pullback", "uniform")
+        blocked = (
+            (RANGE, ACCUMULATION),
+            (RANGE, DISTRIBUTION),
+            (RANGE, NEUTRAL),
+            (UNDECIDED, PENDING),
+            (UPTREND, ACCUMULATION),
+            (UPTREND, DISTRIBUTION),
+            (UPTREND, NEUTRAL),
+            (UPTREND, PENDING),
+            (None, INSUFFICIENT),
+            (DOWNTREND, DOWN_BIRTH),
+        )
+        for structure, category in blocked:
+            with self.subTest(structure=structure, category=category):
+                self.assertIsNone(breakout.propose(_breakout_ready(category, structure)))
+                self.assertIsNone(pullback.propose(_pullback_week(last_category=category, last_structure=structure)))
+
+    def test_plugins_read_their_own_parameters(self):
+        above = [
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 99, 100),
+            _rb(2, 100, 100.1, 99, 100.1),
+        ]
+        loose, _, _ = _prepared("breakout", "uniform", lookback=2, buffer=0, stop_lookback=0, stop_buffer=0.3)
+        tight, _, _ = _prepared("breakout", "uniform", lookback=2, buffer=0.2, stop_lookback=0, stop_buffer=0.3)
+        self.assertIsNotNone(loose.propose(above))
+        self.assertIsNone(tight.propose(above))
+
+        stops = [
+            _rb(0, 100, 100, 90, 100),
+            _rb(1, 100, 100, 94, 100),
+            _rb(2, 100, 100, 94, 100),
+            _rb(3, 100, 100, 94, 100),
+            _rb(4, 100, 101, 95, 100.5),
+        ]
+        wide, _, _ = _prepared("breakout", "uniform", lookback=4, buffer=0, stop_lookback=4, stop_buffer=0.3)
+        narrow, _, _ = _prepared("breakout", "uniform", lookback=4, buffer=0, stop_lookback=0, stop_buffer=0.3)
+        self.assertAlmostEqual(wide.propose(stops).adjusted_stop, 89.7)
+        self.assertAlmostEqual(narrow.propose(stops).adjusted_stop, 94.7)
+
+        memory = [
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 96, 99, category=UP_PULLBACK, phase_start_index=1),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 101, 99, 101, ema=100),
+        ]
+        short, _, _ = _prepared("pullback", "uniform", lookback=1, break_lookback=2, stop_buffer=0.3)
+        longer, _, _ = _prepared("pullback", "uniform", lookback=2, break_lookback=2, stop_buffer=0.3)
+        touched, _, _ = _prepared("pullback", "uniform", lookback=2, break_lookback=2, stop_buffer=0)
+        self.assertIsNone(short.propose(memory))
+        self.assertAlmostEqual(longer.propose(memory).adjusted_stop, 95.7)
+        self.assertAlmostEqual(touched.propose(memory).adjusted_stop, 96)
+
+    def test_signals_use_adjusted_prices(self):
+        tactic, _, _ = _prepared(
+            "breakout", "uniform", lookback=2, buffer=0.2, stop_lookback=1, stop_buffer=0.3,
+        )
+        signal = tactic.propose([
+            _rb(0, 50, 50, 40, 50, factor=2),
+            _rb(1, 50, 50, 40, 50, factor=2),
+            _rb(2, 50, 50.2, 40, 50.2, factor=2),
+        ])
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(signal.adjusted_stop, 79.7)
+
+    def test_log_axis_uses_a_multiplicative_buffer(self):
+        a_t = 0.02
+        threshold = 100 * math.exp(0.2 * a_t)
+        additive = 100 + 0.2 * a_t
+        self.assertGreater(100.2, additive)
+        self.assertLess(100.2, threshold)
+        self.assertGreater(100.41, threshold)
+        tactic, _, _ = _prepared("breakout", "log")
+        self.assertIsNone(tactic.propose(self._breakout_close(100.2, a_t)))
+        self.assertIsNone(tactic.propose(self._breakout_close(threshold, a_t)))
+        prefix = self._breakout_close(100.41, a_t)
+        signal = tactic.propose(prefix)
+        stop = 99 * math.exp(-0.3 * a_t)
+        self.assertAlmostEqual(signal.adjusted_stop, stop)
+        self.assertNotAlmostEqual(signal.adjusted_stop, 99 - 0.3 * a_t, places=4)
+        self.assertIn("乘以 e^", signal.text)
+        self.assertIn("策略 A", signal.text)
+        filled = prefix + [_rb(21, 100.41, 100.8, 100.2, 100.41, a_t=a_t)]
+        result = _run_plugin(filled, "breakout", "log")
+        entry = _by(result, "入场")
+        self.assertEqual(len(entry), 1)
+        self.assertEqual(entry[0].index, 21)
+        self.assertEqual(_by(result, "取消"), [])
+        self.assertAlmostEqual(entry[0].adjusted_stop, stop)
+        self.assertIn("乘以 e^", entry[0].text)
+        self.assertEqual(result.equity[20].shares, 0)
+        self.assertGreater(result.equity[21].shares, 0)
+
+        pullback, _, _ = _prepared("pullback", "log")
+        blocked = self._pullback_axis(a_t, math.log(110) + 0.01)
+        self.assertIsNone(pullback.propose(blocked))
+        b_prefix = self._pullback_axis(a_t, math.log(110) - 0.01)
+        b_stop = 105 * math.exp(-0.3 * a_t)
+        b_signal = pullback.propose(b_prefix)
+        self.assertAlmostEqual(b_signal.adjusted_stop, b_stop)
+        self.assertNotAlmostEqual(b_signal.adjusted_stop, 105 - 0.3 * a_t, places=3)
+        self.assertIn("乘以 e^", b_signal.text)
+        b_filled = b_prefix + [_rb(7, 110, 111, 109, 110, a_t=a_t)]
+        b_result = _run_plugin(b_filled, "pullback", "log")
+        b_entry = _by(b_result, "入场")[0]
+        self.assertEqual(b_entry.index, 7)
+        self.assertAlmostEqual(b_entry.adjusted_stop, b_stop)
+        self.assertGreater(b_entry.shares_after, 0)
+
+    def test_uniform_axis_uses_an_additive_buffer(self):
+        a_t = 5.0
+        multiplicative = 100 * math.exp(0.2 * a_t)
+        self.assertLess(100.5, 101)
+        self.assertGreater(102, 101)
+        self.assertLess(102, multiplicative)
+        tactic, _, _ = _prepared("breakout", "uniform")
+        self.assertIsNone(tactic.propose(self._breakout_close(100.5, a_t)))
+        self.assertIsNone(tactic.propose(self._breakout_close(101, a_t)))
+        prefix = self._breakout_close(102, a_t)
+        signal = tactic.propose(prefix)
+        self.assertAlmostEqual(signal.adjusted_stop, 97.5)
+        self.assertNotAlmostEqual(signal.adjusted_stop, 99 * math.exp(-0.3 * a_t), places=1)
+        self.assertIn("加上", signal.text)
+        self.assertIn("减去", signal.text)
+        filled = prefix + [_rb(21, 102, 103, 100, 102, a_t=a_t)]
+        result = _run_plugin(filled, "breakout", "uniform")
+        entry = _by(result, "入场")[0]
+        self.assertEqual(entry.index, 21)
+        self.assertAlmostEqual(entry.adjusted_stop, 97.5)
+        self.assertEqual(entry.shares_after, 444)
+        self.assertEqual(result.equity[20].shares, 0)
+        self.assertEqual(result.equity[21].shares, 444)
+
+        pullback, _, _ = _prepared("pullback", "uniform")
+        self.assertIsNone(pullback.propose(self._pullback_axis(2, 110, close=110)))
+        self.assertIsNone(pullback.propose(self._pullback_axis(2, 100, close=108)))
+        b_prefix = self._pullback_axis(2, 109)
+        b_signal = pullback.propose(b_prefix)
+        self.assertAlmostEqual(b_signal.adjusted_stop, 104.4)
+        self.assertNotAlmostEqual(b_signal.adjusted_stop, 105 * math.exp(-0.6), places=1)
+        self.assertIn("减去", b_signal.text)
+        b_result = _run_plugin(b_prefix + [_rb(7, 110, 111, 109, 110, a_t=2)], "pullback", "uniform")
+        b_entry = _by(b_result, "入场")[0]
+        self.assertEqual(b_entry.index, 7)
+        self.assertAlmostEqual(b_entry.adjusted_stop, 104.4)
+        self.assertGreater(b_entry.shares_after, 0)
+
+    def test_accounts_match_whether_run_alone_or_together(self):
+        bars = [
+            _rb(0, 100, 100, 99, 100, a_t=2),
+            _rb(1, 100, 100, 99, 100, a_t=2),
+            _rb(2, 100, 100, 99, 100, a_t=2),
+            _rb(3, 100, 103, 99, 102, a_t=2),
+            _rb(4, 102, 103, 101, 102, a_t=2),
+            _rb(5, 102, 104, 100.5, 104, a_t=2, category=UP_PULLBACK, phase_start_index=5, ema=100),
+            _rb(6, 104, 105, 100.5, 104.5, a_t=2, category=UP_PULLBACK, phase_start_index=5, ema=100),
+            _rb(7, 104.5, 106, 103, 105, a_t=2, category=UP_PULLBACK, phase_start_index=5, ema=100),
+        ]
+        solo_a = self._account(bars, "breakout")
+        solo_b = self._account(bars, "pullback")
+        pair_a, pair_b = self._account(bars, "breakout"), self._account(bars, "pullback")
+        again_a = self._account(bars, "breakout")
+        again_b = self._account(bars, "pullback")
+        self.assertEqual(_by(solo_a, "入场")[0].index, 4)
+        self.assertEqual(_by(solo_b, "入场")[0].index, 7)
+        self.assertAlmostEqual(_by(solo_a, "入场")[0].adjusted_stop, 98.4)
+        self.assertAlmostEqual(_by(solo_b, "入场")[0].adjusted_stop, 99.9)
+        self.assertEqual(_by(solo_a, "取消"), [])
+        self.assertEqual(_by(solo_b, "取消"), [])
+        self.assertEqual(_by(solo_a, "止损"), [])
+        self.assertEqual(_by(solo_b, "止损"), [])
+        self.assertNotEqual(solo_a, solo_b)
+        self.assertEqual(pair_a, solo_a)
+        self.assertEqual(pair_b, solo_b)
+        self.assertEqual(again_a, solo_a)
+        self.assertEqual(again_b, solo_b)
+        self.assertEqual(pair_a.final_shares, solo_a.final_shares)
+        self.assertEqual(pair_b.final_cash, solo_b.final_cash)
+
+    def _account(self, bars, name):
+        if name == "breakout":
+            return _run_plugin(
+                bars, name, "uniform", lookback=3, buffer=0.2, stop_lookback=1, stop_buffer=0.3,
+            )
+        return _run_plugin(bars, name, "uniform", lookback=3, break_lookback=2, stop_buffer=0.3)
+
+    def _breakout_close(self, close, a_t):
+        bars = [_rb(index, 100, 100, 99, 100, a_t=a_t) for index in range(20)]
+        bars.append(_rb(20, 100, max(100.0, close), 99, close, a_t=a_t))
+        return bars
+
+    def _pullback_axis(self, a_t, ema, close=110.0):
+        bars = []
+        for index in range(6):
+            pullback = index == 1
+            bars.append(_rb(
+                index,
+                108,
+                108,
+                105 if pullback else 106,
+                107 if pullback else 108,
+                a_t=a_t,
+                category=UP_PULLBACK if pullback else UP_CONTINUE,
+                phase_start_index=1 if pullback else None,
+            ))
+        bars.append(_rb(6, 108, max(108.0, close), 106, close, a_t=a_t, ema=ema))
+        return bars
+
+    def _rejoined(self, broken):
+        bars = []
+        for index in range(7):
+            if index <= 1:
+                category, low, close, direction, structure, phase = UP_PULLBACK, 80 if index == 0 else 90, 99, 0, UPTREND, 0
+            elif index == 6:
+                category, low, close, direction, structure, phase = UP_CONTINUE, 99, 101, 3 if broken else 0, UPTREND, None
+            elif index == 2 and broken:
+                category, low, close, direction, structure, phase = NEUTRAL, 99, 100, 2, RANGE, None
+            else:
+                category = UP_BIRTH if index == 3 and broken else UP_CONTINUE
+                low, close, direction, structure, phase = 99, 100, 3 if broken else 0, UPTREND, None
+            bars.append(_rb(
+                index,
+                100,
+                101 if index == 6 else 100,
+                low,
+                close,
+                structure=structure,
+                category=category,
+                phase_start_index=phase,
+                direction_start_index=direction,
+                ema=100 if index == 6 else None,
+            ))
+        return bars
+
+    def _relabeled(self, changed):
+        bars = []
+        for index in range(7):
+            pullback = index == 1
+            direction = 0 if index <= 1 or not changed else 7
+            bars.append(_rb(
+                index,
+                100,
+                101 if index == 6 else 100,
+                90 if pullback else 99,
+                101 if index == 6 else (99 if pullback else 100),
+                category=UP_PULLBACK if pullback else UP_CONTINUE,
+                phase_start_index=1 if pullback else None,
+                direction_start_index=direction,
+                ema=100 if index == 6 else None,
+            ))
+        return bars
+
+    def _after_gap(self, remember):
+        if not remember:
+            return [
+                _rb(0, 100, 100, 80, 99, category=UP_PULLBACK, phase_start_index=0),
+                _rb(1, 100, 100, 90, 99, category=UP_PULLBACK, phase_start_index=0),
+                _rb(2, 100, 100, 99, 100, gap_before=True),
+                _rb(3, 100, 100, 99, 100),
+                _rb(4, 100, 100, 99, 100),
+                _rb(5, 100, 100, 99, 100),
+                _rb(6, 100, 101, 99, 101, ema=100),
+            ]
+        return [
+            _rb(0, 100, 100, 70, 100),
+            _rb(1, 100, 100, 70, 100),
+            _rb(2, 100, 100, 96, 99, category=UP_PULLBACK, phase_start_index=2, gap_before=True),
+            _rb(3, 100, 100, 97, 99, category=UP_PULLBACK, phase_start_index=2),
+            _rb(4, 100, 100, 99, 100),
+            _rb(5, 100, 100, 99, 100),
+            _rb(6, 100, 101, 99, 101, ema=100),
+        ]
 
 
 if __name__ == "__main__":

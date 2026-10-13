@@ -79,7 +79,12 @@ def run_empty_session(bars: pd.DataFrame, capital: float) -> EngineResult:
 
 @dataclass(frozen=True)
 class ReplayBar:
-    """手写或由磁带拼出来的一根 K 线。价格是不复权价，因子把它们换回复权价。"""
+    """手写或由磁带拼出来的一根 K 线。价格是不复权价，因子把它们换回复权价。
+
+    `ema` 在对数轴上是几何价格，和阶段方法的快均线同一套坐标。
+    `phase_start_index`、`direction_start_index` 是这段 bars 里的序号。
+    结构间断和方向段用来清掉回调记忆。
+    """
 
     time: str
     open: float
@@ -93,6 +98,9 @@ class ReplayBar:
     ema: Optional[float] = None
     dividend: float = 0.0
     split: float = 1.0
+    gap_before: bool = False
+    phase_start_index: Optional[int] = None
+    direction_start_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
