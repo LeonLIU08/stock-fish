@@ -6,6 +6,7 @@ import math
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,7 +14,17 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from analysis.backtest.trend.config import load_trend_config, load_trend_yaml, trend_config_from_mapping
-from analysis.backtest.trend.prices import CorporateAction, adjust_prices
+from analysis.backtest.trend.markets import HK as MARKET_HK, US as MARKET_US, parse_symbol, trade_fees
+from analysis.backtest.trend.prices import (
+    CorporateAction,
+    Holding,
+    adjust_prices,
+    dividend_credit,
+    long_stop_hit,
+    raw_from_adjusted,
+    replay_holding,
+    upward_gap_cancel,
+)
 from analysis.backtest.trend.runner import run_trend_backtest
 from analysis.backtest.trend.session import run_empty_session
 from analysis.backtest.trend.tape import (
@@ -483,6 +494,252 @@ class TapeTests(unittest.TestCase):
                     self.assertIn("stats", raw)
                     found = True
         self.assertTrue(found)
+
+
+def _series_ohlc():
+    closes = [100.0, 110.0, 105.0, 120.0, 130.0, 125.0]
+    opens = [100.0, 100.0, 110.0, 105.0, 120.0, 130.0]
+    highs = [101.0, 112.0, 106.0, 121.0, 132.0, 131.0]
+    lows = [99.0, 108.0, 104.0, 119.0, 128.0, 124.0]
+    volumes = [1000.0, 800.0, 900.0, 2000.0, 700.0, 600.0]
+    return opens, highs, lows, closes, volumes
+
+
+class PriceMarketTests(unittest.TestCase):
+    def test_hand_calculated_factors_preserve_log_returns(self):
+        opens, highs, lows, closes, volumes = _series_ohlc()
+        adjusted = adjust_prices(
+            opens[:4],
+            highs[:4],
+            lows[:4],
+            closes[:4],
+            volumes[:4],
+            [
+                CorporateAction(2, "dividend", 5.0),
+                CorporateAction(3, "split", 2.0),
+            ],
+        )
+        dividend_factor = 110.0 / 105.0
+        self.assertEqual(adjusted.factor, (1.0, 1.0, dividend_factor, dividend_factor * 2.0))
+        self.assertEqual(adjusted.split_ratio, (1.0, 1.0, 1.0, 2.0))
+        self.assertAlmostEqual(adjusted.close[0], 100.0)
+        self.assertAlmostEqual(adjusted.close[1], 110.0)
+        self.assertAlmostEqual(adjusted.close[2], 105.0 * dividend_factor)
+        self.assertAlmostEqual(adjusted.open[2], 110.0 * dividend_factor)
+        self.assertAlmostEqual(adjusted.high[2], 106.0 * dividend_factor)
+        self.assertAlmostEqual(adjusted.low[2], 104.0 * dividend_factor)
+        self.assertAlmostEqual(adjusted.close[3], 120.0 * dividend_factor * 2.0)
+        self.assertAlmostEqual(adjusted.open[3], 105.0 * dividend_factor * 2.0)
+        self.assertEqual(adjusted.volume[2], 900.0)
+        self.assertAlmostEqual(adjusted.volume[3], 1000.0)
+        for index in range(1, 4):
+            raw_return = math.log(closes[index] / closes[index - 1])
+            adjusted_return = math.log(adjusted.close[index] / adjusted.close[index - 1])
+            factor_return = math.log(adjusted.factor[index] / adjusted.factor[index - 1])
+            self.assertAlmostEqual(adjusted_return, raw_return + factor_return)
+        self.assertAlmostEqual(math.log(adjusted.close[1] / adjusted.close[0]), math.log(110.0 / 100.0))
+
+    def test_future_dividend_does_not_change_past_prices_or_decisions(self):
+        opens, highs, lows, closes, volumes = _series_ohlc()
+        past = [
+            CorporateAction(2, "dividend", 5.0),
+            CorporateAction(3, "split", 2.0),
+        ]
+        holding = Holding(shares=100, cash=1000, adjusted_stop=80)
+        original, original_rows, original_holding = replay_holding(
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            past,
+            holding,
+            withholding=0.3,
+            currency="HKD",
+            times=[f"2024-01-0{index + 1}" for index in range(6)],
+        )
+        changed, changed_rows, _ = replay_holding(
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            past + [CorporateAction(5, "dividend", 1.0)],
+            holding,
+            withholding=0.3,
+            currency="HKD",
+            times=[f"2024-01-0{index + 1}" for index in range(6)],
+        )
+        self.assertEqual(original.close[:4], changed.close[:4])
+        self.assertEqual(original.open[:4], changed.open[:4])
+        self.assertEqual(original.high[:4], changed.high[:4])
+        self.assertEqual(original.low[:4], changed.low[:4])
+        self.assertEqual(original.factor[:4], changed.factor[:4])
+        past_rows = [row.canonical() for row in original_rows if row.index <= 3]
+        changed_past = [row.canonical() for row in changed_rows if row.index <= 3]
+        self.assertEqual(past_rows, changed_past)
+        self.assertEqual(len(past_rows), 2)
+        self.assertGreater(changed.factor[5], original.factor[5])
+        dividend = original_rows[0]
+        self.assertEqual(dividend.action, "派息入账")
+        self.assertAlmostEqual(dividend.cash_credited, 350.0)
+        self.assertAlmostEqual(dividend.tax, 150.0)
+        self.assertEqual(dividend.shares_after, 100)
+        self.assertAlmostEqual(dividend.cash_after, 1350.0)
+        self.assertIn("入账现金 350 HKD", dividend.text)
+        split = original_rows[1]
+        self.assertEqual(split.shares_before, 100)
+        self.assertEqual(split.shares_after, 200)
+        self.assertEqual(split.cash_before, split.cash_after)
+        self.assertAlmostEqual(split.raw_stop * split.factor, 80.0)
+        self.assertAlmostEqual(original_holding.shares, 200)
+        self.assertAlmostEqual(original_holding.cash, 1350)
+        self.assertEqual(original_holding.adjusted_stop, 80)
+
+    def test_ex_dividend_gap_does_not_stop_out_or_look_like_a_gap(self):
+        opens = [100.0, 80.0]
+        highs = [101.0, 81.0]
+        lows = [99.0, 78.0]
+        closes = [100.0, 80.0]
+        volumes = [1000.0, 1000.0]
+        adjusted = adjust_prices(
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            [CorporateAction(1, "dividend", 20.0)],
+        )
+        self.assertAlmostEqual(adjusted.factor[1], 1.25)
+        self.assertAlmostEqual(adjusted.open[1], 100.0)
+        self.assertAlmostEqual(adjusted.close[1], 100.0)
+        raw_stop = raw_from_adjusted(90.0, adjusted.factor[1])
+        self.assertAlmostEqual(raw_stop, 72.0)
+        self.assertGreater(lows[1], raw_stop)
+        self.assertLess(lows[1], 90.0)
+        self.assertFalse(long_stop_hit(lows[1], 90.0, adjusted.factor[1]))
+        self.assertFalse(long_stop_hit(opens[1], 90.0, adjusted.factor[1]))
+        self.assertTrue(long_stop_hit(72.0, 90.0, adjusted.factor[1]))
+        a_t = 0.02
+        self.assertGreater(math.log(closes[0] / opens[1]), 0.5 * a_t)
+        self.assertFalse(upward_gap_cancel(opens[1], adjusted.factor[1], adjusted.close[0], a_t, 0.5))
+        threshold = 100.0 * math.exp(0.5 * a_t)
+        self.assertFalse(upward_gap_cancel(threshold, 1.0, 100.0, a_t, 0.5))
+        self.assertTrue(upward_gap_cancel(threshold + 0.01, 1.0, 100.0, a_t, 0.5))
+        self.assertFalse(upward_gap_cancel(101.0, 1.0, 100.0, 2.0, 0.5, price_axis="uniform"))
+        self.assertTrue(upward_gap_cancel(101.01, 1.0, 100.0, 2.0, 0.5, price_axis="uniform"))
+
+        credited = dividend_credit(200, 20, 0.0)
+        self.assertEqual(credited.cash, 4000.0)
+        self.assertEqual(credited.tax, 0.0)
+        withheld = dividend_credit(200, 20, 0.3)
+        self.assertEqual(withheld.cash, 2800.0)
+        self.assertEqual(withheld.tax, 1200.0)
+
+    def test_split_scales_shares_and_keeps_the_adjusted_stop(self):
+        opens = [100.0, 50.0]
+        highs = [101.0, 52.0]
+        lows = [99.0, 48.0]
+        closes = [100.0, 50.0]
+        volumes = [1000.0, 2000.0]
+        _, rows, holding = replay_holding(
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            [CorporateAction(1, "split", 2.0)],
+            Holding(shares=100, cash=5000, adjusted_stop=80),
+            withholding=0.0,
+            currency="USD",
+        )
+        self.assertEqual(holding.shares, 200)
+        self.assertEqual(holding.cash, 5000)
+        self.assertEqual(holding.adjusted_stop, 80)
+        decision = rows[0]
+        self.assertEqual(decision.action, "拆股")
+        self.assertEqual(decision.cash_before, decision.cash_after)
+        self.assertAlmostEqual(decision.factor, 2.0)
+        self.assertAlmostEqual(decision.raw_stop, 40.0)
+        self.assertAlmostEqual(decision.raw_stop * decision.factor, decision.adjusted_stop)
+        self.assertFalse(long_stop_hit(lows[1], 80.0, decision.factor))
+        self.assertLess(lows[1], 80.0)
+        self.assertIn("现金不变仍为 5000 USD", decision.text)
+
+        reverse = adjust_prices(
+            [100.0, 200.0],
+            [101.0, 202.0],
+            [99.0, 198.0],
+            [100.0, 200.0],
+            [1000.0, 500.0],
+            [CorporateAction(1, "split", 0.5)],
+        )
+        self.assertAlmostEqual(reverse.close[1], 100.0)
+        self.assertAlmostEqual(reverse.volume[1], 1000.0)
+        signal = reverse.close[0]
+        self.assertGreater(200.0, signal * math.exp(0.5 * 0.02))
+        self.assertFalse(upward_gap_cancel(200.0, reverse.factor[1], signal, 0.02, 0.5))
+
+    def test_hk_and_us_trade_fees(self):
+        config = load_trend_config(today=date(2026, 10, 13))
+        hk = config.markets[MARKET_HK]
+        us = config.markets[MARKET_US]
+        buy = trade_fees(hk, side="buy", notional=10000, shares=100)
+        sell = trade_fees(hk, side="sell", notional=10000, shares=100)
+        self.assertEqual(buy.commission, 3.0)
+        self.assertEqual(buy.stamp_duty, 10.0)
+        self.assertAlmostEqual(buy.exchange_fee, 0.85)
+        self.assertAlmostEqual(buy.settlement_fee, 0.2)
+        self.assertEqual(buy.sec_fee, 0.0)
+        self.assertEqual(buy.taf, 0.0)
+        self.assertAlmostEqual(buy.total, 14.05)
+        self.assertEqual(sell.stamp_duty, buy.stamp_duty)
+        self.assertEqual(sell.commission, buy.commission)
+        self.assertEqual(sell.sec_fee, 0.0)
+        self.assertEqual(trade_fees(hk, side="buy", notional=10001, shares=100).stamp_duty, 11.0)
+        self.assertEqual(trade_fees(hk, side="buy", notional=100, shares=100).commission, 3.0)
+        self.assertEqual(trade_fees(hk, side="sell", notional=100, shares=100).stamp_duty, 1.0)
+        with_platform = trade_fees(replace(hk, platform_fee=15), side="buy", notional=10000, shares=100)
+        self.assertEqual(with_platform.platform_fee, 15.0)
+        self.assertAlmostEqual(with_platform.total, 29.05)
+
+        us_buy = trade_fees(us, side="buy", notional=5000, shares=100)
+        us_sell = trade_fees(us, side="sell", notional=5000, shares=100)
+        self.assertEqual(us_buy.commission, 1.0)
+        self.assertEqual(us_buy.stamp_duty, 0.0)
+        self.assertEqual(us_buy.sec_fee, 0.0)
+        self.assertEqual(us_buy.taf, 0.0)
+        self.assertEqual(us_sell.stamp_duty, 0.0)
+        self.assertAlmostEqual(us_sell.sec_fee, 0.139)
+        self.assertAlmostEqual(us_sell.taf, 0.0166)
+        self.assertEqual(us_sell.commission, 1.0)
+        large_buy = trade_fees(us, side="buy", notional=2_000_000, shares=100_000)
+        large_sell = trade_fees(us, side="sell", notional=2_000_000, shares=100_000)
+        self.assertEqual(large_buy.commission, 500.0)
+        self.assertEqual(large_buy.sec_fee, 0.0)
+        self.assertEqual(large_buy.taf, 0.0)
+        self.assertEqual(large_sell.commission, 500.0)
+        self.assertAlmostEqual(large_sell.sec_fee, 55.6)
+        self.assertEqual(large_sell.taf, 8.3)
+        capped = trade_fees(us, side="buy", notional=10, shares=1)
+        self.assertAlmostEqual(capped.commission, 0.1)
+
+    def test_symbol_codes_and_default_withholding(self):
+        self.assertEqual(parse_symbol("700"), parse_symbol("00700.HK"))
+        self.assertEqual(parse_symbol("700").code, "00700")
+        self.assertEqual(parse_symbol("700").market, MARKET_HK)
+        self.assertEqual(parse_symbol("NVDA").code, "NVDA")
+        self.assertEqual(parse_symbol("NVDA.US").market, MARKET_US)
+        self.assertEqual(parse_symbol("NVDA"), parse_symbol("NVDA.US"))
+        with self.assertRaisesRegex(ValueError, "A 股"):
+            parse_symbol("600519")
+        config = load_trend_config(today=date(2026, 10, 13))
+        self.assertEqual(config.markets[MARKET_HK].dividend_withholding, 0.0)
+        self.assertEqual(config.markets[MARKET_US].dividend_withholding, 0.3)
+        self.assertEqual(config.symbols[0].dividend_withholding, 0.0)
+        self.assertEqual(config.symbols[2].dividend_withholding, 0.3)
+        self.assertEqual(dividend_credit(100, 2, config.markets[MARKET_HK].dividend_withholding).cash, 200)
+        self.assertEqual(dividend_credit(100, 2, config.markets[MARKET_US].dividend_withholding).cash, 140)
 
 
 if __name__ == "__main__":
