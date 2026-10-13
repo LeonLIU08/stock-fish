@@ -26,7 +26,11 @@ from analysis.backtest.trend.prices import (
     upward_gap_cancel,
 )
 from analysis.backtest.trend.runner import run_trend_backtest
-from analysis.backtest.trend.session import run_empty_session
+from analysis.backtest.trend.entries.base import EntrySignal, EntryTactic
+from analysis.backtest.trend.fills import entry_cancel_reason
+from analysis.backtest.trend.exits import long_trend_failed, next_long_stop, reduce_shares
+from analysis.backtest.trend.risk import estimate_cost_per_share, size_position
+from analysis.backtest.trend.session import ReplayBar, run_account, run_empty_session
 from analysis.backtest.trend.tape import (
     build_tape,
     canonical_row,
@@ -34,7 +38,21 @@ from analysis.backtest.trend.tape import (
     true_range_units,
 )
 from analysis.structure.config import PARAM_VERSION_V6, default_params
-from analysis.structure.methods.phase import _Run
+from analysis.structure.methods.phase import (
+    DOWN_BIRTH,
+    DOWNTREND,
+    INSUFFICIENT,
+    NEUTRAL,
+    PENDING,
+    RANGE,
+    UNDECIDED,
+    UP_BIRTH,
+    UP_CONTINUE,
+    UP_EXHAUSTION,
+    UP_PULLBACK,
+    UPTREND,
+    _Run,
+)
 from analysis.structure.series import build_series
 from analysis.structure.snapshot import build_snapshot
 from analysis.structure.view_model import display_snapshot
@@ -740,6 +758,603 @@ class PriceMarketTests(unittest.TestCase):
         self.assertEqual(config.symbols[2].dividend_withholding, 0.3)
         self.assertEqual(dividend_credit(100, 2, config.markets[MARKET_HK].dividend_withholding).cash, 200)
         self.assertEqual(dividend_credit(100, 2, config.markets[MARKET_US].dividend_withholding).cash, 140)
+
+
+class _Script(EntryTactic):
+    name = "script"
+
+    def __init__(self, signals):
+        self.signals = signals
+        self.calls = []
+
+    def propose(self, bars):
+        self.calls.append(len(bars) - 1)
+        return self.signals.get(len(bars) - 1)
+
+
+def _bar(time, open_, high, low, close, **kw):
+    return ReplayBar(
+        time=time,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        structure=kw.pop("structure", UPTREND),
+        category=kw.pop("category", UP_CONTINUE),
+        a_t=kw.pop("a_t", 5.0),
+        factor=kw.pop("factor", 1.0),
+        dividend=kw.pop("dividend", 0.0),
+        split=kw.pop("split", 1.0),
+    )
+    if kw:
+        raise TypeError(sorted(kw))
+
+
+def _calm(time, **kw):
+    return _bar(time, 100, 102, 96, 101, **kw)
+
+
+def _sig(stop=90.0, text="测试入场"):
+    return EntrySignal(stop, text)
+
+
+def _account(bars, signals, **kw):
+    config = load_trend_config(today=date(2026, 10, 13))
+    strategy = config.strategies["breakout"]
+    risk = {"risk_per_trade": 0.02}
+    risk.update(kw.pop("risk", {}))
+    order = {"slippage_rate": 0.0}
+    order.update(kw.pop("order", {}))
+    exit_over = kw.pop("exit", {})
+    strategy = replace(
+        strategy,
+        risk=replace(strategy.risk, **risk),
+        order=replace(strategy.order, **order),
+    )
+    if exit_over:
+        strategy = replace(strategy, exit=replace(strategy.exit, **exit_over))
+    market = replace(
+        config.markets[MARKET_HK],
+        commission_rate=0.0,
+        min_commission=0.0,
+        platform_fee=0.0,
+        stamp_duty_rate=0.0,
+        exchange_fee_rate=0.0,
+        settlement_rate=0.0,
+    )
+    market_over = kw.pop("market", {})
+    if market_over:
+        market = replace(market, **market_over)
+    lot_size = kw.pop("lot_size", 100)
+    capital = kw.pop("capital", 100_000.0)
+    price_axis = kw.pop("price_axis", "uniform")
+    withholding = kw.pop("withholding", 0.0)
+    if kw:
+        raise TypeError(sorted(kw))
+    tactic = _Script(signals)
+    result = run_account(
+        bars,
+        tactic,
+        strategy,
+        market,
+        lot_size=lot_size,
+        capital=capital,
+        price_axis=price_axis,
+        withholding=withholding,
+    )
+    return result, tactic
+
+
+def _by(result, action):
+    return [row for row in result.decisions if row.action == action]
+
+
+class AccountRuleTests(unittest.TestCase):
+    def test_position_size_takes_the_smallest_constraint_then_rounds_to_lots(self):
+        market = self._market()
+        sized = size_position(
+            equity=100_000,
+            cash=30_000,
+            open_price=100,
+            raw_stop=90,
+            lot_size=100,
+            risk_per_trade=0.05,
+            one_lot_max_risk=0.05,
+            max_gross_exposure=0.25,
+            slippage_rate=0,
+            market=market,
+        )
+        self.assertEqual((sized.q_risk, sized.q_cash, sized.q_cap), (500, 300, 250))
+        self.assertEqual(sized.shares, 200)
+        self.assertFalse(sized.one_lot)
+        self.assertAlmostEqual(sized.planned_risk, 0.02)
+
+        cash_bound = size_position(
+            equity=100_000, cash=15_000, open_price=100, raw_stop=90, lot_size=100,
+            risk_per_trade=0.05, one_lot_max_risk=0.05, max_gross_exposure=1,
+            slippage_rate=0, market=market,
+        )
+        self.assertEqual(cash_bound.q_cash, 150)
+        self.assertEqual(cash_bound.shares, 100)
+
+        risk_bound = size_position(
+            equity=100_000, cash=100_000, open_price=100, raw_stop=90, lot_size=100,
+            risk_per_trade=0.01, one_lot_max_risk=0.02, max_gross_exposure=1,
+            slippage_rate=0, market=market,
+        )
+        self.assertEqual(risk_bound.q_risk, 100)
+        self.assertEqual(risk_bound.shares, 100)
+
+        capped = size_position(
+            equity=100_000, cash=100_000, open_price=100, raw_stop=90, lot_size=100,
+            risk_per_trade=0.005, one_lot_max_risk=0.02, max_gross_exposure=0.05,
+            slippage_rate=0, market=market,
+        )
+        self.assertEqual(capped.shares, 0)
+        self.assertEqual(capped.reason, "占用上限")
+        self.assertFalse(capped.one_lot)
+
+    def test_estimated_cost_ignores_per_order_fees_and_changes_the_share_count(self):
+        plain = self._market()
+        rated = replace(plain, commission_rate=0.01, min_commission=50, platform_fee=15)
+        self.assertAlmostEqual(estimate_cost_per_share(rated, 100, 90, 0.001), 1.99)
+        self.assertAlmostEqual(
+            estimate_cost_per_share(rated, 100, 90, 0.001),
+            estimate_cost_per_share(replace(rated, min_commission=0, platform_fee=0), 100, 90, 0.001),
+        )
+        kwargs = dict(
+            equity=100_000, cash=100_000, open_price=100, raw_stop=90, lot_size=1,
+            risk_per_trade=0.01, one_lot_max_risk=0.02, max_gross_exposure=1, slippage_rate=0,
+        )
+        self.assertEqual(size_position(market=plain, **kwargs).shares, 100)
+        self.assertEqual(size_position(market=replace(plain, commission_rate=0.01), **kwargs).shares, 84)
+
+        tight = dict(
+            equity=100_000, cash=10_010, open_price=100, raw_stop=90, lot_size=1,
+            risk_per_trade=0.05, one_lot_max_risk=0.05, max_gross_exposure=1, slippage_rate=0,
+        )
+        self.assertEqual(size_position(market=plain, **tight).q_cash, 100)
+        self.assertEqual(size_position(market=replace(plain, platform_fee=15), **tight).q_cash, 99)
+        self.assertEqual(
+            size_position(market=plain, **tight).q_risk,
+            size_position(market=replace(plain, platform_fee=15), **tight).q_risk,
+        )
+
+        us = load_trend_config(today=date(2026, 10, 13)).markets[MARKET_US]
+        self.assertAlmostEqual(estimate_cost_per_share(us, 100, 90, 0.0005), 0.057668)
+
+    def test_one_lot_rule_buys_rounds_or_cancels(self):
+        bought, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.005, "one_lot_max_risk": 0.01},
+        )
+        entry = _by(bought, "入场")[0]
+        self.assertEqual(entry.shares_after, 100)
+        self.assertTrue(entry.one_lot)
+        self.assertAlmostEqual(entry.planned_risk, 0.01)
+        self.assertIn("风险预算不够一手，按一手规则买入，计划风险", entry.text)
+
+        closed, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.005, "one_lot_max_risk": 0},
+        )
+        self.assertEqual(_by(closed, "入场"), [])
+        cancel = _by(closed, "取消")[0]
+        self.assertEqual(cancel.reason, "风险预算")
+        self.assertIn("一手规则已关闭", cancel.text)
+
+        exceeded, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.005, "one_lot_max_risk": 0.009},
+        )
+        self.assertEqual(_by(exceeded, "取消")[0].reason, "风险预算")
+        self.assertIn("一手规则也不够", _by(exceeded, "取消")[0].text)
+
+    def test_account_floors_the_risk_budget_to_a_whole_lot(self):
+        result, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.025},
+        )
+        entry = _by(result, "入场")[0]
+        self.assertEqual(entry.shares_after, 200)
+        self.assertFalse(entry.one_lot)
+        self.assertAlmostEqual(entry.planned_risk, 0.02)
+
+    def test_cash_and_exposure_each_cancel_on_their_own(self):
+        cash, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            capital=10_050,
+            market={"min_commission": 60},
+            risk={"risk_per_trade": 0.2, "one_lot_max_risk": 0.2},
+        )
+        self.assertEqual(_by(cash, "取消")[0].reason, "现金")
+        self.assertEqual(_by(cash, "入场"), [])
+
+        cap, _ = _account(
+            [_calm("d0"), _calm("d1")],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.05, "one_lot_max_risk": 0.05, "max_gross_exposure": 0.05},
+        )
+        self.assertEqual(_by(cap, "取消")[0].reason, "占用上限")
+
+    def test_gap_distance_and_open_through_stop_cancel_before_a_fill(self):
+        self.assertIsNone(entry_cancel_reason(
+            raw_open=101, factor=1, adjusted_stop=90, adjusted_signal_close=100,
+            a_t=2, gap_cancel=0.5, max_stop_distance=20, price_axis="uniform",
+        ))
+        self.assertEqual(entry_cancel_reason(
+            raw_open=101.01, factor=1, adjusted_stop=90, adjusted_signal_close=100,
+            a_t=2, gap_cancel=0.5, max_stop_distance=20, price_axis="uniform",
+        ), "跳空")
+        self.assertIsNone(entry_cancel_reason(
+            raw_open=88, factor=1, adjusted_stop=80, adjusted_signal_close=88,
+            a_t=2, gap_cancel=0.5, max_stop_distance=4, price_axis="uniform",
+        ))
+        self.assertEqual(entry_cancel_reason(
+            raw_open=88.01, factor=1, adjusted_stop=80, adjusted_signal_close=88,
+            a_t=2, gap_cancel=0.5, max_stop_distance=4, price_axis="uniform",
+        ), "止损距离")
+        self.assertEqual(entry_cancel_reason(
+            raw_open=80, factor=1, adjusted_stop=80, adjusted_signal_close=100,
+            a_t=5, gap_cancel=0.5, max_stop_distance=4, price_axis="uniform",
+        ), "开盘价不高于止损")
+
+        held, _ = _account(
+            [_bar("d0", 100, 101, 99, 100, a_t=2), _bar("d1", 101, 102, 95, 101, a_t=2)],
+            {0: _sig()},
+            order={"max_stop_distance": 20},
+        )
+        self.assertEqual(len(_by(held, "入场")), 1)
+        gapped, _ = _account(
+            [_bar("d0", 100, 101, 99, 100, a_t=2), _bar("d1", 101.01, 102, 95, 101.01, a_t=2)],
+            {0: _sig()},
+            order={"max_stop_distance": 20},
+        )
+        self.assertEqual(_by(gapped, "取消")[0].reason, "跳空")
+        self.assertEqual(_by(gapped, "入场"), [])
+
+        exact, _ = _account(
+            [_bar("d0", 88, 89, 87, 88, a_t=2), _bar("d1", 88, 89, 85, 88, a_t=2)],
+            {0: _sig(80)},
+        )
+        self.assertEqual(len(_by(exact, "入场")), 1)
+        far, _ = _account(
+            [_bar("d0", 88, 89, 87, 88, a_t=2), _bar("d1", 88.01, 89, 85, 88.01, a_t=2)],
+            {0: _sig(80)},
+        )
+        self.assertEqual(_by(far, "取消")[0].reason, "止损距离")
+
+        touched, _ = _account(
+            [_bar("d0", 100, 101, 99, 100), _bar("d1", 80, 81, 79, 80)],
+            {0: _sig(80)},
+        )
+        self.assertEqual(_by(touched, "取消")[0].reason, "开盘价不高于止损")
+        self.assertEqual(_by(touched, "止损"), [])
+
+    def test_birth_does_not_trail_and_a_new_high_cannot_stop_out_the_same_bar(self):
+        result, tactic = _account(
+            [
+                _bar("d0", 100, 101, 99, 100, category=UP_BIRTH),
+                _bar("d1", 100, 140, 96, 120, category=UP_BIRTH),
+                _bar("d2", 120, 140, 110, 130, category=UP_BIRTH),
+                _bar("d3", 130, 140, 100, 135, category=UP_CONTINUE),
+                _bar("d4", 130, 140, 126, 132, category=UP_CONTINUE, a_t=40),
+            ],
+            {0: _sig()},
+        )
+        self.assertEqual(tactic.calls, [0])
+        self.assertEqual(_by(result, "止损"), [])
+        self.assertEqual(result.equity[1].next_stop, 90)
+        self.assertEqual(result.equity[2].next_stop, 90)
+        self.assertGreater(result.equity[2].shares, 0)
+        self.assertEqual(result.equity[3].effective_stop, 90)
+        self.assertEqual(result.equity[3].next_stop, 125)
+        self.assertEqual(result.equity[4].effective_stop, 125)
+        self.assertEqual(result.equity[4].next_stop, 125)
+
+        states = ("up_continue", "up_pullback")
+        self.assertEqual(next_long_stop(
+            90, 140, 5, buffer=3, price_axis="uniform", category=UP_BIRTH, trail_states=states,
+        ), 90)
+        self.assertEqual(next_long_stop(
+            90, 140, 5, buffer=3, price_axis="uniform", category=UP_CONTINUE, trail_states=states,
+        ), 125)
+        self.assertEqual(next_long_stop(
+            125, 140, 40, buffer=3, price_axis="uniform", category=UP_CONTINUE, trail_states=states,
+        ), 125)
+        self.assertEqual(next_long_stop(
+            90, 130, 5, buffer=3, price_axis="uniform", category=UP_PULLBACK, trail_states=states,
+        ), 115)
+
+    def test_log_trail_is_multiplicative_and_waits_for_the_next_bar(self):
+        expected = 110 * math.exp(-0.15)
+        result, _ = _account(
+            [
+                _bar("d0", 100, 101, 99, 100, a_t=0.05),
+                _bar("d1", 100, 110, 93, 105, a_t=0.05),
+                _bar("d2", 93, 95, 92, 94, a_t=0.05),
+            ],
+            {0: _sig()},
+            price_axis="log",
+        )
+        self.assertEqual(_by(result, "止损")[0].index, 2)
+        self.assertEqual(_by(result, "止损")[0].reason, "跳空穿过止损")
+        self.assertAlmostEqual(_by(result, "止损")[0].price, 93)
+        self.assertEqual(result.equity[1].effective_stop, 90)
+        self.assertAlmostEqual(result.equity[1].next_stop, expected)
+        self.assertEqual([row.index for row in _by(result, "止损")], [2])
+
+    def test_old_stop_still_fills_when_the_same_bar_makes_a_new_high(self):
+        result, _ = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 100, 140, 89, 100)],
+            {0: _sig()},
+        )
+        stop = _by(result, "止损")
+        self.assertEqual(len(stop), 1)
+        self.assertEqual(stop[0].index, 2)
+        self.assertEqual(stop[0].reason, "盘中触及止损")
+        self.assertEqual(stop[0].price, 90)
+        self.assertEqual(stop[0].raw_stop, 90)
+
+    def test_intraday_stop_happens_before_the_close_state(self):
+        result, _ = _account(
+            [
+                _calm("d0"),
+                _calm("d1"),
+                _bar("d2", 100, 110, 89, 100, structure=RANGE, category=NEUTRAL),
+                _calm("d3", structure=RANGE, category=NEUTRAL),
+            ],
+            {0: _sig()},
+        )
+        self.assertEqual(_by(result, "趋势退出"), [])
+        stop = _by(result, "止损")[0]
+        self.assertEqual(stop.index, 2)
+        self.assertEqual(stop.price, 90)
+        self.assertEqual(stop.reason, "盘中触及止损")
+
+    def test_a_gap_through_the_stop_fills_at_the_open_and_can_lose_more_than_planned(self):
+        result, _ = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 70, 72, 60, 71)],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.01},
+        )
+        stop = _by(result, "止损")[0]
+        self.assertEqual(stop.reason, "跳空穿过止损")
+        self.assertEqual(stop.price, 70)
+        self.assertEqual(stop.raw_stop, 90)
+        self.assertAlmostEqual(stop.planned_risk, 0.01)
+        self.assertAlmostEqual(stop.actual_loss_fraction, 0.03)
+        self.assertGreater(stop.actual_loss_fraction, stop.planned_risk)
+        self.assertAlmostEqual(result.final_cash, 97_000)
+
+        equal, _ = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 90, 92, 80, 91)],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.01},
+        )
+        touched = _by(equal, "止损")[0]
+        self.assertEqual(touched.reason, "跳空穿过止损")
+        self.assertEqual(touched.price, 90)
+
+    def test_slippage_hurts_the_position_and_a_stop_ignores_the_daily_trade_cap(self):
+        result, _ = _account(
+            [_calm("d0"), _bar("d1", 100, 102, 89, 101)],
+            {0: _sig()},
+            order={"slippage_rate": 0.001, "max_trades_per_day": 1},
+        )
+        entry = _by(result, "入场")[0]
+        stop = _by(result, "止损")[0]
+        self.assertAlmostEqual(entry.price, 100.1)
+        self.assertAlmostEqual(stop.price, 89.91)
+        self.assertEqual(result.final_shares, 0)
+
+    def test_exhaustion_reduces_once_and_a_new_position_can_reduce_again(self):
+        once, _ = _account(
+            [
+                _calm("d0"),
+                _calm("d1"),
+                _calm("d2", category=UP_EXHAUSTION),
+                _calm("d3", category=UP_EXHAUSTION),
+                _calm("d4", category=UP_EXHAUSTION),
+                _bar("d5", 100, 130, 96, 120),
+            ],
+            {0: _sig()},
+            exit={"reduce_fraction": 0.5},
+        )
+        reduces = _by(once, "减仓")
+        self.assertEqual([row.index for row in reduces], [3])
+        self.assertEqual(reduces[0].reason, "衰竭减仓")
+        self.assertEqual(reduces[0].shares_before, 200)
+        self.assertEqual(reduces[0].shares_after, 100)
+        self.assertEqual(once.equity[4].shares, 100)
+        self.assertEqual(once.equity[5].shares, 100)
+        self.assertEqual(once.equity[5].next_stop, 115)
+
+        flat, _ = _account(
+            [_calm("d0"), _calm("d1"), _calm("d2", category=UP_EXHAUSTION), _calm("d3", category=UP_EXHAUSTION)],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.01},
+        )
+        flatten = _by(flat, "减仓")[0]
+        self.assertEqual(flatten.reason, "取整全平")
+        self.assertIn("取整", flatten.text)
+        self.assertEqual(flatten.shares_after, 0)
+
+        again, _ = _account(
+            [
+                _calm("d0"), _calm("d1"),
+                _calm("d2", category=UP_EXHAUSTION),
+                _calm("d3", category=UP_EXHAUSTION),
+                _calm("d4"),
+                _calm("d5", category=UP_EXHAUSTION),
+                _calm("d6", category=UP_EXHAUSTION),
+            ],
+            {0: _sig(), 3: _sig()},
+            risk={"risk_per_trade": 0.01},
+        )
+        self.assertEqual([row.index for row in _by(again, "入场")], [1, 4])
+        self.assertEqual([row.index for row in _by(again, "减仓")], [3, 6])
+        self.assertNotIn(3, [row.index for row in _by(again, "入场")])
+
+        kept, _ = _account(
+            [
+                _calm("d0"), _calm("d1"),
+                _calm("d2", category=UP_EXHAUSTION),
+                _calm("d3", category=UP_EXHAUSTION),
+            ],
+            {0: _sig()},
+            exit={"exhaustion_action": "none"},
+        )
+        self.assertEqual(_by(kept, "减仓"), [])
+        self.assertEqual(kept.equity[-1].shares, 200)
+
+        deferred, _ = _account(
+            [
+                _calm("d0"),
+                _calm("day"),
+                _calm("d2", category=UP_EXHAUSTION),
+                _calm("day", category=UP_EXHAUSTION),
+                _calm("d4", category=UP_EXHAUSTION),
+            ],
+            {0: _sig()},
+            order={"max_trades_per_day": 1},
+        )
+        self.assertEqual([row.index for row in _by(deferred, "减仓")], [4])
+        self.assertEqual(deferred.equity[3].shares, 200)
+        self.assertEqual(deferred.equity[4].shares, 100)
+
+    def test_pullback_holds_and_trends_the_stop_without_exiting(self):
+        result, tactic = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 100, 130, 96, 120, category=UP_PULLBACK)],
+            {0: _sig()},
+        )
+        self.assertEqual(tactic.calls, [0])
+        self.assertEqual(_by(result, "趋势退出"), [])
+        self.assertEqual(_by(result, "减仓"), [])
+        self.assertEqual(result.equity[2].shares, 200)
+        self.assertEqual(result.equity[2].next_stop, 115)
+
+    def test_trend_failure_flattens_next_bar_and_does_not_open_a_short(self):
+        cases = (
+            (RANGE, NEUTRAL),
+            (UNDECIDED, PENDING),
+            (DOWNTREND, DOWN_BIRTH),
+            (None, INSUFFICIENT),
+        )
+        for structure, category in cases:
+            with self.subTest(structure=structure):
+                result, tactic = _account(
+                    [
+                        _calm("d0"),
+                        _calm("d1"),
+                        _calm("d2", structure=structure, category=category),
+                        _calm("d3", structure=structure, category=category),
+                        _calm("d4", structure=structure, category=category),
+                    ],
+                    {0: _sig(), 3: _sig()},
+                )
+                exit_row = _by(result, "趋势退出")[0]
+                self.assertEqual(exit_row.index, 3)
+                self.assertEqual(exit_row.price, 100)
+                self.assertGreater(exit_row.shares_before, 0)
+                self.assertEqual(exit_row.shares_after, 0)
+                self.assertIn("不开反向仓", exit_row.text)
+                self.assertEqual([row.index for row in _by(result, "入场")], [1, 4])
+                self.assertNotIn(3, [row.index for row in _by(result, "入场")])
+                self.assertTrue(all(row.shares_after >= 0 for row in result.decisions))
+                self.assertNotIn(1, tactic.calls)
+                self.assertNotIn(2, tactic.calls)
+
+        self.assertTrue(long_trend_failed(RANGE))
+        self.assertTrue(long_trend_failed(None))
+        self.assertFalse(long_trend_failed(UPTREND))
+
+    def test_trend_failure_and_exhaustion_on_the_same_bar_flatten_once(self):
+        result, _ = _account(
+            [
+                _calm("d0"),
+                _calm("d1"),
+                _calm("d2", structure=RANGE, category=UP_EXHAUSTION),
+                _calm("d3", structure=RANGE, category=UP_EXHAUSTION),
+            ],
+            {0: _sig()},
+        )
+        self.assertEqual(_by(result, "减仓"), [])
+        exit_row = _by(result, "趋势退出")[0]
+        self.assertEqual(exit_row.shares_after, 0)
+        self.assertIn("衰竭", exit_row.text)
+        self.assertIn("不开反向仓", exit_row.text)
+
+    def test_plugin_is_not_asked_while_a_position_is_open(self):
+        result, tactic = _account(
+            [_calm("d0"), _calm("d1"), _calm("d2"), _calm("d3")],
+            {0: _sig(), 1: _sig(), 2: _sig(), 3: _sig()},
+        )
+        self.assertEqual(tactic.calls, [0])
+        self.assertEqual(len(_by(result, "入场")), 1)
+        self.assertEqual(result.equity[-1].shares, 200)
+
+    def test_the_last_bar_does_not_invent_a_fill(self):
+        pending, _ = _account([_calm("d0")], {0: _sig()})
+        self.assertEqual(_by(pending, "取消")[0].reason, "没有下一根")
+        self.assertEqual(pending.final_shares, 0)
+
+        held, _ = _account(
+            [_calm("d0"), _calm("d1"), _calm("d2", structure=RANGE, category=NEUTRAL)],
+            {0: _sig()},
+        )
+        self.assertEqual(_by(held, "趋势退出"), [])
+        self.assertGreater(held.final_shares, 0)
+        self.assertEqual(held.equity[-1].shares, held.final_shares)
+
+    def test_dividend_and_split_do_not_look_like_a_stop(self):
+        dividend, _ = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 80, 82, 78, 80, factor=1.25, dividend=20)],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.01},
+            withholding=0.3,
+        )
+        self.assertEqual(_by(dividend, "止损"), [])
+        self.assertEqual(dividend.equity[2].shares, 100)
+        self.assertAlmostEqual(dividend.equity[2].cash, 91_400)
+        self.assertEqual(dividend.equity[2].effective_stop, 90)
+        self.assertAlmostEqual(dividend.equity[2].raw_stop, 72)
+        self.assertIn("入账现金 1400", _by(dividend, "派息入账")[0].text)
+
+        split, _ = _account(
+            [_calm("d0"), _calm("d1"), _bar("d2", 50, 52, 48, 50, factor=2, split=2)],
+            {0: _sig()},
+            risk={"risk_per_trade": 0.01},
+        )
+        self.assertEqual(_by(split, "止损"), [])
+        row = _by(split, "拆股")[0]
+        self.assertEqual(row.shares_before, 100)
+        self.assertEqual(row.shares_after, 200)
+        self.assertAlmostEqual(split.equity[2].cash, 90_000)
+        self.assertEqual(split.equity[2].effective_stop, 90)
+        self.assertAlmostEqual(split.equity[2].raw_stop, 45)
+
+    def test_reduce_share_counts(self):
+        self.assertEqual(reduce_shares(200, 0.5, 100), (100, False))
+        self.assertEqual(reduce_shares(300, 0.5, 100), (100, False))
+        self.assertEqual(reduce_shares(100, 0.5, 100), (100, True))
+
+    def _market(self):
+        config = load_trend_config(today=date(2026, 10, 13))
+        return replace(
+            config.markets[MARKET_HK],
+            commission_rate=0.0,
+            min_commission=0.0,
+            platform_fee=0.0,
+            stamp_duty_rate=0.0,
+            exchange_fee_rate=0.0,
+            settlement_rate=0.0,
+        )
 
 
 if __name__ == "__main__":

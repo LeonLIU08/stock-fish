@@ -6,12 +6,13 @@ from analysis.backtest.trend.config import (
     load_trend_config,
     trend_config_from_mapping,
 )
-from analysis.backtest.trend.session import run_empty_session
+from analysis.backtest.trend.session import run_account, run_empty_session
 
 __all__ = [
     "DEFAULT_TREND_CONFIG_PATH",
     "TrendStrategyConfig",
     "load_trend_config",
+    "run_account",
     "run_empty_session",
     "trend_config_from_mapping",
 ]
