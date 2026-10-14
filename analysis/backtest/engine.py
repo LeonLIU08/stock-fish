@@ -57,6 +57,14 @@ class Trade:
     equity_gross_after: float
     reason: str
     skipped: bool = False
+    action: str = ""
+    tactic: str = ""
+    stop_price: Optional[float] = None
+    planned_risk: Optional[float] = None
+    position_fraction: Optional[float] = None
+    basis: str = ""
+    one_lot: bool = False
+    shares_after: Optional[int] = None
 
 
 @dataclass

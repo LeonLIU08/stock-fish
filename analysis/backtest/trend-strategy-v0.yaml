@@ -3,7 +3,7 @@ version: trend-strategy-v0
 structure:
   param_version: structure-params-v6
   price_axis: log          # log | uniform
-  scale: mid               # short | mid | long
+  scale: short             # short | mid | long。短期更容易确认方向，信号更密
   # 传开盘、最高、最低、成交量。开盘价让阶段影线分可计算
 
 prices:                    # 第 4.4 节。第一期只接受这一组
@@ -46,7 +46,7 @@ markets:                   # 第 8.1 节。费率是初值，按券商对账单�
 
 universe:
   allow_short: false
-  symbols:                 # 可逐只写 lot_size、dividend_withholding。港股没写 lot_size 就失败
+  symbols:                 # 可逐只写 lot_size、dividend_withholding。港股没写 lot_size 就从 Longbridge 取
     - code: "00700"
       name: "腾讯控股"
       lot_size: 100
@@ -68,11 +68,11 @@ strategies:                # 每个策略一份完整参数，互不引用
     entry:
       lookback: 20
       buffer: 0.2
-      stop_lookback: 4     # 信号当根及此前 4 根
-      stop_buffer: 0.3
+      stop_lookback: 10    # 信号当根及此前 10 根，避免 4 根低点被普通回撤打掉
+      stop_buffer: 1.0
     order:
       gap_cancel: 0.5
-      max_stop_distance: 4.0        # 初稿是 3，第 8.2 节
+      max_stop_distance: 8.0        # 与更宽的初始止损一起放宽，否则进场会被取消
       slippage_rate: 0.0005
       max_trades_per_day: 2     # 不限制止损
     risk:
@@ -81,7 +81,7 @@ strategies:                # 每个策略一份完整参数，互不引用
       max_gross_exposure: 1.0
       point_value: null
     exit:
-      trail_buffer: 3.0
+      trail_buffer: 5.0             # 与更宽的初始止损一起放宽，避免第一天抬回最高价附近
       trail_states: [up_continue, up_pullback]
       reduce_fraction: 0.5
       reduce_rounding: floor_lot_else_flatten
@@ -90,10 +90,10 @@ strategies:                # 每个策略一份完整参数，互不引用
     entry:
       lookback: 5
       break_lookback: 3
-      stop_buffer: 0.3
+      stop_buffer: 1.0
     order:
       gap_cancel: 0.5
-      max_stop_distance: 4.0        # 初稿是 3，第 8.2 节
+      max_stop_distance: 8.0        # 与更宽的初始止损一起放宽，否则进场会被取消
       slippage_rate: 0.0005
       max_trades_per_day: 2
     risk:
@@ -102,11 +102,25 @@ strategies:                # 每个策略一份完整参数，互不引用
       max_gross_exposure: 1.0
       point_value: null
     exit:
-      trail_buffer: 3.0
+      trail_buffer: 5.0
       trail_states: [up_continue, up_pullback]
       reduce_fraction: 0.5
       reduce_rounding: floor_lot_else_flatten
       exhaustion_action: reduce
+  trend:                   # 策略 C。只看方向：短尺度上升出现后的下一根开盘买入，中尺度下降出现后的下一根开盘卖出
+    entry:
+      buy_scale: short     # 必须与 structure.scale 相同
+      sell_scale: mid
+    order:
+      gap_cancel: 0.5
+      slippage_rate: 0.0005
+      max_trades_per_day: 2
+    risk:
+      sizing: exposure     # 没有价格止损，按占用上限和现金买
+      max_gross_exposure: 1.0
+      point_value: null
+    exit:
+      mode: scale_downtrend
 
 benchmarks:                # 含股息的 ETF，按第 4.4 节同一口径
   tracker_fund:
@@ -137,5 +151,8 @@ runs:
     label: 策略 B，衰竭不减仓
     strategy: pullback
     exhaustion_action: none
+  - key: trend
+    label: 策略 C
+    strategy: trend
 
 output_dir: backtest_results

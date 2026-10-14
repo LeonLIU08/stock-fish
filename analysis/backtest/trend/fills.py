@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from analysis.backtest.trend.markets import trade_fees
@@ -99,11 +99,17 @@ def apply_split(shares: int, ratio: float) -> int:
         raise ValueError("股数必须是非负整数")
     if ratio <= 0:
         raise ValueError("拆股比例必须为正")
-    scaled = Decimal(shares) * Decimal(str(ratio))
-    whole = scaled.to_integral_value()
-    if scaled != whole:
-        raise ValueError(f"拆股后的股数不是整数: {scaled}")
-    return int(whole)
+    return whole_shares(Decimal(shares) * Decimal(str(ratio)))
+
+
+def whole_shares(value: Decimal) -> int:
+    """浮点误差贴着整数时收成整数。差得更多仍视为拆股不成整股。"""
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
+    nearest = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    if abs(value - nearest) <= Decimal("0.000001"):
+        return int(nearest)
+    raise ValueError(f"拆股后的股数不是整数: {value}")
 
 
 def _slip(raw_price: float, slippage: float, *, buy: bool) -> float:

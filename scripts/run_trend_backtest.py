@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """趋势状态策略回测。
 
-第一阶段对每只股票、每个 run 走取数、结构快照和空账户，并写出现有格式的报告。
-策略 A 和策略 B 仍是不同账户，这一阶段都不下单。
+每只股票、每个 run 一个账户。信号用复权价，成交用不复权价。
+策略 A、策略 B 和策略 C 分开记账。策略 C 在短尺度上升趋势出现后的下一根开盘买入，在中尺度下降趋势出现后的下一根开盘卖出。
 
 示例:
     /Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py
     /Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py \
-        --config analysis/backtest/trend-strategy-v0.yaml \
-        --symbols 00700,09988,NVDA --runs breakout,pullback --years 3
+        --symbols-file scripts/hkconnect_06Oct.txt --years 3
 """
 from __future__ import annotations
 
@@ -20,9 +19,25 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.backtest.trend.config import DEFAULT_TREND_CONFIG_PATH, load_trend_config
+from analysis.backtest.trend.config import (
+    DEFAULT_TREND_CONFIG_PATH,
+    load_trend_config,
+    read_symbol_file,
+)
+from analysis.backtest.trend.lots import fetch_hk_lot_sizes
 from analysis.backtest.trend.runner import run_trend_backtest
 from analysis.structure.series import NonPositivePriceError
+
+
+def _symbols(symbols: str | None, symbols_file: str | None) -> list | None:
+    codes = list(read_symbol_file(symbols_file)) if symbols_file else []
+    if symbols:
+        seen = set(codes)
+        for code in _csv(symbols):
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+    return codes or None
 
 
 def _csv(value: str) -> list:
@@ -37,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"YAML 配置路径，默认 {DEFAULT_TREND_CONFIG_PATH}",
     )
     parser.add_argument("--symbols", help="覆盖标的，逗号分隔")
+    parser.add_argument("--symbols-file", help="股票名单，一行一个代码。与 --symbols 同时写时合并，名单在前")
     parser.add_argument("--runs", help="覆盖要跑的 run，逗号分隔。不写则跑配置里的全部")
     parser.add_argument("--start", help="覆盖开始日期 YYYY-MM-DD")
     parser.add_argument("--end", help="覆盖结束日期 YYYY-MM-DD")
@@ -47,8 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
+    codes = _symbols(args.symbols, args.symbols_file)
     overrides = {
-        "symbols": _csv(args.symbols) if args.symbols else None,
+        "symbols": codes,
         "runs": _csv(args.runs) if args.runs else None,
         "start": args.start,
         "end": args.end,
@@ -56,15 +73,25 @@ def main(argv: list | None = None) -> int:
         "output_dir": args.output_dir,
     }
     try:
-        config = load_trend_config(args.config, overrides)
+        config = load_trend_config(args.config, overrides, lot_lookup=fetch_hk_lot_sizes)
         payload = run_trend_backtest(config)
     except (ValueError, RuntimeError, FileNotFoundError, OSError, NonPositivePriceError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    return _finish(payload)
+
+
+def _finish(payload: dict) -> int:
+    failures = list(payload.get("failures") or [])
     print(f"\n索引: {payload.get('index_html')}")
     print(f"报告: {payload.get('report_md')}")
     print(f"JSON: {Path(payload['output_dir']) / 'summary.json'}")
-    return 0
+    if not failures:
+        return 0
+    print(f"跳过 {len(failures)} 只", file=sys.stderr)
+    for item in failures:
+        print(f"{item['symbol']}: {item['error']}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

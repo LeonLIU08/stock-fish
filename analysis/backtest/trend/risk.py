@@ -100,6 +100,58 @@ def size_position(
     )
 
 
+def size_exposure(
+    *,
+    equity: float,
+    cash: float,
+    open_price: float,
+    lot_size: int,
+    max_gross_exposure: float,
+    market,
+) -> SizeResult:
+    """没有价格止损时，只按现金和占用上限取整到整手。"""
+    _require_lot(lot_size)
+    if open_price <= 0:
+        raise ValueError("开盘成交价必须为正")
+    if equity < 0 or cash < 0:
+        raise ValueError("净值和现金不能为负")
+    if not 0 < float(max_gross_exposure) <= 1:
+        raise ValueError("占用上限必须在 (0, 1]")
+    q_cash = _affordable_shares(cash, open_price, market)
+    q_cap = _floor_ratio(_decimal(equity) * _decimal(max_gross_exposure), _decimal(open_price))
+    shares = _floor_lot(min(q_cash, q_cap), lot_size)
+    reason = ""
+    if shares <= 0:
+        reason = "现金" if q_cash < lot_size else "占用上限"
+    planned = 0.0
+    if shares > 0 and equity > 0:
+        planned = float(_decimal(shares) * _decimal(open_price) / _decimal(equity))
+    counts = f"现金可买 {q_cash} 股，占用上限 {q_cap} 股"
+    if shares > 0:
+        text = (
+            f"没有价格止损，按占用上限 {format_percent(max_gross_exposure)} 和现金买入。"
+            f"{counts}，按每手 {lot_size} 股取整后 {shares} 股，"
+            f"名义仓位 {format_percent(planned)}。"
+        )
+    elif reason == "现金":
+        text = f"现金不足，股数取整为 0。{counts}。"
+    else:
+        text = f"占用上限把股数取成了 0。{counts}。"
+    return SizeResult(
+        shares=shares,
+        planned_risk=planned,
+        one_lot=False,
+        reason=reason,
+        text=text,
+        q_risk=q_cap,
+        q_cash=q_cash,
+        q_cap=q_cap,
+        open_price=float(open_price),
+        raw_stop=0.0,
+        cost_per_share=0.0,
+    )
+
+
 def format_percent(fraction: float) -> str:
     text = f"{float(fraction) * 100:.4f}".rstrip("0").rstrip(".")
     return f"{text or '0'}%"

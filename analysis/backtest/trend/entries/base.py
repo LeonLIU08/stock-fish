@@ -11,21 +11,36 @@ from analysis.structure.methods.phase import _STRUCTURE_NAME as STRUCTURE_NAMES
 
 @dataclass(frozen=True)
 class EntrySignal:
-    """`adjusted_stop` 是信号当根的复权止损。"""
+    """`adjusted_stop` 是信号当根的复权止损。策略 C 不设价格止损，这里是 None。"""
 
-    adjusted_stop: float
+    adjusted_stop: Optional[float]
     text: str
+
+
+SCALE_LABELS = {
+    "short": "短期",
+    "mid": "中期",
+    "long": "长期",
+}
+
+
+def scale_label(scale: Optional[str]) -> str:
+    if not scale:
+        return "该尺度"
+    return SCALE_LABELS.get(scale, scale)
 
 
 class EntryTactic:
     """一个账户只装一个插件。`bars` 停在信号当根，不含以后的 K 线。
 
-    `provides_stop` 为假的插件拒绝加载。`allows_add` 留给以后的加仓，第一期会话不用。
+    没有价格止损、也没有 `exit_kind == scale_downtrend` 的插件拒绝加载。
+    `allows_add` 留给以后的加仓，第一期会话不用。
     """
 
     name = ""
     provides_stop = False
     allows_add = False
+    exit_kind = ""
 
     def propose(self, bars: Sequence) -> Optional[EntrySignal]:
         if not bars or not self.allows(bars[-1]):
@@ -36,13 +51,22 @@ class EntryTactic:
         if not isinstance(signal, EntrySignal):
             raise TypeError("插件必须返回 EntrySignal 或 None")
         stop = signal.adjusted_stop
-        if isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(float(stop)):
-            raise ValueError("入场插件必须给出有限止损")
+        if self.provides_stop:
+            if isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(float(stop)):
+                raise ValueError("入场插件必须给出有限止损")
+        elif stop is not None:
+            raise ValueError("不设价格止损的插件不能返回止损价")
         return signal
 
     def allows(self, bar) -> bool:
         """当根的方向和主状态是否允许这个插件寻找入场。"""
         return False
+
+    def environment_block(self, bar) -> Optional[str]:
+        """环境不允许时返回原因。`propose` 被覆盖的测试插件不受影响。"""
+        if self.allows(bar):
+            return None
+        return "环境不允许"
 
     def trigger(self, bars: Sequence) -> Optional[EntrySignal]:
         raise NotImplementedError

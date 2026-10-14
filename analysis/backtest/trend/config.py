@@ -48,7 +48,6 @@ _CATEGORIES = frozenset({
     PENDING,
     INSUFFICIENT,
 })
-_STRATEGY_NAMES = ("breakout", "pullback")
 
 
 @dataclass(frozen=True)
@@ -139,9 +138,17 @@ class PullbackEntry:
 
 
 @dataclass(frozen=True)
+class TrendEntry:
+    """策略 C。买入尺度在加载时必须与 structure.scale 相同。"""
+
+    buy_scale: str
+    sell_scale: str
+
+
+@dataclass(frozen=True)
 class OrderSpec:
     gap_cancel: float
-    max_stop_distance: float
+    max_stop_distance: Optional[float]
     slippage_rate: float
     max_trades_per_day: int
 
@@ -152,6 +159,7 @@ class RiskSpec:
     one_lot_max_risk: float
     max_gross_exposure: float
     point_value: None
+    sizing: str = "stop"
 
 
 @dataclass(frozen=True)
@@ -161,12 +169,13 @@ class ExitSpec:
     reduce_fraction: float
     reduce_rounding: str
     exhaustion_action: str
+    mode: str = "price"
 
 
 @dataclass(frozen=True)
 class StrategySpec:
     name: str
-    entry: BreakoutEntry | PullbackEntry
+    entry: BreakoutEntry | PullbackEntry | TrendEntry
     order: OrderSpec
     risk: RiskSpec
     exit: ExitSpec
@@ -422,10 +431,13 @@ def load_trend_config(
     overrides: Optional[Mapping[str, Any]] = None,
     *,
     today: Optional[date] = None,
+    lot_lookup: Optional[Any] = None,
 ) -> TrendStrategyConfig:
     data = load_trend_yaml(path)
     source = str(data.pop("_config_path"))
-    return trend_config_from_mapping(data, overrides=overrides, source=source, today=today)
+    return trend_config_from_mapping(
+        data, overrides=overrides, source=source, today=today, lot_lookup=lot_lookup,
+    )
 
 
 def trend_config_from_mapping(
@@ -434,6 +446,7 @@ def trend_config_from_mapping(
     *,
     source: Optional[str] = None,
     today: Optional[date] = None,
+    lot_lookup: Optional[Any] = None,
 ) -> TrendStrategyConfig:
     payload = dict(data)
     config_path = source or payload.pop("_config_path", None)
@@ -470,8 +483,10 @@ def trend_config_from_mapping(
     symbols = _symbols(payload["universe"], markets)
     window = _window(payload["window"], today or date.today(), overrides or {})
     strategies = _strategies(payload["strategies"])
+    _check_trend_scale(structure, strategies)
     runs = _runs(payload["runs"], strategies, overrides or {})
-    symbols = _select_symbols(symbols, markets[US], overrides or {})
+    symbols = _select_symbols(symbols, markets, overrides or {})
+    symbols = _fill_missing_lots(symbols, lot_lookup)
     output_dir = _text(
         (overrides or {}).get("output_dir", payload["output_dir"]),
         "output_dir",
@@ -698,7 +713,8 @@ def _symbol(value: Any, index: int, markets: Mapping[str, HkMarket | UsMarket]) 
             raise ValueError(f"{label}.lot_size 必须 >= 1")
         lot_source = "config"
     elif parsed.market == HK:
-        raise ValueError(f"{parsed.code} 是港股，必须写 lot_size")
+        lot_size = 0
+        lot_source = "missing"
     else:
         if not isinstance(market, UsMarket):
             raise ValueError(f"{parsed.code} 缺少美股市场配置")
@@ -750,11 +766,14 @@ def _window(value: Any, today: date, overrides: Mapping[str, Any]) -> WindowSpec
 
 def _strategies(value: Any) -> Dict[str, StrategySpec]:
     row = _mapping(value, "strategies")
-    _exact(row, _STRATEGY_NAMES, "strategies")
-    return {
+    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend",))
+    specs = {
         "breakout": _strategy("breakout", row["breakout"]),
         "pullback": _strategy("pullback", row["pullback"]),
     }
+    if "trend" in row and row["trend"] is not None:
+        specs["trend"] = _strategy("trend", row["trend"])
+    return specs
 
 
 def _strategy(name: str, value: Any) -> StrategySpec:
@@ -762,10 +781,31 @@ def _strategy(name: str, value: Any) -> StrategySpec:
     row = _mapping(value, label)
     _exact(row, ("entry", "order", "risk", "exit"), label)
     if name == "breakout":
-        entry: BreakoutEntry | PullbackEntry = _breakout_entry(row["entry"])
-    else:
+        entry: BreakoutEntry | PullbackEntry | TrendEntry = _breakout_entry(row["entry"])
+        order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
+    elif name == "pullback":
         entry = _pullback_entry(row["entry"])
-    return StrategySpec(name, entry, _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name))
+        order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
+    elif name == "trend":
+        entry = _trend_entry(row["entry"])
+        order, risk, exit_spec = _trend_order(row["order"]), _trend_risk(row["risk"]), _trend_exit(row["exit"])
+    else:
+        raise ValueError(f"未知策略 {name}")
+    return StrategySpec(name, entry, order, risk, exit_spec)
+
+
+def _check_trend_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
+    trend = strategies.get("trend")
+    if trend is None:
+        return
+    entry = trend.entry
+    if not isinstance(entry, TrendEntry):
+        raise ValueError("strategies.trend 的入场参数类型不对")
+    if entry.buy_scale != structure.scale:
+        raise ValueError(
+            "策略 C 的买入尺度必须与 structure.scale 相同，"
+            f"收到 {entry.buy_scale} 和 {structure.scale}"
+        )
 
 
 def _breakout_entry(value: Any) -> BreakoutEntry:
@@ -799,6 +839,64 @@ def _pullback_entry(value: Any) -> PullbackEntry:
     )
 
 
+def _trend_entry(value: Any) -> TrendEntry:
+    label = "strategies.trend.entry"
+    row = _mapping(value, label)
+    _exact(row, ("buy_scale", "sell_scale"), label)
+    buy = _scale(row["buy_scale"], f"{label}.buy_scale")
+    sell = _scale(row["sell_scale"], f"{label}.sell_scale")
+    if buy == sell:
+        raise ValueError("策略 C 的买入尺度和卖出尺度不能相同")
+    return TrendEntry(buy, sell)
+
+
+def _scale(value: Any, label: str) -> str:
+    scale = _text(value, label).lower()
+    if scale not in _SCALES:
+        raise ValueError(f"{label} 必须是 short、mid、long 之一，收到 {scale}")
+    return scale
+
+
+def _trend_order(value: Any) -> OrderSpec:
+    label = "strategies.trend.order"
+    row = _mapping(value, label)
+    _exact(row, ("gap_cancel", "slippage_rate", "max_trades_per_day"), label)
+    trades = _int(row["max_trades_per_day"], f"{label}.max_trades_per_day")
+    if trades < 1:
+        raise ValueError(f"{label}.max_trades_per_day 必须 >= 1")
+    return OrderSpec(
+        _positive(_number(row["gap_cancel"], f"{label}.gap_cancel"), f"{label}.gap_cancel"),
+        None,
+        _positive(_number(row["slippage_rate"], f"{label}.slippage_rate"), f"{label}.slippage_rate", allow_zero=True),
+        trades,
+    )
+
+
+def _trend_risk(value: Any) -> RiskSpec:
+    label = "strategies.trend.risk"
+    row = _mapping(value, label)
+    _exact(row, ("sizing", "max_gross_exposure", "point_value"), label)
+    if row["point_value"] is not None:
+        raise ValueError(f"{label}.point_value 必须为空，第一期不支持期货每点价值")
+    sizing = _text(row["sizing"], f"{label}.sizing")
+    if sizing != "exposure":
+        raise ValueError(f"{label}.sizing 只接受 exposure，收到 {sizing}")
+    exposure = _number(row["max_gross_exposure"], f"{label}.max_gross_exposure")
+    if not 0 < exposure <= 1:
+        raise ValueError(f"{label}.max_gross_exposure 必须在 (0, 1]，第一期不使用杠杆")
+    return RiskSpec(0.0, 0.0, exposure, None, sizing="exposure")
+
+
+def _trend_exit(value: Any) -> ExitSpec:
+    label = "strategies.trend.exit"
+    row = _mapping(value, label)
+    _exact(row, ("mode",), label)
+    mode = _text(row["mode"], f"{label}.mode")
+    if mode != "scale_downtrend":
+        raise ValueError(f"{label}.mode 只接受 scale_downtrend，收到 {mode}")
+    return ExitSpec(0.0, (), 0.5, "floor_lot_else_flatten", "none", mode="scale_downtrend")
+
+
 def _order(value: Any, strategy: str) -> OrderSpec:
     label = f"strategies.{strategy}.order"
     row = _mapping(value, label)
@@ -829,7 +927,7 @@ def _risk(value: Any, strategy: str) -> RiskSpec:
     exposure = _number(row["max_gross_exposure"], f"{label}.max_gross_exposure")
     if not 0 < exposure <= 1:
         raise ValueError(f"{label}.max_gross_exposure 必须在 (0, 1]，第一期不使用杠杆")
-    return RiskSpec(risk, one_lot, exposure, None)
+    return RiskSpec(risk, one_lot, exposure, None, sizing="stop")
 
 
 def _exit(value: Any, strategy: str) -> ExitSpec:
@@ -862,6 +960,7 @@ def _exit(value: Any, strategy: str) -> ExitSpec:
         fraction,
         rounding,
         _exhaustion(row["exhaustion_action"], f"{label}.exhaustion_action"),
+        mode="price",
     )
 
 
@@ -900,6 +999,8 @@ def _runs(
         action = strategies[strategy_name].exit.exhaustion_action
         if "exhaustion_action" in row and row["exhaustion_action"] is not None:
             action = _exhaustion(row["exhaustion_action"], f"runs.{key}.exhaustion_action")
+        if strategies[strategy_name].exit.mode == "scale_downtrend" and action != "none":
+            raise ValueError(f"run {key} 是策略 C，不能减仓")
         specs.append(RunSpec(key, _text(row["label"], f"{label}.label"), strategy_name, action))
 
     selected = overrides.get("runs") if overrides else None
@@ -918,9 +1019,72 @@ def _runs(
     return tuple(by_key[key] for key in wanted)
 
 
+def read_symbol_file(path: str | Path) -> Tuple[str, ...]:
+    """读股票名单。一行一个代码，空行和 # 注释忽略，重复的只留第一次。"""
+    file = Path(path)
+    if not file.is_file():
+        raise FileNotFoundError(f"找不到股票列表: {file}")
+    ordered = []
+    seen = set()
+    for line in file.read_text(encoding="utf-8").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        for piece in text.replace("，", ",").replace("、", ",").split(","):
+            code = piece.strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            ordered.append(code)
+    if not ordered:
+        raise ValueError(f"{file} 里没有股票代码")
+    return tuple(ordered)
+
+
+def _fill_missing_lots(symbols: Sequence[SymbolSpec], lookup: Optional[Any]) -> Tuple[SymbolSpec, ...]:
+    missing = [item for item in symbols if item.lot_size_source == "missing"]
+    if not missing:
+        return tuple(symbols)
+    found: Mapping[str, Any] = {}
+    if lookup is not None:
+        found = lookup([item.code for item in missing]) or {}
+    filled = []
+    absent = []
+    for spec in symbols:
+        if spec.lot_size_source != "missing":
+            filled.append(spec)
+            continue
+        row = found.get(spec.code)
+        lot, name = _lot_row(row)
+        if lot is None:
+            absent.append(spec.code)
+            continue
+        filled.append(replace(
+            spec,
+            name=name if name and spec.name == spec.code else spec.name,
+            lot_size=lot,
+            lot_size_source="longbridge",
+        ))
+    if absent:
+        joined = ", ".join(absent)
+        raise ValueError(f"这些港股没有 lot_size，Longbridge 也没有返回：{joined}")
+    return tuple(filled)
+
+
+def _lot_row(row: Any) -> Tuple[Optional[int], Optional[str]]:
+    if not row:
+        return None, None
+    lot = row[0]
+    name = row[1] if len(row) > 1 else None
+    if isinstance(lot, bool) or not isinstance(lot, int) or lot < 1:
+        return None, None
+    text = str(name).strip() if name else None
+    return lot, text or None
+
+
 def _select_symbols(
     symbols: Sequence[SymbolSpec],
-    us_market: UsMarket,
+    markets: Mapping[str, HkMarket | UsMarket],
     overrides: Mapping[str, Any],
 ) -> Tuple[SymbolSpec, ...]:
     selected = overrides.get("symbols") if overrides else None
@@ -944,15 +1108,23 @@ def _select_symbols(
             chosen.append(by_code[parsed.code])
             continue
         if parsed.market == HK:
-            raise ValueError(f"{parsed.code} 是港股，必须写 lot_size")
+            chosen.append(SymbolSpec(
+                parsed.code,
+                parsed.code,
+                HK,
+                0,
+                "missing",
+                markets[HK].dividend_withholding,
+            ))
+            continue
         chosen.append(
             SymbolSpec(
                 parsed.code,
                 parsed.code,
                 US,
-                us_market.lot_size,
+                markets[US].lot_size,
                 "market_default",
-                us_market.dividend_withholding,
+                markets[US].dividend_withholding,
             )
         )
     return tuple(chosen)

@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import math
 import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from analysis.backtest.trend.config import load_trend_config, load_trend_yaml, trend_config_from_mapping
+from analysis.backtest.trend.config import (
+    load_trend_config,
+    load_trend_yaml,
+    read_symbol_file,
+    trend_config_from_mapping,
+)
 from analysis.backtest.trend.markets import HK as MARKET_HK, US as MARKET_US, parse_symbol, trade_fees
 from analysis.backtest.trend.prices import (
     CorporateAction,
@@ -25,13 +32,18 @@ from analysis.backtest.trend.prices import (
     replay_holding,
     upward_gap_cancel,
 )
+from analysis.backtest.report import render_html_case
+from analysis.backtest.trend.audit import audit_summary
+from analysis.backtest.trend.baselines import simulate_buy_hold, simulate_even_dca, split_adjusted_price
 from analysis.backtest.trend.entries import create_entry, list_entries
+from analysis.backtest.trend.feed import enclose_ohlc, restore_traded_prices
+from analysis.backtest.trend.fills import whole_shares
 from analysis.backtest.trend.entries.base import EntrySignal, EntryTactic
 from analysis.backtest.trend.entries.registry import register_entry
 from analysis.backtest.trend.fills import entry_cancel_reason
 from analysis.backtest.trend.exits import long_trend_failed, next_long_stop, reduce_shares
 from analysis.backtest.trend.risk import estimate_cost_per_share, size_position
-from analysis.backtest.trend.runner import run_trend_backtest
+from analysis.backtest.trend.runner import _case_config, run_trend_backtest
 from analysis.backtest.trend.session import ReplayBar, run_account, run_empty_session
 from analysis.backtest.trend.tape import (
     build_tape,
@@ -102,14 +114,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.symbols[2].lot_size_source, "market_default")
         self.assertEqual(config.symbols[2].dividend_withholding, 0.3)
         self.assertEqual(config.symbols[0].dividend_withholding, 0.0)
-        self.assertEqual(config.structure.scale, "mid")
+        self.assertEqual(config.structure.scale, "short")
         self.assertEqual(config.structure.param_version, "structure-params-v6")
         self.assertEqual([run.key for run in config.runs], [
             "breakout",
             "breakout_no_reduce",
             "pullback",
             "pullback_no_reduce",
+            "trend",
         ])
+        trend = config.strategies["trend"]
+        self.assertEqual(trend.entry.buy_scale, "short")
+        self.assertEqual(trend.entry.sell_scale, "mid")
+        self.assertEqual(trend.risk.sizing, "exposure")
+        self.assertEqual(trend.exit.mode, "scale_downtrend")
+        self.assertIsNone(trend.order.max_stop_distance)
         by_key = {run.key: run for run in config.runs}
         self.assertEqual(by_key["breakout"].exhaustion_action, "reduce")
         self.assertEqual(by_key["breakout_no_reduce"].exhaustion_action, "none")
@@ -216,6 +235,27 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lot_size"):
             load_trend_config(overrides={"symbols": ["00005"]})
 
+    def test_symbol_file_fills_missing_hk_lots_from_the_lookup(self):
+        listing = ROOT / "scripts" / "hkconnect_06Oct.txt"
+        self.assertGreater(len(read_symbol_file(listing)), 100)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "names.txt"
+            path.write_text("00005\n# skip\n\n00700\n00005\n", encoding="utf-8")
+            self.assertEqual(read_symbol_file(path), ("00005", "00700"))
+        config = load_trend_config(
+            overrides={"symbols": ["00005", "00700"]},
+            today=date(2026, 10, 13),
+            lot_lookup=lambda codes: {"00005": (400, "汇丰控股")} if "00005" in codes else {},
+        )
+        self.assertEqual(config.symbols[0].code, "00005")
+        self.assertEqual(config.symbols[0].lot_size, 400)
+        self.assertEqual(config.symbols[0].lot_size_source, "longbridge")
+        self.assertEqual(config.symbols[0].name, "汇丰控股")
+        self.assertEqual(config.symbols[1].code, "00700")
+        self.assertEqual(config.symbols[1].lot_size, 100)
+        self.assertEqual(config.symbols[1].lot_size_source, "config")
+        self.assertEqual(config.symbols[1].name, "腾讯控股")
+
     def test_cli_rejects_a_share_before_fetching(self):
         result = subprocess.run(
             [PYTHON, "scripts/run_trend_backtest.py", "--symbols", "600519"],
@@ -226,6 +266,58 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("A 股", result.stderr)
+
+    def test_finish_returns_one_after_skipped_symbols(self):
+        path = ROOT / "scripts" / "run_trend_backtest.py"
+        spec = importlib.util.spec_from_file_location("run_trend_backtest_cli", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        code = module._finish({
+            "index_html": "index.html",
+            "report_md": "summary.md",
+            "output_dir": ".",
+            "failures": [{"symbol": "00004", "error": "最高价和最低价包不住开盘价或收盘价"}],
+        })
+        self.assertEqual(code, 1)
+        self.assertEqual(module._finish({
+            "index_html": "index.html",
+            "report_md": "summary.md",
+            "output_dir": ".",
+            "failures": [],
+        }), 0)
+
+    def test_trend_buy_scale_must_match_the_run_scale(self):
+        data = _raw()
+        data["structure"]["scale"] = "mid"
+        with self.assertRaisesRegex(ValueError, "买入尺度必须与 structure.scale 相同"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+
+    def test_trend_scales_must_differ_and_reduce_is_rejected(self):
+        data = _raw()
+        data["strategies"]["trend"]["entry"]["sell_scale"] = "short"
+        with self.assertRaisesRegex(ValueError, "不能相同"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+        data = _raw()
+        data["runs"][-1]["exhaustion_action"] = "reduce"
+        with self.assertRaisesRegex(ValueError, "不能减仓"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+        data = _raw()
+        data["strategies"]["trend"]["order"]["max_stop_distance"] = 4
+        with self.assertRaisesRegex(ValueError, "未登记的字段: max_stop_distance"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+
+    def test_yaml_without_trend_still_loads(self):
+        data = _raw()
+        del data["strategies"]["trend"]
+        data["runs"] = [item for item in data["runs"] if item["strategy"] != "trend"]
+        config = trend_config_from_mapping(data, today=date(2026, 10, 13))
+        self.assertNotIn("trend", config.strategies)
+        self.assertEqual([item.key for item in config.runs], [
+            "breakout",
+            "breakout_no_reduce",
+            "pullback",
+            "pullback_no_reduce",
+        ])
 
 
 class EmptySessionTests(unittest.TestCase):
@@ -260,9 +352,6 @@ class EmptySessionTests(unittest.TestCase):
             folders = sorted(path.name for path in out.iterdir() if path.is_dir())
             self.assertEqual(folders, ["00700_breakout", "00700_pullback"])
             for row in payload["results"]:
-                self.assertEqual(row["metrics"]["n_trades"], 0)
-                self.assertEqual(row["metrics"]["final_equity"], 1_000_000)
-                self.assertEqual(row["metrics"]["final_cash"], 1_000_000)
                 self.assertEqual(row["structure"]["param_version"], "structure-params-v6")
                 self.assertEqual(row["structure"]["bar_count"], 80)
                 self.assertIn("phase", row["structure"]["methods"])
@@ -271,10 +360,10 @@ class EmptySessionTests(unittest.TestCase):
                 report = Path(row["report_html"])
                 text = report.read_text(encoding="utf-8")
                 self.assertIn("关键指标", text)
-                self.assertIn("无成交", text)
-                self.assertIn("空会话", text)
-                decisions = report.parent / "decisions.jsonl"
-                self.assertEqual(decisions.read_text(encoding="utf-8"), "")
+                self.assertIn("取消与跳过", text)
+                self.assertIn("衰竭减仓", text)
+                self.assertIn("信号使用当根 as-of", text)
+                self.assertTrue((report.parent / "decisions.jsonl").is_file())
             hashes = {row["structure"]["tape_hash"] for row in payload["results"]}
             self.assertEqual(len(hashes), 1)
             summary = (out / "summary.md").read_text(encoding="utf-8")
@@ -517,6 +606,26 @@ class TapeTests(unittest.TestCase):
                     found = True
         self.assertTrue(found)
 
+    def test_extra_scale_reads_that_scale_without_changing_the_primary(self):
+        series = _make_series(_wave(72))
+        snapshot = _snapshot(series)
+        short = build_tape(series, snapshot, scale="short", span=14, floor=0.003, extra_scale="mid")
+        mid = build_tape(series, snapshot, scale="mid", span=14, floor=0.003)
+        primary = build_tape(series, snapshot, scale="short", span=14, floor=0.003)
+        self.assertTrue(any(row.structure is not None for row in short))
+        self.assertTrue(any(row.exit_structure is not None for row in short))
+        for left, other, plain in zip(short, mid, primary):
+            self.assertEqual(left.scale, "short")
+            self.assertEqual(left.exit_scale, "mid")
+            self.assertEqual(left.exit_structure, other.structure)
+            self.assertEqual(left.exit_direction_start_index, other.direction_start_index)
+            self.assertEqual(left.structure, plain.structure)
+            self.assertEqual(left.category, plain.category)
+            self.assertEqual(left.direction_start_index, plain.direction_start_index)
+            self.assertIsNone(plain.exit_scale)
+        with self.assertRaisesRegex(ValueError, "卖出尺度不能和买入尺度相同"):
+            build_tape(series, snapshot, scale="short", span=14, floor=0.003, extra_scale="short")
+
 
 def _series_ohlc():
     closes = [100.0, 110.0, 105.0, 120.0, 130.0, 125.0]
@@ -528,6 +637,25 @@ def _series_ohlc():
 
 
 class PriceMarketTests(unittest.TestCase):
+    def test_ohlc_is_expanded_to_enclose_open_and_close(self):
+        frame = pd.DataFrame({
+            "open": [10.0, 10.0],
+            "high": [10.2, 9.0],
+            "low": [9.8, 9.0],
+            "close": [10.1, 12.0],
+        })
+        repaired, count = enclose_ohlc(frame)
+        self.assertEqual(count, 1)
+        self.assertEqual(repaired.loc[1, "high"], 12.0)
+        self.assertEqual(repaired.loc[1, "low"], 9.0)
+        self.assertEqual(repaired.loc[0, "high"], 10.2)
+
+    def test_split_share_count_tolerates_float_dust(self):
+        self.assertEqual(whole_shares(Decimal("20300.00000000000000000000001")), 20300)
+        self.assertEqual(whole_shares(Decimal("99.99999999999999999999999999")), 100)
+        with self.assertRaises(ValueError):
+            whole_shares(Decimal("10.5"))
+
     def test_hand_calculated_factors_preserve_log_returns(self):
         opens, highs, lows, closes, volumes = _series_ohlc()
         adjusted = adjust_prices(
@@ -793,6 +921,9 @@ def _bar(time, open_, high, low, close, **kw):
         gap_before=kw.pop("gap_before", False),
         phase_start_index=kw.pop("phase_start_index", None),
         direction_start_index=kw.pop("direction_start_index", None),
+        exit_scale=kw.pop("exit_scale", None),
+        exit_structure=kw.pop("exit_structure", None),
+        exit_direction_start_index=kw.pop("exit_direction_start_index", None),
     )
     if kw:
         raise TypeError(sorted(kw))
@@ -1500,15 +1631,15 @@ def _pullback_week(
 class EntryPluginTests(unittest.TestCase):
     def test_registry_refuses_a_plugin_without_a_stop(self):
         config = load_trend_config(today=date(2026, 10, 13))
-        self.assertEqual(list_entries(), ["breakout", "pullback"])
+        self.assertEqual(list_entries(), ["breakout", "pullback", "trend"])
         first = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         second = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         self.assertIsNot(first, second)
         self.assertTrue(first.allows_add)
         self.assertEqual(first.entry.lookback, 20)
         self.assertEqual(first.entry.buffer, 0.2)
-        self.assertEqual(first.entry.stop_lookback, 4)
-        self.assertEqual(first.entry.stop_buffer, 0.3)
+        self.assertEqual(first.entry.stop_lookback, 10)
+        self.assertEqual(first.entry.stop_buffer, 1.0)
         pullback = create_entry("pullback", config.strategies["pullback"], price_axis="log")
         self.assertFalse(pullback.allows_add)
         self.assertEqual(pullback.entry.lookback, 5)
@@ -1534,6 +1665,24 @@ class EntryPluginTests(unittest.TestCase):
         finally:
             from analysis.backtest.trend.entries.registry import _REGISTRY
             _REGISTRY.pop("bare", None)
+
+    def test_wide_stop_snapshot_pins_the_measured_run(self):
+        path = ROOT / "analysis" / "backtest" / "trend-strategy-wide-stop.yaml"
+        config = load_trend_config(path, today=date(2026, 10, 14))
+        self.assertEqual(config.version, "trend-strategy-v0")
+        self.assertEqual(config.window.start, date(2025, 10, 14))
+        self.assertEqual(config.window.end, date(2026, 10, 14))
+        self.assertEqual([run.key for run in config.runs], ["breakout", "pullback"])
+        breakout = config.strategies["breakout"]
+        pullback = config.strategies["pullback"]
+        self.assertEqual(breakout.entry.lookback, 20)
+        self.assertEqual(breakout.entry.stop_lookback, 10)
+        self.assertEqual(breakout.entry.stop_buffer, 1.0)
+        self.assertEqual(breakout.order.max_stop_distance, 8.0)
+        self.assertEqual(breakout.exit.trail_buffer, 5.0)
+        self.assertEqual(pullback.entry.stop_buffer, 1.0)
+        self.assertEqual(pullback.order.max_stop_distance, 8.0)
+        self.assertEqual(pullback.exit.trail_buffer, 5.0)
 
     def test_breakout_triggers_only_in_uptrend_birth_or_continuation(self):
         tactic, _, _ = _prepared("breakout", "uniform")
@@ -1648,6 +1797,18 @@ class EntryPluginTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(bounded.adjusted_stop, 89.7)
         self.assertIn("起点序号 1", bounded.text)
+
+    def test_mismatched_pullback_origin_skips_the_bar(self):
+        tactic, _, _ = _prepared("pullback", "uniform")
+        bars = [
+            _rb(0, 100, 100, 99, 100),
+            _rb(1, 100, 100, 96, 99, category=UP_PULLBACK, phase_start_index=0),
+            _rb(2, 100, 100, 99, 100),
+            _rb(3, 100, 100, 99, 100),
+            _rb(4, 100, 100, 99, 100),
+            _rb(5, 100, 101, 97, 101, ema=100),
+        ]
+        self.assertIsNone(tactic.propose(bars))
 
     def test_range_and_pending_states_do_not_open(self):
         breakout, _, _ = _prepared("breakout", "uniform")
@@ -1924,6 +2085,393 @@ class EntryPluginTests(unittest.TestCase):
             _rb(5, 100, 100, 99, 100),
             _rb(6, 100, 101, 99, 101, ema=100),
         ]
+
+
+def _cbar(index, open_, close, *, structure, direction_start, exit_structure, exit_start, low=None, a_t=1.0, exit_scale="mid"):
+    high = max(open_, close)
+    if low is None:
+        low = min(open_, close)
+    return _bar(
+        f"d{index}",
+        open_,
+        high,
+        low,
+        close,
+        structure=structure,
+        category=UP_CONTINUE if structure == UPTREND else NEUTRAL,
+        a_t=a_t,
+        direction_start_index=direction_start,
+        exit_scale=exit_scale,
+        exit_structure=exit_structure,
+        exit_direction_start_index=exit_start,
+    )
+
+
+class TrendOnlyTests(unittest.TestCase):
+    def test_buys_the_day_after_a_short_uptrend_and_sells_on_a_new_mid_downtrend(self):
+        bars = [
+            _cbar(0, 100, 100, structure=RANGE, direction_start=0, exit_structure=RANGE, exit_start=0),
+            _cbar(1, 100, 100, structure=UPTREND, direction_start=1, exit_structure=RANGE, exit_start=0),
+            _cbar(2, 100, 80, structure=UPTREND, direction_start=1, exit_structure=RANGE, exit_start=0, low=70),
+            _cbar(3, 80, 80, structure=RANGE, direction_start=3, exit_structure=RANGE, exit_start=0),
+            _cbar(4, 80, 80, structure=UPTREND, direction_start=4, exit_structure=DOWNTREND, exit_start=4),
+            _cbar(5, 110, 110, structure=UPTREND, direction_start=4, exit_structure=DOWNTREND, exit_start=4),
+            _cbar(6, 110, 110, structure=UPTREND, direction_start=6, exit_structure=DOWNTREND, exit_start=4),
+            _cbar(7, 110, 110, structure=UPTREND, direction_start=6, exit_structure=RANGE, exit_start=7),
+            _cbar(8, 100, 100, structure=UPTREND, direction_start=8, exit_structure=RANGE, exit_start=7),
+            _cbar(9, 100, 100, structure=UPTREND, direction_start=8, exit_structure=RANGE, exit_start=7),
+        ]
+        result = _run_plugin(bars, "trend", "uniform")
+        entries = _by(result, "入场")
+        exits = _by(result, "趋势退出")
+        self.assertEqual([item.time for item in entries], ["d2", "d9"])
+        self.assertEqual(entries[0].shares_after, 1000)
+        self.assertAlmostEqual(entries[0].planned_risk, 1.0)
+        self.assertIsNone(entries[0].adjusted_stop)
+        self.assertIn("策略 C", entries[0].text)
+        self.assertIn("下一根开盘买入", entries[0].text)
+        self.assertIn("没有价格止损", entries[0].text)
+        self.assertEqual(_by(result, "止损"), [])
+        self.assertEqual([item.time for item in exits], ["d5"])
+        self.assertEqual(exits[0].exit_rule, "中期下降")
+        self.assertEqual(exits[0].shares_after, 0)
+        self.assertIn("不开反向仓", exits[0].text)
+        self.assertEqual(result.blocked, (("中期下降，不开仓", 1),))
+        self.assertEqual(result.equity[2].effective_stop, None)
+        self.assertGreater(result.final_shares, 0)
+
+    def test_a_gap_cancels_and_the_same_uptrend_is_not_retried(self):
+        appeared = _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0, a_t=10)
+        cancelled = _run_plugin([
+            appeared,
+            _cbar(1, 106, 106, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0, a_t=10),
+        ], "trend", "uniform")
+        self.assertEqual(_by(cancelled, "入场"), [])
+        self.assertEqual(_by(cancelled, "取消")[0].reason, "跳空")
+        filled = _run_plugin([
+            appeared,
+            _cbar(1, 104, 104, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0, a_t=10),
+        ], "trend", "uniform")
+        self.assertEqual(len(_by(filled, "入场")), 1)
+
+    def test_the_last_bar_and_warmup_do_not_leave_an_order(self):
+        alone = _run_plugin([
+            _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0),
+        ], "trend", "uniform")
+        self.assertEqual(_by(alone, "取消")[0].reason, "没有下一根")
+        self.assertEqual(alone.final_shares, 0)
+
+        tactic, strategy, market = _prepared("trend", "uniform")
+        missed = run_account(
+            [
+                _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0),
+                _cbar(1, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0),
+            ],
+            tactic,
+            strategy,
+            market,
+            lot_size=1,
+            capital=100_000.0,
+            price_axis="uniform",
+            trade_from=1,
+        )
+        self.assertEqual(_by(missed, "入场"), [])
+        self.assertEqual(missed.final_shares, 0)
+
+    def test_exposure_cap_and_cash_cancel_without_a_stop(self):
+        bars = [
+            _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0),
+            _cbar(1, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0),
+        ]
+        tactic, strategy, market = _prepared("trend", "uniform")
+        half = run_account(
+            bars, tactic, replace(strategy, risk=replace(strategy.risk, max_gross_exposure=0.5)),
+            market, lot_size=1, capital=100_000.0, price_axis="uniform",
+        )
+        self.assertEqual(_by(half, "入场")[0].shares_after, 500)
+        self.assertAlmostEqual(_by(half, "入场")[0].planned_risk, 0.5)
+
+        cash = run_account(
+            bars, tactic, strategy, market, lot_size=100, capital=50.0, price_axis="uniform",
+        )
+        self.assertEqual(_by(cash, "取消")[0].reason, "现金")
+        capped = run_account(
+            bars,
+            tactic,
+            replace(strategy, risk=replace(strategy.risk, max_gross_exposure=0.01)),
+            market,
+            lot_size=100,
+            capital=100_000.0,
+            price_axis="uniform",
+        )
+        self.assertEqual(_by(capped, "取消")[0].reason, "占用上限")
+
+    def test_mid_downtrend_blocks_the_entry_and_the_sell_scale_comes_from_the_parameters(self):
+        blocked = [
+            _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=DOWNTREND, exit_start=0),
+            _cbar(1, 100, 100, structure=UPTREND, direction_start=0, exit_structure=DOWNTREND, exit_start=0),
+        ]
+        result = _run_plugin(blocked, "trend", "uniform")
+        self.assertEqual(_by(result, "入场"), [])
+        self.assertEqual(result.blocked, (("中期下降，不开仓", 1),))
+
+        tactic, strategy, _ = _prepared("trend", "uniform")
+        wrong_scale = [
+            _cbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=RANGE, exit_start=0, exit_scale="long"),
+        ]
+        self.assertIsNone(tactic.propose(wrong_scale))
+        self.assertEqual(tactic.skip_reason(wrong_scale), "缺少卖出尺度")
+        renamed = create_entry(
+            "trend",
+            replace(strategy, entry=replace(strategy.entry, sell_scale="long")),
+            price_axis="uniform",
+        )
+        self.assertIsNotNone(renamed.propose(wrong_scale))
+        self.assertIn("长期", renamed.propose(wrong_scale).text)
+
+    def test_price_stops_and_the_short_trend_ending_do_not_change_strategy_a(self):
+        held, _ = _account([
+            _calm("d0"),
+            _calm("d1", exit_structure=DOWNTREND, exit_direction_start_index=1, exit_scale="mid"),
+            _calm("d2"),
+        ], {0: _sig()})
+        self.assertEqual(_by(held, "趋势退出"), [])
+        self.assertGreater(held.final_shares, 0)
+
+
+class ReportTests(unittest.TestCase):
+    def test_dividend_income_is_cash_and_is_not_also_left_in_the_price(self):
+        market = self._flat_market()
+        # 100 股买在 100，除息 2 之后不复权收盘 98。复权价仍是 100。
+        # 总权益应回到 10000：价格少了 200，股息收入补回 200。
+        dates = ["2024-01-02", "2024-01-03", "2024-01-04"]
+        hold = simulate_buy_hold(
+            dates,
+            [100, 100, 100],
+            [100, 100, 100],
+            [1, 1, 100 / 98],
+            [1, 1, 1],
+            [0, 0, 2],
+            lot_size=1,
+            capital=10_000,
+            market=market,
+            withholding=0,
+        )
+        self.assertEqual(hold.final_shares, 100)
+        self.assertAlmostEqual(hold.dividend_income, 200)
+        self.assertAlmostEqual(hold.final_equity, 10_000)
+        self.assertAlmostEqual(hold.total_return, 0)
+        self.assertAlmostEqual(split_adjusted_price(100, 100 / 98, 1), 98)
+
+        taxed = simulate_buy_hold(
+            dates, [100, 100, 100], [100, 100, 100], [1, 1, 100 / 98], [1, 1, 1], [0, 0, 2],
+            lot_size=1, capital=10_000, market=market, withholding=0.3,
+        )
+        self.assertAlmostEqual(taxed.dividend_income, 140)
+        self.assertAlmostEqual(taxed.final_equity, 9_940)
+
+    def test_split_stays_inside_the_adjusted_price(self):
+        market = self._flat_market()
+        hold = simulate_buy_hold(
+            ["2024-01-02", "2024-01-03"],
+            [200, 200],
+            [200, 200],
+            [1, 2],
+            [1, 2],
+            [0, 0],
+            lot_size=1,
+            capital=200,
+            market=market,
+            withholding=0,
+        )
+        self.assertEqual(hold.final_shares, 2)
+        self.assertAlmostEqual(hold.final_equity, 200)
+        self.assertAlmostEqual(hold.dividend_income, 0)
+
+        dca = simulate_even_dca(
+            ["2024-01-02", "2024-01-03", "2024-01-04"],
+            [100, 100, 100],
+            [100, 100, 100],
+            [1, 1, 100 / 98],
+            [1, 1, 1],
+            [0, 0, 2],
+            lot_size=1,
+            capital=250,
+            market=market,
+            withholding=0,
+        )
+        self.assertGreater(dca.dividend_income, 0)
+        self.assertGreater(dca.final_shares, 0)
+
+    def _flat_market(self):
+        config = load_trend_config(today=date(2026, 10, 13))
+        return replace(
+            config.markets[MARKET_HK],
+            commission_rate=0,
+            min_commission=0,
+            platform_fee=0,
+            stamp_duty_rate=0,
+            exchange_fee_rate=0,
+            settlement_rate=0,
+        )
+
+    def test_restores_split_adjusted_yahoo_prices_to_the_traded_price(self):
+        opens, highs, lows, closes, dividends = restore_traded_prices(
+            [100, 100, 50],
+            [110, 110, 55],
+            [90, 90, 45],
+            [100, 100, 50],
+            [1, 0, 0],
+            [0, 2, 0],
+        )
+        self.assertEqual(closes, [200, 100, 50])
+        self.assertEqual(opens, [200, 100, 50])
+        self.assertEqual(highs, [220, 110, 55])
+        self.assertEqual(lows, [180, 90, 45])
+        self.assertEqual(dividends, [2, 0, 0])
+
+    def test_case_report_includes_basis_position_stop_and_risk(self):
+        prefix = [_rb(index, 100, 100, 99, 100, a_t=1) for index in range(3)]
+        prefix.append(_rb(3, 100, 102, 99, 102, a_t=1))
+        prefix.append(_rb(4, 102, 103, 100, 102, a_t=1))
+        result = _run_plugin(prefix, "breakout", "uniform", lookback=3, buffer=0.2, stop_lookback=1, stop_buffer=0.3)
+        entry = _by(result, "入场")[0]
+        self.assertIn("策略 A", entry.text)
+        summary = audit_summary(result, exhaustion_enabled=True)
+        config = load_trend_config(today=date(2026, 10, 13))
+        case = _case_config(config, config.symbols[0], config.runs[0])
+        row = {
+            "symbol": "00700",
+            "variant_label": "策略 A",
+            "coverage": "合成",
+            "bar_source": "synthetic",
+            "metrics": {
+                "dca_start_price": 100,
+                "dca_n_lots": 1,
+                "dca_n_trading_days": 5,
+                "dca_interval": 1,
+                "dca_n_lots_bought": 1,
+                "dca_n_buy_days": 1,
+                "dca_return": 0,
+                "excess_vs_dca": 0,
+                "max_consecutive_losses": summary["max_consecutive_losses"],
+            },
+            "split": {},
+            "gaps": [],
+            "extremes": {},
+            "round_trips": summary["round_trips"],
+            "trades": [{
+                "timestamp": entry.time,
+                "side": "buy",
+                "action": "入场",
+                "tactic": "breakout",
+                "price": entry.price,
+                "shares": entry.shares_after,
+                "position_fraction": entry.position_fraction,
+                "planned_risk": entry.planned_risk,
+                "stop_price": entry.raw_stop,
+                "basis": entry.text,
+                "fee": 0,
+                "equity_after": entry.equity_after,
+            }],
+            "audit": summary,
+            "preamble": ["信号使用当根 as-of，成交在下一根开盘；盘中止损使用上一根收盘已经生效的止损"],
+        }
+        text = render_html_case(row, case, {})
+        self.assertIn("关键指标", text)
+        self.assertIn("仓位占比", text)
+        self.assertIn("计划风险", text)
+        self.assertIn("生效止损", text)
+        self.assertIn("策略 A", text)
+        self.assertIn("取消与跳过", text)
+        self.assertIn("衰竭减仓", text)
+        self.assertIn("最大连续亏损次数", text)
+        self.assertIn("按一手规则成交", text)
+
+    def test_summary_lines_up_runs_without_adding_accounts(self):
+        bars = _bars(80)
+        data = _raw()
+        data["universe"]["symbols"] = [
+            {"code": "00700", "name": "腾讯控股", "lot_size": 100},
+            {"code": "NVDA", "name": "英伟达"},
+        ]
+        data["window"]["start"] = bars["datetime"].iloc[40].date().isoformat()
+        data["window"]["end"] = bars["datetime"].iloc[-1].date().isoformat()
+        data["window"]["warmup_bars"] = 30
+        with tempfile.TemporaryDirectory() as tmp:
+            data["output_dir"] = tmp
+            config = trend_config_from_mapping(data, source="test")
+            payload = run_trend_backtest(
+                config,
+                frames={"00700": bars, "NVDA": bars},
+                load_benchmarks=False,
+            )
+            out = Path(payload["output_dir"])
+            folders = sorted(path.name for path in out.iterdir() if path.is_dir())
+            self.assertEqual(folders, [
+                "00700_breakout",
+                "00700_breakout_no_reduce",
+                "00700_pullback",
+                "00700_pullback_no_reduce",
+                "00700_trend",
+                "NVDA_breakout",
+                "NVDA_breakout_no_reduce",
+                "NVDA_pullback",
+                "NVDA_pullback_no_reduce",
+                "NVDA_trend",
+            ])
+            summary = (out / "summary.md").read_text(encoding="utf-8")
+            index = (out / "index.html").read_text(encoding="utf-8")
+            self.assertIn("账户对照", summary)
+            self.assertIn("账户对照", index)
+            self.assertNotIn("合计", summary)
+            self.assertIn("00700", summary)
+            self.assertIn("NVDA", summary)
+            self.assertIn("HKD", summary)
+            self.assertIn("USD", summary)
+            self.assertIn("样本外", summary)
+            self.assertIn("趋势回测汇总", index)
+            self.assertIn('href="00700_breakout/report.html"', index)
+            self.assertIn('href="00700_pullback/report.html"', index)
+            self.assertIn('href="NVDA_breakout/report.html"', index)
+            self.assertIn('href="NVDA_pullback_no_reduce/report.html"', index)
+            self.assertIn('href="00700_trend/report.html"', index)
+            trend_case = (out / "00700_trend" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("不设价格止损", trend_case)
+            self.assertIn("中期", trend_case)
+            case = (out / "00700_breakout" / "report.html").read_text(encoding="utf-8")
+            self.assertIn('href="../index.html"', case)
+            self.assertIn("返回汇总", case)
+
+    def test_bar_that_does_not_enclose_is_repaired_and_kept(self):
+        bars = _bars(80)
+        bad = bars.copy()
+        bad.loc[bad.index[50], "high"] = 1.0
+        data = _raw()
+        data["universe"]["symbols"] = [
+            {"code": "00700", "name": "腾讯控股", "lot_size": 100},
+            {"code": "00004", "name": "九龙仓集团", "lot_size": 100},
+        ]
+        data["window"]["start"] = bars["datetime"].iloc[40].date().isoformat()
+        data["window"]["end"] = bars["datetime"].iloc[-1].date().isoformat()
+        data["window"]["warmup_bars"] = 30
+        data["runs"] = [data["runs"][0]]
+        with tempfile.TemporaryDirectory() as tmp:
+            data["output_dir"] = tmp
+            config = trend_config_from_mapping(data, source="test")
+            payload = run_trend_backtest(
+                config,
+                frames={"00700": bars, "00004": bad},
+                load_benchmarks=False,
+            )
+            self.assertEqual(sorted({row["symbol"] for row in payload["results"]}), ["00004", "00700"])
+            self.assertEqual(payload["failures"], [])
+            repaired = [row for row in payload["results"] if row["symbol"] == "00004"]
+            self.assertTrue(repaired)
+            self.assertGreater(repaired[0]["repaired_bars"], 0)
+            self.assertTrue(any("修补了" in gap for gap in repaired[0]["gaps"]))
+            out = Path(payload["output_dir"])
+            self.assertTrue((out / "00004_breakout" / "report.html").is_file())
 
 
 if __name__ == "__main__":

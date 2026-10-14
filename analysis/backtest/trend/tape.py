@@ -40,6 +40,9 @@ class TapeRow:
     a_t: Optional[float]
     ema: Optional[float]
     s_t: Optional[float]
+    exit_scale: Optional[str] = None
+    exit_structure: Optional[str] = None
+    exit_direction_start_index: Optional[int] = None
 
 
 def canonical_row(row: TapeRow) -> str:
@@ -138,12 +141,22 @@ def build_tape(
     floor: float,
     start_index: int = 0,
     end_index: Optional[int] = None,
+    extra_scale: Optional[str] = None,
 ) -> tuple[TapeRow, ...]:
-    """评估窗口内每一根一行。暖机只参与递推，不写出。"""
+    """评估窗口内每一根一行。暖机只参与递推，不写出。
+
+    `extra_scale` 在同一次 as-of 里再读一个尺度的方向，给策略 C 的卖出用。
+    它不改变本尺度的结构方向和主状态。
+    """
     if series.params.phase is None:
         raise ValueError("结构参数没有 phase，不能计算快均线")
     if scale not in ("short", "mid", "long"):
         raise ValueError(f"尺度必须是 short、mid、long，收到 {scale}")
+    if extra_scale is not None:
+        if extra_scale not in ("short", "mid", "long"):
+            raise ValueError(f"卖出尺度必须是 short、mid、long，收到 {extra_scale}")
+        if extra_scale == scale:
+            raise ValueError("卖出尺度不能和买入尺度相同")
     closes = snapshot.get("closes") or []
     if len(closes) != len(series):
         raise ValueError(f"快照有 {len(closes)} 根，序列有 {len(series)} 根")
@@ -159,10 +172,21 @@ def build_tape(
         bar = series.bars[index]
         when = str(closes[index]["time"])
         view = _as_of_view(snapshot, when)
-        phase = _covering(_method_objects(view, "phase"), scale, index)
-        direction = _covering(_method_objects(view, "direction"), scale, index)
+        phase_objects = _method_objects(view, "phase")
+        direction_objects = _method_objects(view, "direction")
+        phase = _covering(phase_objects, scale, index)
+        direction = _covering(direction_objects, scale, index)
         structure = None if phase is None else phase.get("structure")
         category = INSUFFICIENT if phase is None else phase.get("category")
+        exit_structure = None
+        exit_start = None
+        if extra_scale is not None:
+            exit_phase = _covering(phase_objects, extra_scale, index)
+            exit_direction = _covering(direction_objects, extra_scale, index)
+            if exit_phase is not None and exit_phase.get("structure") is not None:
+                exit_structure = str(exit_phase.get("structure"))
+            if exit_direction is not None and exit_direction.get("start_index") is not None:
+                exit_start = int(exit_direction["start_index"])
         rows.append(
             TapeRow(
                 index=index,
@@ -181,6 +205,9 @@ def build_tape(
                 a_t=units[index],
                 ema=emas[index],
                 s_t=volatility[index],
+                exit_scale=extra_scale,
+                exit_structure=exit_structure,
+                exit_direction_start_index=exit_start,
             )
         )
     return tuple(rows)

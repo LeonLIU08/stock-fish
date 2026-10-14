@@ -33,7 +33,7 @@ def create_entry(name: str, strategy: StrategySpec, *, price_axis: str) -> Entry
     cls = _REGISTRY.get(key)
     if cls is None:
         raise KeyError(f"未知入场策略 {name!r}，已注册: {list_entries()}")
-    if not cls.provides_stop:
+    if not cls.provides_stop and getattr(cls, "exit_kind", "") != "scale_downtrend":
         raise ValueError(f"没有止损的插件拒绝加载: {key}")
     return cls(strategy, price_axis=price_axis)
 
@@ -42,6 +42,6 @@ def _ensure_loaded() -> None:
     global _LOADED
     if _LOADED:
         return
-    from analysis.backtest.trend.entries import breakout, pullback  # noqa: F401
+    from analysis.backtest.trend.entries import breakout, pullback, trend  # noqa: F401
 
     _LOADED = True

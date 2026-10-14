@@ -162,7 +162,7 @@ class EngineTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_load_yaml_defaults(self):
         cfg = load_backtest_config(DEFAULT_CONFIG_PATH)
-        self.assertEqual(cfg.symbols, ["00700", "09988", "06869"])
+        self.assertEqual(cfg.symbols, ["00700", "09988", "06869", "NVDA", "AAPL", "GOOGL", "TSLA"])
         self.assertEqual(cfg.capital, 300_000)
         self.assertEqual(cfg.max_trades_per_day, 2)
         self.assertEqual(cfg.strategy_name, "ma_cross")

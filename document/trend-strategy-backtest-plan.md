@@ -34,14 +34,14 @@
 backtest_results/{时间戳}_{周期}_trend_state/
   summary.md
   summary.json
-  index.html
+  index.html          # 汇总。点某只股票下的策略，打开该账户的 report.html
   {symbol}_{run}/
     report.html
     charts…
     decisions.jsonl
 ```
 
-默认四个 run：`breakout`、`breakout_no_reduce`、`pullback`、`pullback_no_reduce`。没有「两者都跑」：策略 A 和策略 B 永远在不同账户里。`summary` 只把各账户的结果并列成表，按股票对照 A、B 和减仓开关，不合成组合净值。港股和美股币种不同，金额不相加。报告目录和现有 `run_backtest` 相同。
+默认五个 run：`breakout`、`breakout_no_reduce`、`pullback`、`pullback_no_reduce`、`trend`。没有「两者都跑」：策略 A、策略 B 和策略 C 永远在不同账户里。策略 C 的规则在第 6.5 节。`summary` 只把各账户的结果并列成表，按股票对照 A、B 和减仓开关，不合成组合净值。港股和美股币种不同，金额不相加。报告目录和现有 `run_backtest` 相同。
 
 命令：
 
@@ -51,6 +51,8 @@ backtest_results/{时间戳}_{周期}_trend_state/
   --config analysis/backtest/trend-strategy-v0.yaml \
   --symbols 00700,09988,NVDA --runs breakout,pullback --years 3
 ```
+
+一只股票在取数、结构或回放时报错时记下原因并跳过，其余股票继续。`index.html` 和 `summary.md` 列出跳过的代码。有跳过时进程退出码为 1，已经写出的报告保留。
 
 ## 3. 第一期不做
 
@@ -62,7 +64,7 @@ backtest_results/{时间戳}_{周期}_trend_state/
 - 不模拟结算周期（港股 T+2、美股 T+1），卖出所得视为马上可用。股息在除息日入账，不按派息日；不做股息再投资。
 - 只做日线。`interval` 只接受 `1d`。
 - 不改 `ma_cross` 的信号和 `simulate()` 的成交结果。
-- 不在第一期用三个尺度投票。一次运行只读 YAML 里的一个尺度，默认中尺度。
+- 不在第一期用三个尺度投票。一次运行只读 YAML 里的一个尺度，默认短尺度。
 - 不把这套策略接进 Flask、飞书或实盘下单。
 
 ## 4. 因果回放
@@ -234,6 +236,16 @@ S_0 = \min(L_{t-4:t}) \times e^{-0.3 a_t}
 新策略实现 `EntryTactic`，在注册表登记，并在 YAML 的 `strategies` 下加一个同名参数块。它在自己的账户里运行，不影响已有策略。它可以使用磁带上已经发布的方向、主状态、\(a_t\)、EMA10 和截至当根的复权 OHLC。它不直接改账户。止损必须由插件在信号当根给出一个有限价格；没有止损的插件拒绝加载。
 
 空头插件第一期可以放进注册表，但 `allow_short: false` 时会话不调用它们。镜像定义先写在 `pullback.py` 的文档字符串里：反弹后几何收盘跌回 EMA10 之下，且跌破此前 3 根最低价，止损在本轮反弹最高价之上。实现留到打开做空的那一期。
+
+### 6.5 策略 C：只按趋势
+
+策略 C 和 A、B 分开账户。它不看主状态，也不用价格止损、跟踪止损和衰竭减仓。买卖仍是收盘确认、下一根开盘成交。
+
+买入：交易尺度（`structure.scale`，默认短尺度）的上升趋势在当根第一次确认。确认根是方向区段的 `start_index`，不回填到更早的候选根。同一段上升只买一次。
+
+卖出：中尺度的下降趋势在当根第一次确认，下一根开盘卖出剩余仓位，不开空。短尺度转成震荡或未定时不卖。中尺度当时已经是下降，则这次短尺度上升不开仓。
+
+仓位没有止损距离，所以不按单笔风险预算计算股数，只按现金和 `max_gross_exposure` 取整到整手。跳空取消仍然生效。参数在 `strategies.trend`，run 键是 `trend`。
 
 ## 7. 波动单位 \(a_t\)
 
@@ -423,7 +435,7 @@ version: trend-strategy-v0
 structure:
   param_version: structure-params-v6
   price_axis: log          # log | uniform
-  scale: mid               # short | mid | long
+  scale: short             # short | mid | long
   # 传开盘、最高、最低、成交量。开盘价让阶段影线分可计算
 
 prices:                    # 第 4.4 节。第一期只接受这一组
@@ -626,7 +638,7 @@ analysis/backtest/trend-strategy-v0.yaml
 
 K 线图用不复权价，买卖点用现有标记。另外把持仓期间的生效止损换成不复权价，画成折线。止损数据来自权益表，不在画图时重算。
 
-`summary.md` 和 `index.html` 有一张对照表：每只股票一行，每个 run 一组列（成交次数、成本后收益、最大回撤、胜率、每笔平均盈亏是计划风险的几倍）。各账户独立，表里不求和；港元和美元账户只比收益率。
+`summary.md` 和 `index.html` 有一张对照表：每只股票一行，每个 run 一组列（成交次数、成本后收益、最大回撤、胜率、每笔平均盈亏是计划风险的几倍）。各账户独立，表里不求和；港元和美元账户只比收益率。`index.html` 里每只股票一张卡片，点某个策略就打开 `{symbol}_{run}/report.html`；对照表里的成本后收益同样可点。个股报告页有返回汇总的链接。
 
 ### 11.3 补充的模块和配置
 
@@ -711,11 +723,11 @@ K 线图用不复权价，买卖点用现有标记。另外把持仓期间的生
 
 ### 12.6 报告与对照
 
-- [ ] 明细含依据、仓位占比、止损、计划风险
-- [ ] 取消列表（含一手规则成交笔数）、衰竭减仓次数、连续亏损
-- [ ] 四个 run 各出一份，目录名带 run 键；summary 对照表按股票并列，不求和
-- [ ] 至少一只港股、一只美股的真实 K 线能跑完；测试本身仍用合成序列，不依赖网络
-- [ ] 现有 `tests/test_ma_backtest.py` 通过
+- [x] 明细含依据、仓位占比、止损、计划风险
+- [x] 取消列表（含一手规则成交笔数）、衰竭减仓次数、连续亏损
+- [x] 四个 run 各出一份，目录名带 run 键；summary 对照表按股票并列，不求和
+- [x] 至少一只港股、一只美股的真实 K 线能跑完；测试本身仍用合成序列，不依赖网络
+- [x] 现有 `tests/test_ma_backtest.py` 通过
 
 ## 13. 实现时容易做错的地方
 

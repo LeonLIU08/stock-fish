@@ -13,7 +13,7 @@ import pandas as pd
 
 from analysis.backtest.engine import EngineResult
 from analysis.backtest.trend.config import StrategySpec
-from analysis.backtest.trend.entries.base import EntrySignal
+from analysis.backtest.trend.entries.base import EntrySignal, scale_label
 from analysis.backtest.trend.exits import exhaustion_due, long_trend_failed, next_long_stop, reduce_shares
 from analysis.backtest.trend.fills import (
     apply_buy,
@@ -25,7 +25,9 @@ from analysis.backtest.trend.fills import (
     slipped_buy,
     slipped_sell,
 )
-from analysis.backtest.trend.risk import format_percent, size_position
+from analysis.backtest.trend.prices import upward_gap_cancel
+from analysis.backtest.trend.risk import format_percent, size_exposure, size_position
+from analysis.structure.methods.phase import DOWNTREND
 
 _COLUMNS = [
     "datetime",
@@ -101,6 +103,9 @@ class ReplayBar:
     gap_before: bool = False
     phase_start_index: Optional[int] = None
     direction_start_index: Optional[int] = None
+    exit_scale: Optional[str] = None
+    exit_structure: Optional[str] = None
+    exit_direction_start_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,17 @@ class Decision:
     actual_loss_fraction: Optional[float]
     one_lot: bool
     text: str
+    structure: Optional[str] = None
+    category: Optional[str] = None
+    a_t: Optional[float] = None
+    ema: Optional[float] = None
+    factor: float = 1.0
+    fee: Optional[float] = None
+    cash_after: Optional[float] = None
+    equity_after: Optional[float] = None
+    position_fraction: Optional[float] = None
+    exit_rule: str = ""
+    reference_equity: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,14 @@ class EquityRow:
     effective_stop: Optional[float]
     next_stop: Optional[float]
     raw_stop: Optional[float]
+    structure: Optional[str] = None
+    category: Optional[str] = None
+    position_fraction: float = 0.0
+    planned_risk: Optional[float] = None
+    factor: float = 1.0
+    dividend_cash: float = 0.0
+    equity_gross: Optional[float] = None
+    fee: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -140,11 +164,12 @@ class AccountResult:
     equity: Tuple[EquityRow, ...]
     final_cash: float
     final_shares: int
+    blocked: Tuple[Tuple[str, int], ...] = ()
 
 
 @dataclass
 class _PendingEntry:
-    adjusted_stop: float
+    adjusted_stop: Optional[float]
     adjusted_close: float
     a_t: float
     text: str
@@ -154,13 +179,14 @@ class _PendingEntry:
 @dataclass
 class _Position:
     shares: int
-    adjusted_stop: float
+    adjusted_stop: Optional[float]
     planned_risk: float
     entry_equity: float
     cost_basis: float
     reduced: bool
     hh: float
     one_lot: bool
+    initial_stop: Optional[float]
 
 
 _STRUCTURE_LABEL = {
@@ -180,6 +206,7 @@ def run_account(
     capital: float,
     price_axis: str = "log",
     withholding: float = 0.0,
+    trade_from: int = 0,
 ) -> AccountResult:
     """按一根 K 线的开盘、盘中、收盘顺序回放。插件只在空仓且没有待执行入场时被询问。"""
     if capital <= 0:
@@ -199,12 +226,13 @@ def run_account(
         capital=float(capital),
         price_axis=price_axis,
         withholding=float(withholding),
+        trade_from=trade_from,
     )
     return replay.run()
 
 
 class _Replay:
-    def __init__(self, bars, tactic, strategy, market, lot_size, capital, price_axis, withholding):
+    def __init__(self, bars, tactic, strategy, market, lot_size, capital, price_axis, withholding, trade_from=0):
         self.bars = bars
         self.tactic = tactic
         self.strategy = strategy
@@ -212,6 +240,9 @@ class _Replay:
         self.lot_size = lot_size
         self.price_axis = price_axis
         self.withholding = withholding
+        if isinstance(trade_from, bool) or not isinstance(trade_from, int) or trade_from < 0:
+            raise ValueError("trade_from 必须是非负整数")
+        self.trade_from = trade_from
         self.slippage = float(strategy.order.slippage_rate)
         self.max_trades = int(strategy.order.max_trades_per_day)
         self.cash = float(capital)
@@ -219,9 +250,14 @@ class _Replay:
         self.pending_entry: Optional[_PendingEntry] = None
         self.pending_exit: Optional[str] = None
         self.pending_exit_text = ""
+        self.pending_exit_rule = ""
         self.fills: dict = {}
         self.decisions: list = []
         self.equity: list = []
+        self.blocked: dict = {}
+        self.cumulative_fees = 0.0
+        self.bar_fee = 0.0
+        self.bar_dividend = 0.0
 
     def run(self) -> AccountResult:
         for index, bar in enumerate(self.bars):
@@ -230,10 +266,20 @@ class _Replay:
             self._on_bar(index, bar)
         self._expire_entry()
         shares = 0 if self.position is None else self.position.shares
-        return AccountResult(tuple(self.decisions), tuple(self.equity), self.cash, shares)
+        return AccountResult(
+            tuple(self.decisions),
+            tuple(self.equity),
+            self.cash,
+            shares,
+            blocked=tuple(sorted(self.blocked.items())),
+        )
 
     def _on_bar(self, index: int, bar: ReplayBar) -> None:
         self._check_bar(bar)
+        self.bar_fee = 0.0
+        self.bar_dividend = 0.0
+        if index < self.trade_from:
+            return
         governed = None if self.position is None else self.position.adjusted_stop
         self._corporate(index, bar)
         self._at_open(index, bar)
@@ -242,7 +288,7 @@ class _Replay:
         self._intraday(index, bar, governed)
         next_stop = None
         if self.position is not None:
-            self._schedule(bar)
+            self._schedule(index, bar)
             next_stop = self.position.adjusted_stop
         elif self.pending_entry is None:
             self._ask(index, bar)
@@ -250,10 +296,11 @@ class _Replay:
 
     def _at_open(self, index: int, bar: ReplayBar) -> None:
         if self.position is not None:
-            stop = raw_stop(self.position.adjusted_stop, bar.factor)
-            if bar.open <= stop:
-                self._stop_out(index, bar, bar.open, gap=True)
-                return
+            if self.position.adjusted_stop is not None:
+                stop = raw_stop(self.position.adjusted_stop, bar.factor)
+                if bar.open <= stop:
+                    self._stop_out(index, bar, bar.open, gap=True)
+                    return
             if self.pending_exit == "trend":
                 self._trend_exit(index, bar)
                 return
@@ -274,6 +321,9 @@ class _Replay:
 
     def _try_entry(self, index: int, bar: ReplayBar) -> None:
         pending = self.pending_entry
+        if pending.adjusted_stop is None:
+            self._try_trend_entry(index, bar)
+            return
         reason = entry_cancel_reason(
             raw_open=bar.open,
             factor=bar.factor,
@@ -323,7 +373,10 @@ class _Replay:
             reduced=False,
             hh=bar.high * bar.factor,
             one_lot=sized.one_lot,
+            initial_stop=pending.adjusted_stop,
         )
+        self.cumulative_fees += fill.fee
+        self.bar_fee += fill.fee
         self.pending_entry = None
         entry_reason = "一手规则" if sized.one_lot else ""
         text = (
@@ -335,6 +388,66 @@ class _Replay:
             index, bar, action="入场", reason=entry_reason, shares_before=0, shares_after=sized.shares,
             price=fill.price, adjusted_stop=pending.adjusted_stop, stop=stop,
             planned_risk=sized.planned_risk, one_lot=sized.one_lot, text=text,
+            fee=fill.fee,             reference_equity=equity,
+        )
+
+    def _try_trend_entry(self, index: int, bar: ReplayBar) -> None:
+        pending = self.pending_entry
+        if upward_gap_cancel(
+            bar.open,
+            bar.factor,
+            pending.adjusted_close,
+            pending.a_t,
+            self.strategy.order.gap_cancel,
+            price_axis=self.price_axis,
+        ):
+            self._cancel(index, bar, "跳空", None, pending.text)
+            self.pending_entry = None
+            return
+        if not self._can_trade(bar.time):
+            self._cancel(index, bar, "当日成交次数", None, pending.text)
+            self.pending_entry = None
+            return
+        fill_price = slipped_buy(bar.open, self.slippage)
+        equity = self.cash
+        sized = size_exposure(
+            equity=equity,
+            cash=self.cash,
+            open_price=fill_price,
+            lot_size=self.lot_size,
+            max_gross_exposure=self.strategy.risk.max_gross_exposure,
+            market=self.market,
+        )
+        if sized.shares <= 0:
+            self._cancel(index, bar, sized.reason, None, sized.text)
+            self.pending_entry = None
+            return
+        fill = apply_buy(self.cash, fill_price, sized.shares, self.market)
+        self.cash = fill.cash_after
+        self._mark_trade(bar.time)
+        self.position = _Position(
+            shares=sized.shares,
+            adjusted_stop=None,
+            planned_risk=sized.planned_risk,
+            entry_equity=equity,
+            cost_basis=fill.notional + fill.fee,
+            reduced=False,
+            hh=bar.high * bar.factor,
+            one_lot=False,
+            initial_stop=None,
+        )
+        self.cumulative_fees += fill.fee
+        self.bar_fee += fill.fee
+        self.pending_entry = None
+        text = (
+            f"入场：买入 {sized.shares} 股，成交价 {_num(fill.price)} {self._currency()}。"
+            f"没有价格止损。{sized.text}{pending.text}"
+        )
+        self._record(
+            index, bar, action="入场", reason="", shares_before=0, shares_after=sized.shares,
+            price=fill.price, adjusted_stop=None, stop=None,
+            planned_risk=sized.planned_risk, one_lot=False, text=text,
+            fee=fill.fee, reference_equity=equity,
         )
 
     def _stop_out(self, index: int, bar: ReplayBar, raw_price: float, *, gap: bool) -> None:
@@ -343,20 +456,27 @@ class _Replay:
         fill_price = slipped_sell(raw_price, self.slippage)
         if gap:
             reason = "跳空穿过止损"
+            rule = self._stop_rule()
             lead = (
                 f"止损：开盘价 {_num(bar.open)} 不高于不复权止损 {_num(stop)}，"
                 f"按开盘价 {_num(fill_price)} 成交。"
             )
         else:
             reason = "盘中触及止损"
+            rule = self._stop_rule()
             lead = f"止损：最低价触及不复权止损 {_num(stop)}，按止损价 {_num(fill_price)} 成交。"
-        self._sell(index, bar, position.shares, fill_price, action="止损", reason=reason, lead=lead, already_slipped=True)
+        self._sell(
+            index, bar, position.shares, fill_price, action="止损", reason=reason,
+            lead=lead, already_slipped=True, exit_rule=rule,
+        )
 
     def _trend_exit(self, index: int, bar: ReplayBar) -> None:
         price = slipped_sell(bar.open, self.slippage)
+        rule = self.pending_exit_rule or "趋势失效"
         self._sell(
             index, bar, self.position.shares, price,
-            action="趋势退出", reason="趋势失效", lead=self.pending_exit_text, already_slipped=True,
+            action="趋势退出", reason=rule, lead=self.pending_exit_text, already_slipped=True,
+            exit_rule=rule,
         )
 
     def _reduce(self, index: int, bar: ReplayBar) -> None:
@@ -369,17 +489,24 @@ class _Replay:
         if flatten:
             lead = "衰竭减仓：取整后不足一手，改为全部退出。"
             reason = "取整全平"
+            rule = "衰竭取整后全平"
         else:
             lead = "衰竭减仓：卖出部分仓位，剩余沿用同一条止损。"
             reason = "衰竭减仓"
-        self._sell(index, bar, qty, price, action="减仓", reason=reason, lead=lead, already_slipped=True)
+            rule = "衰竭减仓"
+        self._sell(
+            index, bar, qty, price, action="减仓", reason=reason, lead=lead,
+            already_slipped=True, exit_rule=rule,
+        )
 
-    def _sell(self, index, bar, qty, price, *, action, reason, lead, already_slipped) -> None:
+    def _sell(self, index, bar, qty, price, *, action, reason, lead, already_slipped, exit_rule="") -> None:
         position = self.position
         if qty < 1 or qty > position.shares:
             raise ValueError("卖出股数必须在持仓之内")
         fill_price = price if already_slipped else slipped_sell(price, self.slippage)
         fill = apply_sell(self.cash, fill_price, qty, self.market)
+        self.cumulative_fees += fill.fee
+        self.bar_fee += fill.fee
         basis = position.cost_basis * qty / position.shares
         pnl = (fill.notional - fill.fee) - basis
         loss_fraction = 0.0
@@ -388,28 +515,37 @@ class _Replay:
         before = position.shares
         self.cash = fill.cash_after
         left = before - qty
+        if position.adjusted_stop is None:
+            risk_line = f"入场名义仓位 {format_percent(position.planned_risk)}，"
+        else:
+            risk_line = f"计划风险 {format_percent(position.planned_risk)}，"
         text = (
             f"{lead}卖出 {qty} 股，成交价 {_num(fill.price)} {self._currency()}，"
             f"股数由 {before} 变为 {left}。"
-            f"计划风险 {format_percent(position.planned_risk)}，"
+            f"{risk_line}"
             f"实际盈亏 {_num(pnl)} {self._currency()}，"
             f"实际亏损 {format_percent(loss_fraction)}。"
         )
         self._record(
             index, bar, action=action, reason=reason, shares_before=before, shares_after=left,
             price=fill.price, adjusted_stop=position.adjusted_stop,
-            stop=raw_stop(position.adjusted_stop, bar.factor),
+            stop=None if position.adjusted_stop is None else raw_stop(position.adjusted_stop, bar.factor),
             planned_risk=position.planned_risk, actual_pnl=pnl, actual_loss_fraction=loss_fraction,
-            one_lot=position.one_lot, text=text,
+            one_lot=position.one_lot, text=text, fee=fill.fee, exit_rule=exit_rule,
+            reference_equity=position.entry_equity,
         )
         if left == 0:
             self.position = None
             self.pending_exit = None
+            self.pending_exit_rule = ""
             return
         position.shares = left
         position.cost_basis -= basis
 
-    def _schedule(self, bar: ReplayBar) -> None:
+    def _schedule(self, index: int, bar: ReplayBar) -> None:
+        if getattr(self.tactic, "exit_kind", "") == "scale_downtrend":
+            self._schedule_scale_exit(index, bar)
+            return
         position = self.position
         position.hh = max(position.hh, bar.high * bar.factor)
         failed = long_trend_failed(bar.structure)
@@ -423,6 +559,7 @@ class _Replay:
             else:
                 self.pending_exit_text = f"趋势变成{label}，下一根全部退出，不开反向仓。"
             self.pending_exit = "trend"
+            self.pending_exit_rule = "趋势失效"
         elif reduce:
             position.reduced = True
             self.pending_exit = "reduce"
@@ -437,21 +574,56 @@ class _Replay:
             trail_states=self.strategy.exit.trail_states,
         )
 
+    def _schedule_scale_exit(self, index: int, bar: ReplayBar) -> None:
+        """卖出尺度的下降趋势在当根确认，下一根开盘退出。不抬止损，不减仓。"""
+        if bar.exit_structure != DOWNTREND or bar.exit_direction_start_index != index:
+            return
+        name = scale_label(bar.exit_scale)
+        self.pending_exit = "trend"
+        self.pending_exit_rule = f"{name}下降"
+        self.pending_exit_text = f"{name}下降趋势在当根确认，下一根开盘全部退出，不开反向仓。"
+
+    def _stop_rule(self) -> str:
+        position = self.position
+        if (
+            position is not None
+            and position.adjusted_stop is not None
+            and position.initial_stop is not None
+            and position.adjusted_stop > position.initial_stop + 1e-8
+        ):
+            return "跟踪止损"
+        return "止损"
+
     def _ask(self, index: int, bar: ReplayBar) -> None:
-        signal = self.tactic.propose(tuple(self.bars[: index + 1]))
+        prefix = tuple(self.bars[: index + 1])
+        if hasattr(self.tactic, "skip_reason"):
+            blocked = self.tactic.skip_reason(prefix)
+        elif hasattr(self.tactic, "environment_block"):
+            blocked = self.tactic.environment_block(bar)
+        else:
+            blocked = None
+        signal = self.tactic.propose(prefix)
+        if signal is None and blocked:
+            self.blocked[blocked] = self.blocked.get(blocked, 0) + 1
         if signal is None:
             return
         if not isinstance(signal, EntrySignal):
             raise TypeError("插件必须返回 EntrySignal 或 None")
         stop = signal.adjusted_stop
-        if isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(float(stop)) or float(stop) <= 0:
+        if stop is None:
+            if getattr(self.tactic, "exit_kind", "") != "scale_downtrend":
+                self._cancel(index, bar, "止损无效", None, signal.text or "")
+                return
+        elif isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(float(stop)) or float(stop) <= 0:
             self._cancel(index, bar, "止损无效", None, signal.text or "")
             return
+        else:
+            stop = float(stop)
         if bar.a_t is None:
             self._cancel(index, bar, "波动单位尚未就绪", None, signal.text or "")
             return
         self.pending_entry = _PendingEntry(
-            adjusted_stop=float(stop),
+            adjusted_stop=stop,
             adjusted_close=bar.close * bar.factor,
             a_t=float(bar.a_t),
             text=signal.text or "入场信号",
@@ -465,29 +637,33 @@ class _Replay:
         if bar.dividend > 0:
             before = self.cash
             self.cash, credit = credit_dividend(self.cash, position.shares, bar.dividend, self.withholding)
+            self.bar_dividend += credit.cash
+            stop_note = _stop_note(position.adjusted_stop)
             text = (
                 f"派息入账：每股股息 {_num(bar.dividend)} {self._currency()}，"
                 f"预扣税 {_num(credit.tax)} {self._currency()}，"
                 f"入账现金 {_num(credit.cash)} {self._currency()}，"
                 f"现金由 {_num(before)} 变为 {_num(self.cash)} {self._currency()}，"
-                f"股数 {position.shares}，复权止损 {_num(position.adjusted_stop)}。"
+                f"股数 {position.shares}。{stop_note}"
             )
             self._record(
                 index, bar, action="派息入账", reason="", shares_before=position.shares,
                 shares_after=position.shares, adjusted_stop=position.adjusted_stop,
-                stop=raw_stop(position.adjusted_stop, bar.factor), text=text,
+                stop=None if position.adjusted_stop is None else raw_stop(position.adjusted_stop, bar.factor),
+                text=text,
             )
         if bar.split != 1:
             before = position.shares
             position.shares = apply_split(position.shares, bar.split)
             text = (
                 f"拆股：1 股变为 {_num(bar.split)} 股，股数由 {before} 变为 {position.shares}，"
-                f"现金不变仍为 {_num(self.cash)} {self._currency()}，"
-                f"复权止损 {_num(position.adjusted_stop)}。"
+                f"现金不变仍为 {_num(self.cash)} {self._currency()}。"
+                f"{_stop_note(position.adjusted_stop)}"
             )
             self._record(
                 index, bar, action="拆股", reason="", shares_before=before, shares_after=position.shares,
-                adjusted_stop=position.adjusted_stop, stop=raw_stop(position.adjusted_stop, bar.factor),
+                adjusted_stop=position.adjusted_stop,
+                stop=None if position.adjusted_stop is None else raw_stop(position.adjusted_stop, bar.factor),
                 text=text,
             )
 
@@ -510,8 +686,11 @@ class _Replay:
     def _record(
         self, index, bar, *, action, reason, shares_before, shares_after, text,
         price=None, adjusted_stop=None, stop=None, planned_risk=None, actual_pnl=None,
-        actual_loss_fraction=None, one_lot=False,
+        actual_loss_fraction=None, one_lot=False, fee=None, exit_rule="", reference_equity=None,
     ) -> None:
+        mark = bar.close if price is None else price
+        equity = self.cash + shares_after * mark
+        fraction = 0.0 if equity <= 0 else shares_after * mark / equity
         self.decisions.append(Decision(
             index=index,
             time=bar.time,
@@ -527,20 +706,41 @@ class _Replay:
             actual_loss_fraction=actual_loss_fraction,
             one_lot=one_lot,
             text=text,
+            structure=bar.structure,
+            category=bar.category,
+            a_t=bar.a_t,
+            ema=bar.ema,
+            factor=bar.factor,
+            fee=fee,
+            cash_after=self.cash,
+            equity_after=equity,
+            position_fraction=fraction,
+            exit_rule=exit_rule,
+            reference_equity=reference_equity,
         ))
 
     def _mark(self, index, bar, governed, next_stop) -> None:
         shares = 0 if self.position is None else self.position.shares
+        equity = self.cash + shares * bar.close
+        fraction = 0.0 if equity <= 0 else shares * bar.close / equity
         self.equity.append(EquityRow(
             index=index,
             time=bar.time,
-            equity=self.cash + shares * bar.close,
+            equity=equity,
             cash=self.cash,
             shares=shares,
             close=bar.close,
             effective_stop=governed,
             next_stop=next_stop,
             raw_stop=None if governed is None else governed / bar.factor,
+            structure=bar.structure,
+            category=bar.category,
+            position_fraction=fraction,
+            planned_risk=None if self.position is None else self.position.planned_risk,
+            factor=bar.factor,
+            dividend_cash=self.bar_dividend,
+            equity_gross=equity + self.cumulative_fees,
+            fee=self.bar_fee,
         ))
 
     def _can_trade(self, when: str) -> bool:
@@ -564,6 +764,12 @@ class _Replay:
             raise ValueError(f"{bar.time} 的除权数据无效")
         if bar.a_t is not None and bar.a_t < 0:
             raise ValueError(f"{bar.time} 的 a_t 不能为负")
+
+
+def _stop_note(adjusted_stop: Optional[float]) -> str:
+    if adjusted_stop is None:
+        return ""
+    return f"复权止损 {_num(adjusted_stop)}。"
 
 
 def _num(value: float) -> str:

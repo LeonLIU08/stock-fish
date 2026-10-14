@@ -69,6 +69,8 @@ class PullbackTactic(EntryTactic):
         if not close > prior_high:
             return None
         origin = _pullback_origin(bars, recent, current)
+        if origin is None:
+            return None
         low = min(adjusted_low(item) for item in bars[origin:current + 1])
         stop = offset_price(low, bar.a_t, -entry.stop_buffer, self.price_axis)
         if not math.isfinite(stop):
@@ -101,23 +103,21 @@ def _latest_pullback(bars: Sequence, current: int, lookback: int) -> Optional[in
     return found
 
 
-def _pullback_origin(bars: Sequence, recent: int, current: int) -> int:
-    """本轮上涨回调的起点。窗口里有多段时，用最近一段的起点，它可以早于这 5 根。"""
+def _pullback_origin(bars: Sequence, recent: int, current: int) -> Optional[int]:
+    """本轮上涨回调的起点。对不上时这根不开仓，不让整只股票失败。"""
     declared = bars[recent].phase_start_index
-    if isinstance(declared, bool):
-        raise ValueError("上涨回调的起点必须是整数序号")
-    if declared is None:
+    if declared is None or isinstance(declared, bool):
         origin = recent
         while origin > 0 and bars[origin - 1].category == UP_PULLBACK and _same_uptrend(bars, origin - 1, current):
             origin -= 1
         return origin
     if not isinstance(declared, int) or not 0 <= declared <= recent:
-        raise ValueError("上涨回调的起点不在可见 K 线里")
+        return None
     if not _same_uptrend(bars, declared, current):
-        raise ValueError("上涨回调的起点和信号不在同一段上升里")
+        return None
     for index in range(declared, recent + 1):
         if bars[index].category != UP_PULLBACK:
-            raise ValueError("上涨回调的起点到该段最后一根应该都是上涨回调")
+            return None
     return declared
 
 
