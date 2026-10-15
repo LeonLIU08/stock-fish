@@ -1,6 +1,6 @@
 /* 趋势结构图。只读 view model，不重新拟合。 */
 const TrendChart = (function () {
-  function mount(container, viewModel) {
+  function mount(container, viewModel, replay) {
     if (!container) {
       throw new Error("缺少图表容器");
     }
@@ -19,15 +19,24 @@ const TrendChart = (function () {
     const styles = viewModel.styles || {};
     const barByIndex = new Map();
     closes.forEach(function (bar) { barByIndex.set(bar.index, bar); });
-    const pivotsByIndex = new Map();
+    const replayFrames = replay && replay.frames;
+    let pivotsByIndex;
+    let legendMeta;
+    let wantedNames;
+    let series;
+    let focusIndex;
+    let focusMarks;
+    let laneCount = 0;
+    function assembleSeries() {
+    pivotsByIndex = new Map();
     (viewModel.pivots || []).forEach(function (pivot) {
       const bucket = pivotsByIndex.get(pivot.index) || [];
       bucket.push(pivot);
       pivotsByIndex.set(pivot.index, bucket);
     });
 
-    const legendMeta = new Map();
-    const wantedNames = [];
+    legendMeta = new Map();
+    wantedNames = [];
     function track(name, scale, method, layer) {
       if (!legendMeta.has(name)) {
         legendMeta.set(name, { scale: scale || null, method: method || null, layer: layer || null });
@@ -35,8 +44,8 @@ const TrendChart = (function () {
       }
     }
 
-    const series = [];
-    const focusIndex = { boundary: new Map(), zone: new Map(), pivot: new Map(), segment: new Map() };
+    series = [];
+    focusIndex = { boundary: new Map(), zone: new Map(), pivot: new Map(), segment: new Map() };
 
     series.push({
       id: "closes",
@@ -50,8 +59,14 @@ const TrendChart = (function () {
       z: 2,
       markLine: viewModel.as_of_index == null ? undefined : {
         symbol: ["none", "none"],
-        label: { formatter: "as-of", color: colors.as_of || "#E0A45A" },
-        lineStyle: { color: colors.as_of || "#E0A45A", type: "dashed", width: 1 },
+        label: {
+          formatter: function () {
+            const bar = barByIndex.get(viewModel.as_of_index);
+            return bar && bar.label ? bar.label : "as-of";
+          },
+          color: colors.as_of || "#E0A45A",
+        },
+        lineStyle: { color: colors.as_of || "#E0A45A", type: "dashed", width: 1.6 },
         data: [{ xAxis: viewModel.as_of_index }],
       },
     });
@@ -197,7 +212,7 @@ const TrendChart = (function () {
       });
     }
 
-    const focusMarks = new Map();
+    focusMarks = new Map();
     const laneBuckets = new Map();
     const laneOrder = [];
     (viewModel.marks || []).forEach(function (mark) {
@@ -310,7 +325,7 @@ const TrendChart = (function () {
         z: 3,
       });
     });
-    const laneCount = laneOrder.length;
+    laneCount = laneOrder.length;
 
     series.push({
       id: "focus-line",
@@ -334,96 +349,116 @@ const TrendChart = (function () {
       z: 7,
       silent: true,
     });
+    }
+    assembleSeries();
 
     const scaleSet = new Set(viewModel.default_scales || ["mid"]);
     let projectionOn = true;
     const extras = { "基础线段": false, "已过期": false };
-    const replacedLayers = new Set(viewModel.replaced_layers || []);
+    let replacedLayers = new Set(viewModel.replaced_layers || []);
     const layerChoice = {};
     const selected = {};
     applySelection(selected);
 
     const priceBounds = paddedPriceBounds(viewModel, priceAxis === "log");
     const chart = echarts.init(container, null, { renderer: "canvas" });
-    chart.setOption({
-      backgroundColor: "transparent",
-      animationDurationUpdate: 0,
-      textStyle: { fontFamily: '"Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif' },
-      graphic: [{
-        type: "text",
-        left: 8,
-        top: 6,
-        style: {
-          text: viewModel.axis_label || "",
-          fill: "#a39c90",
-          font: '12px "Avenir Next", "PingFang SC", sans-serif',
-        },
-      }],
-      grid: { left: 8, right: 36, top: 28, bottom: 112 + (laneCount ? 22 + laneCount * 16 : 0), containLabel: true },
-      legend: {
-        type: "scroll",
-        bottom: 40,
-        data: wantedNames,
-        selected: selected,
-        textStyle: { color: "#c8c2b4" },
-        pageIconColor: "#c8c2b4",
-        pageTextStyle: { color: "#c8c2b4" },
-      },
-      tooltip: {
-        trigger: "axis",
-        confine: true,
-        backgroundColor: "#262017",
-        borderColor: "#4a4338",
-        textStyle: { color: "#f3efe4", fontSize: 12 },
-        axisPointer: { type: "cross", lineStyle: { color: "rgba(224,164,90,0.45)" } },
-        formatter: tooltipFormatter,
-      },
-      xAxis: {
-        type: "value",
-        axisLine: { lineStyle: { color: "#3a342c" } },
-        axisTick: { show: false },
-        axisLabel: { color: "#a39c90", hideOverlap: true, margin: 12, formatter: tickText },
-        splitLine: { show: false },
-      },
-      yAxis: {
-        type: priceAxis,
-        min: priceBounds.min,
-        max: priceBounds.max,
-        scale: false,
-        splitNumber: 5,
-        logBase: 10,
-        axisLine: { show: false },
-        axisTick: { show: false },
-        axisLabel: { color: "#a39c90", margin: 10, formatter: formatPrice },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
-      },
-      dataZoom: [
-        { id: "x-pan", type: "inside", xAxisIndex: 0, filterMode: "none", zoomOnMouseWheel: false, moveOnMouseMove: false, moveOnMouseWheel: false },
-        {
-          id: "x-slider",
-          type: "slider",
-          xAxisIndex: 0,
+    function chartOption(yMin, yMax, xMin, xMax, selectedNow) {
+      function zoom(extra) {
+        const item = {
           filterMode: "none",
-          bottom: 10,
-          height: 18,
-          borderColor: "#3a342c",
-          backgroundColor: "#1a1814",
-          fillerColor: "rgba(224,164,90,0.22)",
-          handleStyle: { color: "#e0a45a", borderColor: "#e0a45a" },
-          textStyle: { color: "#a39c90" },
-          brushSelect: false,
-          labelFormatter: tickText,
+          xAxisIndex: 0,
+        };
+        if (xMin != null && xMax != null) {
+          item.startValue = xMin;
+          item.endValue = xMax;
+        }
+        Object.keys(extra).forEach(function (key) { item[key] = extra[key]; });
+        return item;
+      }
+      return {
+        backgroundColor: "transparent",
+        animation: false,
+        animationDurationUpdate: 0,
+        textStyle: { fontFamily: '"Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif' },
+        graphic: [{
+          type: "text",
+          left: 8,
+          top: 6,
+          style: {
+            text: viewModel.axis_label || "",
+            fill: "#a39c90",
+            font: '12px "Avenir Next", "PingFang SC", sans-serif',
+          },
+        }],
+        grid: { left: 8, right: 36, top: 28, bottom: 112 + (laneCount ? 22 + laneCount * 16 : 0), containLabel: true },
+        legend: {
+          type: "scroll",
+          bottom: 40,
+          data: wantedNames,
+          selected: selectedNow,
+          textStyle: { color: "#c8c2b4" },
+          pageIconColor: "#c8c2b4",
+          pageTextStyle: { color: "#c8c2b4" },
         },
-      ],
-      series: series,
-    });
+        tooltip: {
+          trigger: "axis",
+          confine: true,
+          backgroundColor: "#262017",
+          borderColor: "#4a4338",
+          textStyle: { color: "#f3efe4", fontSize: 12 },
+          axisPointer: { type: "cross", lineStyle: { color: "rgba(224,164,90,0.45)" } },
+          formatter: tooltipFormatter,
+        },
+        xAxis: {
+          type: "value",
+          axisLine: { lineStyle: { color: "#3a342c" } },
+          axisTick: { show: false },
+          axisLabel: { color: "#a39c90", hideOverlap: true, margin: 12, formatter: tickText },
+          splitLine: { show: false },
+        },
+        yAxis: {
+          type: priceAxis,
+          min: yMin,
+          max: yMax,
+          scale: false,
+          splitNumber: 5,
+          logBase: 10,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          axisLabel: { color: "#a39c90", margin: 10, formatter: formatPrice },
+          splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
+        },
+        dataZoom: [
+          zoom({ id: "x-pan", type: "inside", zoomOnMouseWheel: false, moveOnMouseMove: false, moveOnMouseWheel: false }),
+          zoom({
+            id: "x-slider",
+            type: "slider",
+            bottom: 10,
+            height: 18,
+            borderColor: "#3a342c",
+            backgroundColor: "#1a1814",
+            fillerColor: "rgba(224,164,90,0.22)",
+            handleStyle: { color: "#e0a45a", borderColor: "#e0a45a" },
+            textStyle: { color: "#a39c90" },
+            brushSelect: false,
+            labelFormatter: tickText,
+          }),
+        ],
+        series: series,
+      };
+    }
+    chart.setOption(chartOption(priceBounds.min, priceBounds.max, null, null, selected));
     chart.resize();
 
     const initial = extents();
     const fullX = { min: initial.x[0], max: initial.x[1] };
     const fullY = { min: priceBounds.min, max: priceBounds.max };
     let listener = null;
+    let asOfListener = null;
     let drag = null;
+    let scrub = null;
+    let scrubIndex = null;
+    let scrubRaf = 0;
     const cleanups = [];
 
     function on(target, type, handler, options) {
@@ -601,6 +636,8 @@ const TrendChart = (function () {
 
     function onChange(fn) { listener = fn; }
 
+    function onAsOf(fn) { asOfListener = fn; }
+
     function emit() { if (listener) listener(state()); }
 
     function applySelection(target) {
@@ -660,8 +697,75 @@ const TrendChart = (function () {
       reset();
     }
 
+    function applyChart(chartFrame) {
+      const xZoom = (chart.getOption().dataZoom || [])[0] || {};
+      const yAxis = (chart.getOption().yAxis || [])[0] || {};
+      viewModel.pivots = chartFrame.pivots || [];
+      viewModel.boundaries = chartFrame.boundaries || [];
+      viewModel.zones = chartFrame.zones || [];
+      viewModel.segments = chartFrame.segments || [];
+      viewModel.marks = chartFrame.marks || [];
+      viewModel.as_of_index = chartFrame.as_of_index;
+      viewModel.method_objects = chartFrame.method_objects || {};
+      if (chartFrame.default_methods) viewModel.default_methods = chartFrame.default_methods;
+      viewModel.replaced_layers = chartFrame.replaced_layers || [];
+      replacedLayers = new Set(viewModel.replaced_layers);
+      assembleSeries();
+      const nextSelected = {};
+      applySelection(nextSelected);
+      chart.setOption(
+        chartOption(yAxis.min, yAxis.max, xZoom.startValue, xZoom.endValue, nextSelected),
+        { notMerge: true }
+      );
+    }
+
+    function asOfPixel() {
+      if (viewModel.as_of_index == null) return null;
+      const px = chart.convertToPixel({ xAxisIndex: 0 }, viewModel.as_of_index);
+      const x = Array.isArray(px) ? px[0] : px;
+      return x != null && isFinite(x) ? x : null;
+    }
+
+    function nearAsOf(event) {
+      const x = asOfPixel();
+      if (x == null) return false;
+      const rect = container.getBoundingClientRect();
+      return Math.abs(event.clientX - rect.left - x) <= 10;
+    }
+
+    function indexAt(event) {
+      const rect = container.getBoundingClientRect();
+      const value = chart.convertFromPixel({ xAxisIndex: 0 }, event.clientX - rect.left);
+      const data = Array.isArray(value) ? value[0] : value;
+      if (data == null || !isFinite(data)) return null;
+      const bars = viewModel.closes || [];
+      if (!bars.length) return null;
+      const min = bars[0].index;
+      const max = bars[bars.length - 1].index;
+      return Math.max(min, Math.min(max, Math.round(data)));
+    }
+
+    function flushScrub(committed) {
+      if (scrubRaf) {
+        cancelAnimationFrame(scrubRaf);
+        scrubRaf = 0;
+      }
+      if (!replayFrames || scrubIndex == null) return;
+      const frame = replayFrames[scrubIndex];
+      if (!frame) return;
+      if (!frame.chart || frame.chart.as_of_index !== viewModel.as_of_index) applyChart(frame.chart || {});
+      if (asOfListener) asOfListener(frame, committed);
+    }
+
     function onPointerDown(event) {
       if (event.button !== 0 || !inGrid(event)) return;
+      if (replayFrames && nearAsOf(event)) {
+        scrub = event.pointerId;
+        scrubIndex = viewModel.as_of_index;
+        container.setPointerCapture(event.pointerId);
+        container.style.cursor = "ew-resize";
+        return;
+      }
       const ext = extents();
       const px0 = chart.convertToPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [ext.x[0], ext.y[0]]);
       const px1 = chart.convertToPixel({ xAxisIndex: 0, yAxisIndex: 0 }, [ext.x[1], ext.y[1]]);
@@ -672,6 +776,21 @@ const TrendChart = (function () {
     }
 
     function onPointerMove(event) {
+      if (scrub != null && event.pointerId === scrub) {
+        event.preventDefault();
+        const index = indexAt(event);
+        if (index == null) return;
+        scrubIndex = index;
+        if (scrubRaf) return;
+        scrubRaf = requestAnimationFrame(function () {
+          scrubRaf = 0;
+          flushScrub(false);
+        });
+        return;
+      }
+      if (replayFrames && !drag && inGrid(event)) {
+        container.style.cursor = nearAsOf(event) ? "ew-resize" : "grab";
+      }
       if (!drag || event.pointerId !== drag.pointerId) return;
       event.preventDefault();
       const dx = event.clientX - drag.clientX;
@@ -692,6 +811,12 @@ const TrendChart = (function () {
     }
 
     function onPointerUp(event) {
+      if (scrub != null && event.pointerId === scrub) {
+        scrub = null;
+        container.style.cursor = "grab";
+        flushScrub(true);
+        return;
+      }
       if (!drag || event.pointerId !== drag.pointerId) return;
       drag = null;
       container.style.cursor = "grab";
@@ -920,7 +1045,7 @@ const TrendChart = (function () {
       return bar ? bar.label : "";
     }
 
-    return { reset: reset, destroy: destroy, focus: focus, setScales: setScales, setExtra: setExtra, state: state, onChange: onChange };
+    return { reset: reset, destroy: destroy, focus: focus, setScales: setScales, setExtra: setExtra, state: state, onChange: onChange, onAsOf: onAsOf };
   }
 
   function laneItem(params, api, laneIndex) {
