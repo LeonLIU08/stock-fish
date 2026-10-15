@@ -1678,7 +1678,7 @@ def _pullback_week(
 class EntryPluginTests(unittest.TestCase):
     def test_registry_refuses_a_plugin_without_a_stop(self):
         config = load_trend_config(today=date(2026, 10, 13))
-        self.assertEqual(list_entries(), ["breakout", "d0", "d1", "pullback", "trend"])
+        self.assertEqual(list_entries(), ["breakout", "d0", "d1", "pullback", "scale", "trend"])
         first = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         second = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         self.assertIsNot(first, second)
@@ -2671,6 +2671,172 @@ class ReportTests(unittest.TestCase):
             self.assertTrue(any("修补了" in gap for gap in repaired[0]["gaps"]))
             out = Path(payload["output_dir"])
             self.assertTrue((out / "00004_breakout" / "report.html").is_file())
+
+
+def _run_scale(bars, price_axis="uniform"):
+    config = load_trend_config(
+        ROOT / "analysis" / "backtest" / "trend-strategy-scale.yaml",
+        today=date(2026, 10, 15),
+    )
+    strategy = replace(config.strategies["scale"], order=replace(config.strategies["scale"].order, slippage_rate=0.0))
+    market = replace(
+        config.markets[MARKET_HK],
+        commission_rate=0.0,
+        min_commission=0.0,
+        platform_fee=0.0,
+        stamp_duty_rate=0.0,
+        exchange_fee_rate=0.0,
+        settlement_rate=0.0,
+    )
+    tactic = create_entry("scale", strategy, price_axis=price_axis)
+    return run_account(
+        bars, tactic, strategy, market, lot_size=1, capital=100_000.0, price_axis=price_axis,
+    )
+
+
+def _sbar(index, open_, close, *, structure=UPTREND, category=UP_CONTINUE, direction_start=0, a_t=1.0, high=None, low=None):
+    return _bar(
+        f"d{index}",
+        open_,
+        max(open_, close) if high is None else high,
+        min(open_, close) if low is None else low,
+        close,
+        structure=structure,
+        category=category,
+        a_t=a_t,
+        direction_start_index=direction_start,
+    )
+
+
+class ScaleTests(unittest.TestCase):
+    def test_config_rejects_trailing_during_birth(self):
+        path = ROOT / "analysis" / "backtest" / "trend-strategy-scale.yaml"
+        config = load_trend_config(path, today=date(2026, 10, 15))
+        scale = config.strategies["scale"]
+        self.assertEqual(scale.exit.mode, "scale_book")
+        self.assertEqual(scale.exit.trail_buffer, 3.0)
+        self.assertEqual(scale.exit.max_adds, 2)
+        self.assertEqual(scale.risk.risk_per_trade, 0.005)
+        self.assertEqual(scale.risk.max_open_risk, 0.01)
+        self.assertEqual(scale.order.min_stop_distance, 1.0)
+        self.assertNotIn(UP_BIRTH, scale.exit.trail_states)
+        data = load_trend_yaml(path)
+        data["strategies"]["scale"]["exit"]["trail_categories"] = ["up_continue", "up_birth"]
+        with self.assertRaisesRegex(ValueError, "up_birth"):
+            trend_config_from_mapping(data, source="scale-test")
+
+    def test_birth_does_not_raise_the_stop(self):
+        result = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 102, category=UP_BIRTH, direction_start=0, high=103, low=99.5),
+            _sbar(2, 102, 104, category=UP_BIRTH, direction_start=0, high=105, low=101),
+            _sbar(3, 101.2, 104, category=UP_CONTINUE, direction_start=0, high=105, low=101.2),
+            _sbar(4, 101.5, 101.5, category=UP_CONTINUE, direction_start=0, high=102, low=101.5),
+        ])
+        self.assertEqual([item.time for item in _by(result, "入场")], ["d1"])
+        self.assertEqual([item.time for item in _by(result, "止损")], ["d4"])
+        self.assertEqual(_by(result, "减仓"), [])
+        self.assertAlmostEqual(result.equity[1].next_stop, 97.0)
+        self.assertAlmostEqual(result.equity[2].next_stop, 97.0)
+        self.assertAlmostEqual(result.equity[3].next_stop, 102.0)
+
+    def test_add_waits_until_pullback_ends_and_the_stop_covers_cost(self):
+        added = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 103, category=UP_CONTINUE, direction_start=0, high=104, low=99.5),
+            _sbar(3, 103, 102, category=UP_PULLBACK, direction_start=0, high=103.5, low=101.5),
+            _sbar(4, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101.5),
+            _sbar(5, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102),
+        ])
+        self.assertEqual([item.time for item in _by(added, "加仓")], ["d5"])
+        self.assertGreater(added.final_shares, _by(added, "入场")[0].shares_after)
+        uncovered = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 101, category=UP_CONTINUE, direction_start=0, high=102, low=99.5),
+            _sbar(3, 101, 100.5, category=UP_PULLBACK, direction_start=0, high=101, low=99.2),
+            _sbar(4, 100.5, 101, category=UP_CONTINUE, direction_start=0, high=101.5, low=99.2),
+            _sbar(5, 101, 101, category=UP_CONTINUE, direction_start=0, high=101.5, low=99.2),
+        ])
+        self.assertEqual(_by(uncovered, "加仓"), [])
+
+    def test_pullback_on_the_confirmation_bar_does_not_open(self):
+        result = _run_scale([
+            _sbar(0, 100, 100, category=UP_PULLBACK, direction_start=0, high=101, low=99),
+            _sbar(1, 100, 101, category=UP_CONTINUE, direction_start=0, high=102, low=99),
+        ])
+        self.assertEqual(_by(result, "入场"), [])
+        self.assertIn("主状态不允许试仓", dict(result.blocked))
+
+    def test_exhaustion_peels_once_and_down_birth_flattens(self):
+        peeled = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 103, category=UP_CONTINUE, direction_start=0, high=104, low=99.5),
+            _sbar(3, 103, 102, category=UP_PULLBACK, direction_start=0, high=103.5, low=101.5),
+            _sbar(4, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101.5),
+            _sbar(5, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102),
+            _sbar(6, 103, 103, category=UP_EXHAUSTION, direction_start=0, high=104, low=102),
+            _sbar(7, 103, 103, category=UP_EXHAUSTION, direction_start=0, high=104, low=102),
+            _sbar(8, 103, 103, category=UP_EXHAUSTION, direction_start=0, high=104, low=102),
+        ])
+        reductions = _by(peeled, "减仓")
+        self.assertEqual([item.time for item in reductions], ["d7"])
+        self.assertGreater(reductions[0].shares_after, 0)
+        self.assertEqual(reductions[0].exit_rule, "上涨衰竭")
+        flat = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 100, category=DOWN_BIRTH, structure=DOWNTREND, direction_start=2, high=101, low=98),
+            _sbar(3, 100, 100, category="down_continue", structure=DOWNTREND, direction_start=2, high=101, low=98),
+        ])
+        exits = _by(flat, "趋势退出")
+        self.assertEqual([item.time for item in exits], ["d3"])
+        self.assertEqual(exits[0].shares_after, 0)
+        self.assertEqual(exits[0].exit_rule, "下跌初生")
+        held = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 100, category=NEUTRAL, structure=RANGE, direction_start=2, high=101, low=98),
+            _sbar(3, 100, 100, category=NEUTRAL, structure=RANGE, direction_start=2, high=101, low=98),
+        ])
+        self.assertEqual(_by(held, "趋势退出"), [])
+        self.assertGreater(held.final_shares, 0)
+
+    def test_banking_the_starter_leaves_the_later_tranche(self):
+        result = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=98),
+            _sbar(2, 100, 103, category=UP_CONTINUE, direction_start=0, high=104, low=99.5),
+            _sbar(3, 103, 102, category=UP_PULLBACK, direction_start=0, high=103.5, low=101.5),
+            _sbar(4, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101.5),
+            _sbar(5, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102),
+            _sbar(6, 108, 110, category=UP_CONTINUE, direction_start=0, high=110, low=108),
+            _sbar(7, 108, 108, category=UP_CONTINUE, direction_start=0, high=109, low=108),
+        ])
+        reductions = _by(result, "减仓")
+        self.assertEqual([item.time for item in reductions], ["d7"])
+        self.assertEqual(reductions[0].exit_rule, "试仓止盈")
+        self.assertGreater(reductions[0].shares_after, 0)
+        self.assertGreaterEqual(len(_by(result, "加仓")), 1)
+
+    def test_wider_volatility_does_not_lower_the_stop(self):
+        result = _run_scale([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 102, category=UP_BIRTH, direction_start=0, high=103, low=99.5),
+            _sbar(2, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101.5),
+            _sbar(3, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102, a_t=20),
+        ])
+        self.assertAlmostEqual(result.equity[2].next_stop, 101.0)
+        self.assertAlmostEqual(result.equity[3].next_stop, 101.0)
+        self.assertEqual(_by(result, "止损"), [])
+
+    def test_add_budget_shrinks_and_then_skips(self):
+        from analysis.backtest.trend.risk import add_risk_budget
+        self.assertIsNone(add_risk_budget(0.008, 0.01, 0.005))
+        self.assertAlmostEqual(add_risk_budget(0.006, 0.01, 0.005), 0.004)
+        self.assertAlmostEqual(add_risk_budget(0.0, 0.01, 0.005), 0.005)
 
 
 if __name__ == "__main__":

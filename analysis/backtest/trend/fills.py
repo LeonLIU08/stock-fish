@@ -36,8 +36,9 @@ def entry_cancel_reason(
     adjusted_signal_close: float,
     a_t: float,
     gap_cancel: float,
-    max_stop_distance: float,
+    max_stop_distance: Optional[float],
     price_axis: str,
+    min_stop_distance: Optional[float] = None,
 ) -> Optional[str]:
     """跳空、止损距离、开盘价不高于止损。比较在复权价上做，门槛冻结在信号那根。"""
     if factor <= 0:
@@ -62,8 +63,10 @@ def entry_cancel_reason(
         distance = adjusted_open - float(adjusted_stop)
     else:
         raise ValueError(f"价格轴必须是 log 或 uniform，收到 {price_axis}")
-    if distance > float(max_stop_distance) * float(a_t):
+    if max_stop_distance is not None and distance > float(max_stop_distance) * float(a_t):
         return "止损距离"
+    if min_stop_distance is not None and distance < float(min_stop_distance) * float(a_t):
+        return "止损过近"
     return None
 
 

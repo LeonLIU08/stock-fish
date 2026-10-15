@@ -13,7 +13,7 @@ import pandas as pd
 
 from analysis.backtest.engine import EngineResult
 from analysis.backtest.trend.config import StrategySpec
-from analysis.backtest.trend.entries.base import EntrySignal, scale_label
+from analysis.backtest.trend.entries.base import EntrySignal, offset_price, scale_label
 from analysis.backtest.trend.exits import (
     drawdown_stop,
     exhaustion_due,
@@ -32,8 +32,14 @@ from analysis.backtest.trend.fills import (
     slipped_sell,
 )
 from analysis.backtest.trend.prices import upward_gap_cancel
-from analysis.backtest.trend.risk import format_percent, size_exposure, size_position
-from analysis.structure.methods.phase import DOWNTREND
+from analysis.backtest.trend.risk import add_risk_budget, format_percent, size_exposure, size_position
+from analysis.structure.methods.phase import (
+    DOWNTREND,
+    INSUFFICIENT,
+    UP_CONTINUE,
+    UP_PULLBACK,
+    _NAMES as PHASE_NAMES,
+)
 
 _COLUMNS = [
     "datetime",
@@ -180,6 +186,16 @@ class _PendingEntry:
     a_t: float
     text: str
     signal_index: int
+    kind: str = "starter"
+
+
+@dataclass
+class _Tranche:
+    role: str
+    shares: int
+    adjusted_fill: float
+    cash_basis: float
+    planned_risk: float
 
 
 @dataclass
@@ -254,9 +270,14 @@ class _Replay:
         self.cash = float(capital)
         self.position: Optional[_Position] = None
         self.pending_entry: Optional[_PendingEntry] = None
+        self.pending_add: Optional[_PendingEntry] = None
         self.pending_exit: Optional[str] = None
         self.pending_exit_text = ""
         self.pending_exit_rule = ""
+        self.tranches: list = []
+        self.add_count = 0
+        self.exhaustion_latched = False
+        self.prev_category: Optional[str] = None
         self.fills: dict = {}
         self.decisions: list = []
         self.equity: list = []
@@ -285,6 +306,7 @@ class _Replay:
         self.bar_fee = 0.0
         self.bar_dividend = 0.0
         if index < self.trade_from:
+            self._remember_phase(bar)
             return
         governed = None if self.position is None else self.position.adjusted_stop
         self._corporate(index, bar)
@@ -299,8 +321,19 @@ class _Replay:
         elif self.pending_entry is None:
             self._ask(index, bar)
         self._mark(index, bar, governed, next_stop)
+        self._remember_phase(bar)
+
+    def _remember_phase(self, bar: ReplayBar) -> None:
+        if getattr(self.tactic, "exit_kind", "") == "scale_book":
+            self.prev_category = bar.category
+
+    def _scale_book(self) -> bool:
+        return getattr(self.tactic, "exit_kind", "") == "scale_book"
 
     def _at_open(self, index: int, bar: ReplayBar) -> None:
+        if self._scale_book():
+            self._scale_open(index, bar)
+            return
         if self.position is not None:
             if self.position.adjusted_stop is not None:
                 stop = raw_stop(self.position.adjusted_stop, bar.factor)
@@ -338,6 +371,7 @@ class _Replay:
             a_t=pending.a_t,
             gap_cancel=self.strategy.order.gap_cancel,
             max_stop_distance=self.strategy.order.max_stop_distance,
+            min_stop_distance=self.strategy.order.min_stop_distance,
             price_axis=self.price_axis,
         )
         if reason:
@@ -396,6 +430,15 @@ class _Replay:
             planned_risk=sized.planned_risk, one_lot=sized.one_lot, text=text,
             fee=fill.fee,             reference_equity=equity,
         )
+        if self._scale_book():
+            self._reset_book()
+            self.tranches = [_Tranche(
+                "starter",
+                sized.shares,
+                fill.price * bar.factor,
+                fill.notional + fill.fee,
+                sized.planned_risk,
+            )]
 
     def _try_trend_entry(self, index: int, bar: ReplayBar) -> None:
         pending = self.pending_entry
@@ -520,7 +563,7 @@ class _Replay:
             already_slipped=True, exit_rule=rule,
         )
 
-    def _sell(self, index, bar, qty, price, *, action, reason, lead, already_slipped, exit_rule="") -> None:
+    def _sell(self, index, bar, qty, price, *, action, reason, lead, already_slipped, exit_rule="", basis_cash=None) -> None:
         position = self.position
         if qty < 1 or qty > position.shares:
             raise ValueError("卖出股数必须在持仓之内")
@@ -528,7 +571,10 @@ class _Replay:
         fill = apply_sell(self.cash, fill_price, qty, self.market)
         self.cumulative_fees += fill.fee
         self.bar_fee += fill.fee
-        basis = position.cost_basis * qty / position.shares
+        if basis_cash is None:
+            basis = position.cost_basis * qty / position.shares
+        else:
+            basis = float(basis_cash)
         pnl = (fill.notional - fill.fee) - basis
         loss_fraction = 0.0
         if pnl < 0 and position.entry_equity > 0:
@@ -559,11 +605,16 @@ class _Replay:
             self.position = None
             self.pending_exit = None
             self.pending_exit_rule = ""
+            self.pending_add = None
+            self._reset_book()
             return
         position.shares = left
         position.cost_basis -= basis
 
     def _schedule(self, index: int, bar: ReplayBar) -> None:
+        if self._scale_book():
+            self._schedule_scale(index, bar)
+            return
         if getattr(self.tactic, "exit_kind", "") == "scale_downtrend":
             self._raise_drawdown_stop(bar)
             self._schedule_scale_exit(index, bar)
@@ -627,6 +678,255 @@ class _Replay:
         candidate = drawdown_stop(position.hh, fraction)
         if position.adjusted_stop is None or candidate > position.adjusted_stop:
             position.adjusted_stop = candidate
+
+    def _scale_open(self, index: int, bar: ReplayBar) -> None:
+        if self.position is not None:
+            if self.position.adjusted_stop is not None:
+                stop = raw_stop(self.position.adjusted_stop, bar.factor)
+                if bar.open <= stop:
+                    self.pending_add = None
+                    self._stop_out(index, bar, bar.open, gap=True)
+                    return
+            if self.pending_exit == "flatten":
+                self.pending_add = None
+                self._trend_exit(index, bar)
+                return
+            if self.pending_exit == "peel" and self._can_trade(bar.time):
+                self._peel_oldest(index, bar)
+                self._mark_trade(bar.time)
+                self.pending_exit = None
+                self.pending_exit_rule = ""
+                self.pending_exit_text = ""
+            if self.position is not None and self.pending_add is not None:
+                self._try_scale_add(index, bar)
+            return
+        if self.pending_entry is not None:
+            self._try_entry(index, bar)
+
+    def _schedule_scale(self, index: int, bar: ReplayBar) -> None:
+        position = self.position
+        if position is None:
+            return
+        high = bar.high * bar.factor
+        if high > position.hh:
+            position.hh = high
+        if bar.category in self.strategy.exit.trail_states and position.adjusted_stop is not None:
+            position.adjusted_stop = next_long_stop(
+                position.adjusted_stop,
+                position.hh,
+                bar.a_t,
+                buffer=self.strategy.exit.trail_buffer,
+                price_axis=self.price_axis,
+                category=bar.category,
+                trail_states=self.strategy.exit.trail_states,
+            )
+        if self._should_flatten(bar):
+            label = PHASE_NAMES.get(bar.category, "不可用" if bar.category is None else str(bar.category))
+            self.pending_exit = "flatten"
+            self.pending_exit_rule = label
+            self.pending_exit_text = f"主状态是{label}，下一根开盘全部退出，不开反向仓。"
+            self.pending_add = None
+            return
+        peel = False
+        if bar.category == self.strategy.exit.peel_on:
+            if not self.exhaustion_latched:
+                peel = True
+                self.exhaustion_latched = True
+                self.pending_exit = "peel"
+                self.pending_exit_rule = "上涨衰竭"
+                self.pending_exit_text = "上涨衰竭预警第一次出现，下一根减掉最早的一笔。"
+        else:
+            self.exhaustion_latched = False
+        if not peel and self._starter_banked(bar):
+            self.pending_exit = "peel"
+            self.pending_exit_rule = "试仓止盈"
+            self.pending_exit_text = "试仓上涨达到门槛，下一根只卖掉试仓。"
+        self._schedule_scale_add(index, bar)
+
+    def _should_flatten(self, bar: ReplayBar) -> bool:
+        if bar.category in self.strategy.exit.flatten_categories:
+            return True
+        return bar.category == INSUFFICIENT and bar.structure is None
+
+    def _starter_banked(self, bar: ReplayBar) -> bool:
+        starter = self._tranche("starter")
+        if starter is None or bar.a_t is None or self.strategy.exit.bank_multiple <= 0:
+            return False
+        close = bar.close * bar.factor
+        target = offset_price(starter.adjusted_fill, bar.a_t, self.strategy.exit.bank_multiple, self.price_axis)
+        return close >= target
+
+    def _schedule_scale_add(self, index: int, bar: ReplayBar) -> None:
+        if self.pending_exit == "flatten" or bar.a_t is None or self.position is None:
+            return
+        if self.add_count >= self.strategy.exit.max_adds:
+            self.pending_add = None
+            return
+        stop = self.position.adjusted_stop
+        if stop is None:
+            return
+        close = bar.close * bar.factor
+        if self.add_count == 0:
+            starter = self._tranche("starter")
+            if starter is None or stop < starter.adjusted_fill:
+                return
+            if bar.category != UP_CONTINUE or self.prev_category != UP_PULLBACK:
+                return
+            kind = "add1"
+            text = "加仓一：上涨回调结束回到上涨延续，止损已不低于试仓成交价。"
+        else:
+            first = self._tranche("add1")
+            wanted = self.strategy.exit.second_category or UP_CONTINUE
+            if first is None or bar.category != wanted:
+                return
+            target = offset_price(first.adjusted_fill, bar.a_t, self.strategy.exit.extend_multiple, self.price_axis)
+            if close < target or stop < self._average_fill():
+                return
+            kind = "add2"
+            text = "加仓二：上涨延续里高出加仓一，止损已不低于持仓成本。"
+        self.pending_add = _PendingEntry(stop, close, float(bar.a_t), text, index, kind)
+
+    def _try_scale_add(self, index: int, bar: ReplayBar) -> None:
+        pending = self.pending_add
+        self.pending_add = None
+        if pending is None or self.position is None or not self.tranches:
+            return
+        if pending.kind == "add1" and self._tranche("starter") is None:
+            self._cancel(index, bar, "试仓已卖出", self.position.adjusted_stop, pending.text)
+            return
+        if pending.kind == "add2" and self._tranche("add1") is None:
+            self._cancel(index, bar, "加仓一已卖出", self.position.adjusted_stop, pending.text)
+            return
+        stop = self.position.adjusted_stop
+        reason = entry_cancel_reason(
+            raw_open=bar.open,
+            factor=bar.factor,
+            adjusted_stop=stop,
+            adjusted_signal_close=pending.adjusted_close,
+            a_t=pending.a_t,
+            gap_cancel=self.strategy.order.gap_cancel,
+            max_stop_distance=self.strategy.order.max_stop_distance,
+            min_stop_distance=self.strategy.order.min_stop_distance,
+            price_axis=self.price_axis,
+        )
+        if reason:
+            self._cancel(index, bar, reason, stop, pending.text)
+            return
+        if pending.kind == "add2" and bar.open * bar.factor <= self._average_fill():
+            self._cancel(index, bar, "开盘价不高于成本", stop, pending.text)
+            return
+        if not self._can_trade(bar.time):
+            self._cancel(index, bar, "当日成交次数", stop, pending.text)
+            return
+        fill_price = slipped_buy(bar.open, self.slippage)
+        equity = self.cash + self.position.shares * bar.open
+        budget = add_risk_budget(
+            self._cash_open_risk(bar, equity),
+            self.strategy.risk.max_open_risk,
+            self.strategy.risk.risk_per_trade,
+            self.strategy.exit.add_floor,
+        )
+        if budget is None:
+            self._cancel(index, bar, "当前风险", stop, pending.text)
+            return
+        sized = size_position(
+            equity=equity,
+            cash=self.cash,
+            open_price=fill_price,
+            raw_stop=raw_stop(stop, bar.factor),
+            lot_size=self.lot_size,
+            risk_per_trade=budget,
+            one_lot_max_risk=0.0,
+            max_gross_exposure=self.strategy.risk.max_gross_exposure,
+            slippage_rate=self.slippage,
+            market=self.market,
+            occupied_notional=self.position.shares * bar.open,
+        )
+        if sized.shares <= 0:
+            self._cancel(index, bar, sized.reason or "风险预算", stop, sized.text + pending.text)
+            return
+        fill = apply_buy(self.cash, fill_price, sized.shares, self.market)
+        before = self.position.shares
+        self.cash = fill.cash_after
+        self.position.shares = before + sized.shares
+        self.position.cost_basis += fill.notional + fill.fee
+        self.position.planned_risk += sized.planned_risk
+        self.cumulative_fees += fill.fee
+        self.bar_fee += fill.fee
+        self._mark_trade(bar.time)
+        role = "add1" if pending.kind == "add1" else "add2"
+        self.tranches.append(_Tranche(
+            role, sized.shares, fill.price * bar.factor, fill.notional + fill.fee, sized.planned_risk,
+        ))
+        self.add_count += 1
+        text = (
+            f"加仓：买入 {sized.shares} 股，成交价 {_num(fill.price)} {self._currency()}，"
+            f"复权止损 {_num(stop)}。{sized.text}{pending.text}"
+        )
+        self._record(
+            index, bar, action="加仓", reason="", shares_before=before,
+            shares_after=self.position.shares, price=fill.price, adjusted_stop=stop,
+            stop=raw_stop(stop, bar.factor), planned_risk=sized.planned_risk,
+            text=text, fee=fill.fee, reference_equity=equity,
+        )
+
+    def _peel_oldest(self, index: int, bar: ReplayBar) -> None:
+        if not self.tranches or self.position is None:
+            return
+        tranche = self.tranches[0]
+        qty = (tranche.shares // self.lot_size) * self.lot_size
+        left = self.position.shares - qty
+        lead = self.pending_exit_text or "减掉最早的一笔。"
+        rule = self.pending_exit_rule or "减仓"
+        if qty <= 0 or (left > 0 and left < self.lot_size):
+            self.pending_exit_text = lead + "取整后不足一手，改为全部退出。"
+            self.pending_exit_rule = "取整全平"
+            self._trend_exit(index, bar)
+            return
+        sold_basis = tranche.cash_basis * qty / tranche.shares
+        sold_risk = tranche.planned_risk * qty / tranche.shares
+        self._sell(
+            index, bar, qty, slipped_sell(bar.open, self.slippage),
+            action="减仓", reason=rule, lead=lead, already_slipped=True, exit_rule=rule,
+            basis_cash=sold_basis,
+        )
+        if self.position is None:
+            return
+        tranche.shares -= qty
+        tranche.cash_basis -= sold_basis
+        tranche.planned_risk -= sold_risk
+        self.position.planned_risk = max(0.0, self.position.planned_risk - sold_risk)
+        if tranche.shares <= 0:
+            self.tranches.pop(0)
+
+    def _tranche(self, role: str) -> Optional[_Tranche]:
+        for tranche in self.tranches:
+            if tranche.role == role and tranche.shares > 0:
+                return tranche
+        return None
+
+    def _cash_open_risk(self, bar: ReplayBar, equity: float) -> float:
+        if equity <= 0 or self.position is None or self.position.adjusted_stop is None:
+            return 0.0
+        raw = raw_stop(self.position.adjusted_stop, bar.factor)
+        total = 0.0
+        for tranche in self.tranches:
+            if tranche.shares <= 0:
+                continue
+            per_share = tranche.cash_basis / tranche.shares
+            total += tranche.shares * max(per_share - raw, 0.0)
+        return total / equity
+
+    def _average_fill(self) -> float:
+        shares = sum(tranche.shares for tranche in self.tranches)
+        if shares <= 0:
+            return 0.0
+        return sum(tranche.shares * tranche.adjusted_fill for tranche in self.tranches) / shares
+
+    def _reset_book(self) -> None:
+        self.tranches = []
+        self.add_count = 0
+        self.exhaustion_latched = False
 
     def _stop_rule(self) -> str:
         if self.strategy.exit.drawdown is not None:
@@ -702,6 +1002,11 @@ class _Replay:
         if bar.split != 1:
             before = position.shares
             position.shares = apply_split(position.shares, bar.split)
+            if self.tranches:
+                for tranche in self.tranches:
+                    tranche.shares = apply_split(tranche.shares, bar.split)
+                drift = position.shares - sum(tranche.shares for tranche in self.tranches)
+                self.tranches[-1].shares += drift
             text = (
                 f"拆股：1 股变为 {_num(bar.split)} 股，股数由 {before} 变为 {position.shares}，"
                 f"现金不变仍为 {_num(self.cash)} {self._currency()}。"

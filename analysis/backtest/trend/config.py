@@ -153,11 +153,19 @@ class D0Entry:
 
 
 @dataclass(frozen=True)
+class ScaleEntry:
+    """策略 E。试仓尺度在加载时必须与 structure.scale 相同。"""
+
+    scale: str
+
+
+@dataclass(frozen=True)
 class OrderSpec:
     gap_cancel: float
     max_stop_distance: Optional[float]
     slippage_rate: float
     max_trades_per_day: int
+    min_stop_distance: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,7 @@ class RiskSpec:
     max_gross_exposure: float
     point_value: None
     sizing: str = "stop"
+    max_open_risk: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -178,12 +187,19 @@ class ExitSpec:
     exhaustion_action: str
     mode: str = "price"
     drawdown: Optional[float] = None
+    bank_multiple: float = 0.0
+    peel_on: Optional[str] = None
+    flatten_categories: Tuple[str, ...] = ()
+    extend_multiple: float = 0.0
+    max_adds: int = 0
+    add_floor: float = 0.0025
+    second_category: str = ""
 
 
 @dataclass(frozen=True)
 class StrategySpec:
     name: str
-    entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry
+    entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry
     order: OrderSpec
     risk: RiskSpec
     exit: ExitSpec
@@ -494,6 +510,7 @@ def trend_config_from_mapping(
     _check_trend_scale(structure, strategies)
     _check_d0_scale(structure, strategies)
     _check_d1_scale(structure, strategies)
+    _check_book_scale(structure, strategies)
     runs = _runs(payload["runs"], strategies, overrides or {})
     symbols = _select_symbols(symbols, markets, overrides or {})
     symbols = _fill_missing_lots(symbols, lot_lookup)
@@ -776,7 +793,9 @@ def _window(value: Any, today: date, overrides: Mapping[str, Any]) -> WindowSpec
 
 def _strategies(value: Any) -> Dict[str, StrategySpec]:
     row = _mapping(value, "strategies")
-    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend", "d0", "d1"))
+    if set(row) == {"scale"}:
+        return {"scale": _strategy("scale", row["scale"])}
+    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend", "d0", "d1", "scale"))
     specs = {
         "breakout": _strategy("breakout", row["breakout"]),
         "pullback": _strategy("pullback", row["pullback"]),
@@ -787,15 +806,20 @@ def _strategies(value: Any) -> Dict[str, StrategySpec]:
         specs["d0"] = _strategy("d0", row["d0"])
     if "d1" in row and row["d1"] is not None:
         specs["d1"] = _strategy("d1", row["d1"])
+    if "scale" in row and row["scale"] is not None:
+        specs["scale"] = _strategy("scale", row["scale"])
     return specs
 
 
 def _strategy(name: str, value: Any) -> StrategySpec:
     label = f"strategies.{name}"
     row = _mapping(value, label)
-    _exact(row, ("entry", "order", "risk", "exit"), label)
+    if name == "scale":
+        _exact(row, ("entry", "order", "risk", "exit", "add"), label)
+    else:
+        _exact(row, ("entry", "order", "risk", "exit"), label)
     if name == "breakout":
-        entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry = _breakout_entry(row["entry"])
+        entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry = _breakout_entry(row["entry"])
         order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
     elif name == "pullback":
         entry = _pullback_entry(row["entry"])
@@ -809,6 +833,9 @@ def _strategy(name: str, value: Any) -> StrategySpec:
     elif name == "d1":
         entry = _d0_entry(row["entry"], name)
         order, risk, exit_spec = _exposure_order(row["order"], name), _exposure_risk(row["risk"], name), _scale_exit(row["exit"], name, drawdown=True)
+    elif name == "scale":
+        entry = _scale_entry(row["entry"])
+        order, risk, exit_spec = _scale_order(row["order"]), _scale_risk(row["risk"]), _book_exit(row["exit"], row["add"])
     else:
         raise ValueError(f"未知策略 {name}")
     return StrategySpec(name, entry, order, risk, exit_spec)
@@ -834,6 +861,20 @@ def _check_d0_scale(structure: StructureSpec, strategies: Mapping[str, StrategyS
 
 def _check_d1_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
     _check_same_scale(structure, strategies, "d1", "策略 D1")
+
+
+def _check_book_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
+    strategy = strategies.get("scale")
+    if strategy is None:
+        return
+    entry = strategy.entry
+    if not isinstance(entry, ScaleEntry):
+        raise ValueError("strategies.scale 的入场参数类型不对")
+    if entry.scale != structure.scale:
+        raise ValueError(
+            "策略 E 的尺度必须与 structure.scale 相同，"
+            f"收到 {entry.scale} 和 {structure.scale}"
+        )
 
 
 def _check_same_scale(
@@ -902,6 +943,107 @@ def _scale(value: Any, label: str) -> str:
     if scale not in _SCALES:
         raise ValueError(f"{label} 必须是 short、mid、long 之一，收到 {scale}")
     return scale
+
+
+def _scale_entry(value: Any) -> ScaleEntry:
+    label = "strategies.scale.entry"
+    row = _mapping(value, label)
+    _exact(row, ("scale",), label)
+    return ScaleEntry(_scale(row["scale"], f"{label}.scale"))
+
+
+def _scale_order(value: Any) -> OrderSpec:
+    label = "strategies.scale.order"
+    row = _mapping(value, label)
+    _exact(row, ("gap_cancel", "min_stop_distance", "slippage_rate", "max_trades_per_day"), label)
+    trades = _int(row["max_trades_per_day"], f"{label}.max_trades_per_day")
+    if trades < 1:
+        raise ValueError(f"{label}.max_trades_per_day 必须 >= 1")
+    return OrderSpec(
+        _positive(_number(row["gap_cancel"], f"{label}.gap_cancel"), f"{label}.gap_cancel"),
+        None,
+        _positive(_number(row["slippage_rate"], f"{label}.slippage_rate"), f"{label}.slippage_rate", allow_zero=True),
+        trades,
+        _positive(_number(row["min_stop_distance"], f"{label}.min_stop_distance"), f"{label}.min_stop_distance"),
+    )
+
+
+def _scale_risk(value: Any) -> RiskSpec:
+    label = "strategies.scale.risk"
+    row = _mapping(value, label)
+    _exact(
+        row,
+        ("risk_per_tranche", "max_open_risk", "max_gross_exposure", "one_lot_max_risk"),
+        label,
+    )
+    tranche = _rate(_number(row["risk_per_tranche"], f"{label}.risk_per_tranche"), f"{label}.risk_per_tranche")
+    cap = _rate(_number(row["max_open_risk"], f"{label}.max_open_risk"), f"{label}.max_open_risk")
+    if tranche <= 0 or cap <= 0:
+        raise ValueError(f"{label} 的风险必须为正")
+    if cap < tranche:
+        raise ValueError(f"{label}.max_open_risk 不得小于 risk_per_tranche")
+    one_lot = _rate(_number(row["one_lot_max_risk"], f"{label}.one_lot_max_risk"), f"{label}.one_lot_max_risk")
+    if one_lot != 0 and one_lot < tranche:
+        raise ValueError(f"{label}.one_lot_max_risk 不为 0 时不得小于 risk_per_tranche")
+    exposure = _number(row["max_gross_exposure"], f"{label}.max_gross_exposure")
+    if not 0 < exposure <= 1:
+        raise ValueError(f"{label}.max_gross_exposure 必须在 (0, 1]，第一期不使用杠杆")
+    return RiskSpec(tranche, one_lot, exposure, None, sizing="stop", max_open_risk=cap)
+
+
+def _book_exit(exit_value: Any, add_value: Any) -> ExitSpec:
+    label = "strategies.scale.exit"
+    row = _mapping(exit_value, label)
+    _exact(row, ("trail_multiple", "trail_categories", "bank_multiple", "peel_on", "flatten_categories"), label)
+    trail = _positive(_number(row["trail_multiple"], f"{label}.trail_multiple"), f"{label}.trail_multiple")
+    categories = _category_list(row["trail_categories"], f"{label}.trail_categories")
+    if UP_BIRTH in categories:
+        raise ValueError(f"{label}.trail_categories 不得包含 up_birth")
+    bank = _positive(_number(row["bank_multiple"], f"{label}.bank_multiple"), f"{label}.bank_multiple")
+    peel = _text(row["peel_on"], f"{label}.peel_on")
+    if peel not in _CATEGORIES:
+        raise ValueError(f"{label}.peel_on 有未知主状态 {peel}")
+    flatten = _category_list(row["flatten_categories"], f"{label}.flatten_categories")
+    add_label = "strategies.scale.add"
+    add = _mapping(add_value, add_label)
+    _exact(add, ("max_adds", "first", "second_category", "extend_multiple"), add_label)
+    adds = _int(add["max_adds"], f"{add_label}.max_adds")
+    if adds != 2:
+        raise ValueError(f"{add_label}.max_adds 这一版只接受 2，收到 {adds}")
+    first = _text(add["first"], f"{add_label}.first")
+    if first != "pullback_to_continue":
+        raise ValueError(f"{add_label}.first 只接受 pullback_to_continue，收到 {first}")
+    second = _text(add["second_category"], f"{add_label}.second_category")
+    if second not in _CATEGORIES:
+        raise ValueError(f"{add_label}.second_category 有未知主状态 {second}")
+    extend = _positive(_number(add["extend_multiple"], f"{add_label}.extend_multiple"), f"{add_label}.extend_multiple")
+    return ExitSpec(
+        trail,
+        tuple(categories),
+        1.0,
+        "floor_lot_else_flatten",
+        "none",
+        mode="scale_book",
+        bank_multiple=bank,
+        peel_on=peel,
+        flatten_categories=tuple(flatten),
+        extend_multiple=extend,
+        max_adds=adds,
+        second_category=second,
+    )
+
+
+def _category_list(value: Any, label: str) -> list:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} 必须是非空列表")
+    cleaned = []
+    for item in value:
+        name = _text(item, label)
+        if name not in _CATEGORIES:
+            raise ValueError(f"{label} 有未知主状态 {name}")
+        if name not in cleaned:
+            cleaned.append(name)
+    return cleaned
 
 
 def _d0_entry(value: Any, strategy: str = "d0") -> D0Entry:

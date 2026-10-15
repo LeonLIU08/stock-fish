@@ -9,7 +9,7 @@ import pandas as pd
 from analysis.backtest.engine import EngineResult, Trade
 from analysis.backtest.trend.session import AccountResult, Decision
 
-_FILLS = {"入场", "减仓", "止损", "趋势退出"}
+_FILLS = {"入场", "加仓", "减仓", "止损", "趋势退出"}
 _CANCEL_KEYS = ("跳空", "开盘价不高于止损", "止损距离", "风险预算", "现金", "占用上限")
 
 
@@ -141,7 +141,7 @@ def to_engine_result(result: AccountResult, capital: float, *, tactic: str) -> E
         if row.action not in _FILLS or row.price is None:
             continue
         fees += row.fee or 0.0
-        side = "buy" if row.action == "入场" else "sell"
+        side = "buy" if row.action in ("入场", "加仓") else "sell"
         trades.append(_trade(row, side, tactic))
     frame = pd.DataFrame([
         {

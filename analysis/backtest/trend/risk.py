@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
+from typing import Optional
 
 from analysis.backtest.trend.markets import trade_fees
 
@@ -39,6 +40,7 @@ def size_position(
     max_gross_exposure: float,
     slippage_rate: float,
     market,
+    occupied_notional: float = 0.0,
 ) -> SizeResult:
     """三者取最小，再向下取整到整手。风险预算不够一手时，才询问一手规则。"""
     _require_lot(lot_size)
@@ -48,14 +50,18 @@ def size_position(
         raise ValueError("止损价必须为正")
     if equity < 0 or cash < 0:
         raise ValueError("净值和现金不能为负")
-    if min(risk_per_trade, one_lot_max_risk, max_gross_exposure, slippage_rate) < 0:
+    if min(risk_per_trade, one_lot_max_risk, max_gross_exposure, slippage_rate, occupied_notional) < 0:
         raise ValueError("风险参数不能为负")
 
     cost = _cost(market, open_price, raw_stop, slippage_rate)
     distance = abs(_decimal(open_price) - _decimal(raw_stop))
     per_share = distance + cost
     q_cash = _affordable_shares(cash, open_price, market)
-    q_cap = _floor_ratio(_decimal(equity) * _decimal(max_gross_exposure), _decimal(open_price))
+    gross_budget = _decimal(equity) * _decimal(max_gross_exposure) - _decimal(occupied_notional)
+    if gross_budget <= 0:
+        q_cap = 0
+    else:
+        q_cap = _floor_ratio(gross_budget, _decimal(open_price))
     if per_share <= 0 or equity <= 0:
         q_risk = 0
     else:
@@ -150,6 +156,14 @@ def size_exposure(
         raw_stop=0.0,
         cost_per_share=0.0,
     )
+
+
+def add_risk_budget(open_risk: float, cap: float, tranche: float, floor: float = 0.0025) -> Optional[float]:
+    """加仓还能用多少风险。剩余额度小于 floor 时不加。"""
+    room = float(cap) - float(open_risk)
+    if room < float(floor):
+        return None
+    return min(float(tranche), room)
 
 
 def format_percent(fraction: float) -> str:
