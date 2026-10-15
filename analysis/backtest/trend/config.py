@@ -146,6 +146,13 @@ class TrendEntry:
 
 
 @dataclass(frozen=True)
+class D0Entry:
+    """策略 D0。买卖用同一个尺度，加载时必须与 structure.scale 相同。"""
+
+    scale: str
+
+
+@dataclass(frozen=True)
 class OrderSpec:
     gap_cancel: float
     max_stop_distance: Optional[float]
@@ -170,12 +177,13 @@ class ExitSpec:
     reduce_rounding: str
     exhaustion_action: str
     mode: str = "price"
+    drawdown: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class StrategySpec:
     name: str
-    entry: BreakoutEntry | PullbackEntry | TrendEntry
+    entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry
     order: OrderSpec
     risk: RiskSpec
     exit: ExitSpec
@@ -484,6 +492,8 @@ def trend_config_from_mapping(
     window = _window(payload["window"], today or date.today(), overrides or {})
     strategies = _strategies(payload["strategies"])
     _check_trend_scale(structure, strategies)
+    _check_d0_scale(structure, strategies)
+    _check_d1_scale(structure, strategies)
     runs = _runs(payload["runs"], strategies, overrides or {})
     symbols = _select_symbols(symbols, markets, overrides or {})
     symbols = _fill_missing_lots(symbols, lot_lookup)
@@ -766,13 +776,17 @@ def _window(value: Any, today: date, overrides: Mapping[str, Any]) -> WindowSpec
 
 def _strategies(value: Any) -> Dict[str, StrategySpec]:
     row = _mapping(value, "strategies")
-    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend",))
+    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend", "d0", "d1"))
     specs = {
         "breakout": _strategy("breakout", row["breakout"]),
         "pullback": _strategy("pullback", row["pullback"]),
     }
     if "trend" in row and row["trend"] is not None:
         specs["trend"] = _strategy("trend", row["trend"])
+    if "d0" in row and row["d0"] is not None:
+        specs["d0"] = _strategy("d0", row["d0"])
+    if "d1" in row and row["d1"] is not None:
+        specs["d1"] = _strategy("d1", row["d1"])
     return specs
 
 
@@ -781,14 +795,20 @@ def _strategy(name: str, value: Any) -> StrategySpec:
     row = _mapping(value, label)
     _exact(row, ("entry", "order", "risk", "exit"), label)
     if name == "breakout":
-        entry: BreakoutEntry | PullbackEntry | TrendEntry = _breakout_entry(row["entry"])
+        entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry = _breakout_entry(row["entry"])
         order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
     elif name == "pullback":
         entry = _pullback_entry(row["entry"])
         order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
     elif name == "trend":
         entry = _trend_entry(row["entry"])
-        order, risk, exit_spec = _trend_order(row["order"]), _trend_risk(row["risk"]), _trend_exit(row["exit"])
+        order, risk, exit_spec = _exposure_order(row["order"], name), _exposure_risk(row["risk"], name), _scale_exit(row["exit"], name)
+    elif name == "d0":
+        entry = _d0_entry(row["entry"], name)
+        order, risk, exit_spec = _exposure_order(row["order"], name), _exposure_risk(row["risk"], name), _scale_exit(row["exit"], name)
+    elif name == "d1":
+        entry = _d0_entry(row["entry"], name)
+        order, risk, exit_spec = _exposure_order(row["order"], name), _exposure_risk(row["risk"], name), _scale_exit(row["exit"], name, drawdown=True)
     else:
         raise ValueError(f"未知策略 {name}")
     return StrategySpec(name, entry, order, risk, exit_spec)
@@ -805,6 +825,33 @@ def _check_trend_scale(structure: StructureSpec, strategies: Mapping[str, Strate
         raise ValueError(
             "策略 C 的买入尺度必须与 structure.scale 相同，"
             f"收到 {entry.buy_scale} 和 {structure.scale}"
+        )
+
+
+def _check_d0_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
+    _check_same_scale(structure, strategies, "d0", "策略 D0")
+
+
+def _check_d1_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
+    _check_same_scale(structure, strategies, "d1", "策略 D1")
+
+
+def _check_same_scale(
+    structure: StructureSpec,
+    strategies: Mapping[str, StrategySpec],
+    key: str,
+    title: str,
+) -> None:
+    strategy = strategies.get(key)
+    if strategy is None:
+        return
+    entry = strategy.entry
+    if not isinstance(entry, D0Entry):
+        raise ValueError(f"strategies.{key} 的入场参数类型不对")
+    if entry.scale != structure.scale:
+        raise ValueError(
+            f"{title} 的尺度必须与 structure.scale 相同，"
+            f"收到 {entry.scale} 和 {structure.scale}"
         )
 
 
@@ -857,8 +904,15 @@ def _scale(value: Any, label: str) -> str:
     return scale
 
 
-def _trend_order(value: Any) -> OrderSpec:
-    label = "strategies.trend.order"
+def _d0_entry(value: Any, strategy: str = "d0") -> D0Entry:
+    label = f"strategies.{strategy}.entry"
+    row = _mapping(value, label)
+    _exact(row, ("scale",), label)
+    return D0Entry(_scale(row["scale"], f"{label}.scale"))
+
+
+def _exposure_order(value: Any, strategy: str) -> OrderSpec:
+    label = f"strategies.{strategy}.order"
     row = _mapping(value, label)
     _exact(row, ("gap_cancel", "slippage_rate", "max_trades_per_day"), label)
     trades = _int(row["max_trades_per_day"], f"{label}.max_trades_per_day")
@@ -872,8 +926,8 @@ def _trend_order(value: Any) -> OrderSpec:
     )
 
 
-def _trend_risk(value: Any) -> RiskSpec:
-    label = "strategies.trend.risk"
+def _exposure_risk(value: Any, strategy: str) -> RiskSpec:
+    label = f"strategies.{strategy}.risk"
     row = _mapping(value, label)
     _exact(row, ("sizing", "max_gross_exposure", "point_value"), label)
     if row["point_value"] is not None:
@@ -887,14 +941,22 @@ def _trend_risk(value: Any) -> RiskSpec:
     return RiskSpec(0.0, 0.0, exposure, None, sizing="exposure")
 
 
-def _trend_exit(value: Any) -> ExitSpec:
-    label = "strategies.trend.exit"
+def _scale_exit(value: Any, strategy: str, *, drawdown: bool = False) -> ExitSpec:
+    label = f"strategies.{strategy}.exit"
     row = _mapping(value, label)
-    _exact(row, ("mode",), label)
+    if drawdown:
+        _exact(row, ("mode", "drawdown"), label)
+    else:
+        _exact(row, ("mode",), label)
     mode = _text(row["mode"], f"{label}.mode")
     if mode != "scale_downtrend":
         raise ValueError(f"{label}.mode 只接受 scale_downtrend，收到 {mode}")
-    return ExitSpec(0.0, (), 0.5, "floor_lot_else_flatten", "none", mode="scale_downtrend")
+    fraction = None
+    if drawdown:
+        fraction = _number(row["drawdown"], f"{label}.drawdown")
+        if not 0 < fraction < 1:
+            raise ValueError(f"{label}.drawdown 必须在 (0, 1)，收到 {fraction}")
+    return ExitSpec(0.0, (), 0.5, "floor_lot_else_flatten", "none", mode="scale_downtrend", drawdown=fraction)
 
 
 def _order(value: Any, strategy: str) -> OrderSpec:
@@ -1000,7 +1062,7 @@ def _runs(
         if "exhaustion_action" in row and row["exhaustion_action"] is not None:
             action = _exhaustion(row["exhaustion_action"], f"runs.{key}.exhaustion_action")
         if strategies[strategy_name].exit.mode == "scale_downtrend" and action != "none":
-            raise ValueError(f"run {key} 是策略 C，不能减仓")
+            raise ValueError(f"run {key} 不设价格止损，不能减仓")
         specs.append(RunSpec(key, _text(row["label"], f"{label}.label"), strategy_name, action))
 
     selected = overrides.get("runs") if overrides else None

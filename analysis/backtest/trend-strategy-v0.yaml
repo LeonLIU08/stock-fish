@@ -121,6 +121,33 @@ strategies:                # 每个策略一份完整参数，互不引用
       point_value: null
     exit:
       mode: scale_downtrend
+  d0:                      # 策略 D0。短尺度上升出现后的下一根开盘买入，短尺度下降出现后的下一根开盘卖出
+    entry:
+      scale: short         # 必须与 structure.scale 相同。买卖用同一个尺度
+    order:
+      gap_cancel: 0.5
+      slippage_rate: 0.0005
+      max_trades_per_day: 2
+    risk:
+      sizing: exposure
+      max_gross_exposure: 1.0
+      point_value: null
+    exit:
+      mode: scale_downtrend
+  d1:                      # 策略 D1。进出与 D0 相同，再加持有以来最高价回撤 15% 的止损
+    entry:
+      scale: short
+    order:
+      gap_cancel: 0.5
+      slippage_rate: 0.0005
+      max_trades_per_day: 2
+    risk:
+      sizing: exposure
+      max_gross_exposure: 1.0
+      point_value: null
+    exit:
+      mode: scale_downtrend
+      drawdown: 0.15         # 前高 × 0.85。不是相对成本价亏损 15%
 
 benchmarks:                # 含股息的 ETF，按第 4.4 节同一口径
   tracker_fund:
@@ -154,5 +181,11 @@ runs:
   - key: trend
     label: 策略 C
     strategy: trend
+  - key: d0
+    label: 策略 D0
+    strategy: d0
+  - key: d1
+    label: 策略 D1
+    strategy: d1
 
 output_dir: backtest_results

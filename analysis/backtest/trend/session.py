@@ -14,7 +14,13 @@ import pandas as pd
 from analysis.backtest.engine import EngineResult
 from analysis.backtest.trend.config import StrategySpec
 from analysis.backtest.trend.entries.base import EntrySignal, scale_label
-from analysis.backtest.trend.exits import exhaustion_due, long_trend_failed, next_long_stop, reduce_shares
+from analysis.backtest.trend.exits import (
+    drawdown_stop,
+    exhaustion_due,
+    long_trend_failed,
+    next_long_stop,
+    reduce_shares,
+)
 from analysis.backtest.trend.fills import (
     apply_buy,
     apply_sell,
@@ -425,28 +431,43 @@ class _Replay:
         fill = apply_buy(self.cash, fill_price, sized.shares, self.market)
         self.cash = fill.cash_after
         self._mark_trade(bar.time)
+        drawdown = self.strategy.exit.drawdown
+        adjusted_fill = fill_price * bar.factor
+        if drawdown is None:
+            stop = None
+            hh = bar.high * bar.factor
+            entry_text = (
+                f"入场：买入 {sized.shares} 股，成交价 {_num(fill.price)} {self._currency()}。"
+                f"没有价格止损。{sized.text}{pending.text}"
+            )
+        else:
+            stop = drawdown_stop(adjusted_fill, drawdown)
+            hh = adjusted_fill
+            entry_text = (
+                f"入场：买入 {sized.shares} 股，成交价 {_num(fill.price)} {self._currency()}。"
+                f"前高先记成交价，回撤 {format_percent(drawdown)} 止损。"
+                f"复权止损 {_num(stop)}，不复权止损 {_num(stop / bar.factor)}。"
+                f"{sized.text}{pending.text}"
+            )
         self.position = _Position(
             shares=sized.shares,
-            adjusted_stop=None,
+            adjusted_stop=stop,
             planned_risk=sized.planned_risk,
             entry_equity=equity,
             cost_basis=fill.notional + fill.fee,
             reduced=False,
-            hh=bar.high * bar.factor,
+            hh=hh,
             one_lot=False,
-            initial_stop=None,
+            initial_stop=stop,
         )
         self.cumulative_fees += fill.fee
         self.bar_fee += fill.fee
         self.pending_entry = None
-        text = (
-            f"入场：买入 {sized.shares} 股，成交价 {_num(fill.price)} {self._currency()}。"
-            f"没有价格止损。{sized.text}{pending.text}"
-        )
         self._record(
             index, bar, action="入场", reason="", shares_before=0, shares_after=sized.shares,
-            price=fill.price, adjusted_stop=None, stop=None,
-            planned_risk=sized.planned_risk, one_lot=False, text=text,
+            price=fill.price, adjusted_stop=stop,
+            stop=None if stop is None else stop / bar.factor,
+            planned_risk=sized.planned_risk, one_lot=False, text=entry_text,
             fee=fill.fee, reference_equity=equity,
         )
 
@@ -544,6 +565,7 @@ class _Replay:
 
     def _schedule(self, index: int, bar: ReplayBar) -> None:
         if getattr(self.tactic, "exit_kind", "") == "scale_downtrend":
+            self._raise_drawdown_stop(bar)
             self._schedule_scale_exit(index, bar)
             return
         position = self.position
@@ -575,15 +597,40 @@ class _Replay:
         )
 
     def _schedule_scale_exit(self, index: int, bar: ReplayBar) -> None:
-        """卖出尺度的下降趋势在当根确认，下一根开盘退出。不抬止损，不减仓。"""
-        if bar.exit_structure != DOWNTREND or bar.exit_direction_start_index != index:
+        """下降趋势在当根确认，下一根开盘退出。不抬止损，不减仓。
+
+        策略 C 看卖出尺度。策略 D0 的买卖是同一个尺度，看这根本身的方向。
+        """
+        if getattr(self.tactic, "sell_on_entry_scale", False):
+            structure = bar.structure
+            start = bar.direction_start_index
+            name = scale_label(getattr(self.tactic, "scale", None))
+        else:
+            structure = bar.exit_structure
+            start = bar.exit_direction_start_index
+            name = scale_label(bar.exit_scale)
+        if structure != DOWNTREND or start != index:
             return
-        name = scale_label(bar.exit_scale)
         self.pending_exit = "trend"
         self.pending_exit_rule = f"{name}下降"
         self.pending_exit_text = f"{name}下降趋势在当根确认，下一根开盘全部退出，不开反向仓。"
 
+    def _raise_drawdown_stop(self, bar: ReplayBar) -> None:
+        """收盘后用当根最高价抬前高。新止损只升不降，下一根才生效。"""
+        fraction = self.strategy.exit.drawdown
+        position = self.position
+        if fraction is None or position is None:
+            return
+        high = bar.high * bar.factor
+        if high > position.hh:
+            position.hh = high
+        candidate = drawdown_stop(position.hh, fraction)
+        if position.adjusted_stop is None or candidate > position.adjusted_stop:
+            position.adjusted_stop = candidate
+
     def _stop_rule(self) -> str:
+        if self.strategy.exit.drawdown is not None:
+            return "前高回撤"
         position = self.position
         if (
             position is not None

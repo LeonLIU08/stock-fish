@@ -2,7 +2,7 @@
 # 用一份股票名单跑趋势回测。
 # 不传股票时读取 scripts/hkconnect_06Oct.txt。
 # 港股没写每手股数时，从 Longbridge static_info 取当前值。
-# 策略 A、策略 B 和两个衰竭开关默认都跑。回看年数沿用配置，默认 3 年。
+# 默认跑配置里的全部 run，包括策略 D0 和 D1。只要 D1 时加 --runs d1。回看年数沿用配置，默认 3 年。
 #
 # 用法:
 #   bash scripts/run_trend_backtest.sh

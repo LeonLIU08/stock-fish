@@ -42,7 +42,7 @@ from analysis.backtest.metrics import compute_metrics
 from analysis.backtest.report import trade_to_dict, write_case_html, write_reports
 from analysis.backtest.trend.audit import audit_summary, decision_records, to_engine_result, write_jsonl
 from analysis.backtest.trend.baselines import simulate_buy_hold, simulate_even_dca
-from analysis.backtest.trend.config import HK, TrendEntry, TrendStrategyConfig
+from analysis.backtest.trend.config import D0Entry, HK, TrendEntry, TrendStrategyConfig
 from analysis.backtest.trend.entries import create_entry
 from analysis.backtest.trend.entries.base import scale_label
 from analysis.backtest.trend.feed import enclose_ohlc, load_raw_bars
@@ -592,6 +592,8 @@ def _sell_scale(config: TrendStrategyConfig) -> Optional[str]:
 
 def _scale_text(config: TrendStrategyConfig, strategy) -> str:
     entry = strategy.entry
+    if isinstance(entry, D0Entry):
+        return entry.scale
     if isinstance(entry, TrendEntry):
         return f"{entry.buy_scale}/{entry.sell_scale}"
     return config.structure.scale
@@ -599,6 +601,16 @@ def _scale_text(config: TrendStrategyConfig, strategy) -> str:
 
 def _scale_sentence(config: TrendStrategyConfig, run) -> str:
     entry = config.strategies[run.strategy].entry
+    if isinstance(entry, D0Entry):
+        drawdown = config.strategies[run.strategy].exit.drawdown
+        stop = ""
+        if drawdown is not None:
+            percent = f"{float(drawdown) * 100:.4f}".rstrip("0").rstrip(".")
+            stop = f"前高回撤 {percent}%，"
+        return (
+            f"买卖尺度 {scale_label(entry.scale)}，{stop}"
+            f"策略 {config.version}，run {run.key}。"
+        )
     if isinstance(entry, TrendEntry):
         return (
             f"买入尺度 {scale_label(entry.buy_scale)}，卖出尺度 {scale_label(entry.sell_scale)}，"
@@ -609,6 +621,21 @@ def _scale_sentence(config: TrendStrategyConfig, run) -> str:
 
 def _timing_note(strategy) -> str:
     entry = strategy.entry
+    if isinstance(entry, D0Entry):
+        drawdown = strategy.exit.drawdown
+        name = scale_label(entry.scale)
+        if drawdown is None:
+            return (
+                "信号使用当根 as-of，成交在下一根开盘。"
+                f"策略 D0 不设价格止损，{name}上升趋势确认后的下一根开盘买入，"
+                f"{name}下降趋势确认后的下一根开盘退出"
+            )
+        percent = f"{float(drawdown) * 100:.4f}".rstrip("0").rstrip(".")
+        return (
+            "信号使用当根 as-of，成交在下一根开盘。"
+            f"策略 D1 按持有以来最高价回撤 {percent}% 止损，前高在收盘后更新，新止损下一根生效。"
+            f"{name}下降趋势确认后的下一根开盘也退出"
+        )
     if isinstance(entry, TrendEntry):
         sell = scale_label(entry.sell_scale)
         return (

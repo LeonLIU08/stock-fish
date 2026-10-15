@@ -42,6 +42,6 @@ def _ensure_loaded() -> None:
     global _LOADED
     if _LOADED:
         return
-    from analysis.backtest.trend.entries import breakout, pullback, trend  # noqa: F401
+    from analysis.backtest.trend.entries import breakout, d0, d1, pullback, trend  # noqa: F401
 
     _LOADED = True

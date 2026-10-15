@@ -122,12 +122,23 @@ class ConfigTests(unittest.TestCase):
             "pullback",
             "pullback_no_reduce",
             "trend",
+            "d0",
+            "d1",
         ])
         trend = config.strategies["trend"]
         self.assertEqual(trend.entry.buy_scale, "short")
         self.assertEqual(trend.entry.sell_scale, "mid")
         self.assertEqual(trend.risk.sizing, "exposure")
         self.assertEqual(trend.exit.mode, "scale_downtrend")
+        d0 = config.strategies["d0"]
+        self.assertEqual(d0.entry.scale, "short")
+        self.assertEqual(d0.risk.sizing, "exposure")
+        self.assertEqual(d0.exit.mode, "scale_downtrend")
+        self.assertEqual(d0.exit.exhaustion_action, "none")
+        d1 = config.strategies["d1"]
+        self.assertEqual(d1.entry.scale, "short")
+        self.assertEqual(d1.exit.drawdown, 0.15)
+        self.assertEqual(d1.risk.sizing, "exposure")
         self.assertIsNone(trend.order.max_stop_distance)
         by_key = {run.key: run for run in config.runs}
         self.assertEqual(by_key["breakout"].exhaustion_action, "reduce")
@@ -309,15 +320,51 @@ class ConfigTests(unittest.TestCase):
     def test_yaml_without_trend_still_loads(self):
         data = _raw()
         del data["strategies"]["trend"]
-        data["runs"] = [item for item in data["runs"] if item["strategy"] != "trend"]
+        del data["strategies"]["d0"]
+        del data["strategies"]["d1"]
+        data["runs"] = [
+            item for item in data["runs"] if item["strategy"] not in ("trend", "d0", "d1")
+        ]
         config = trend_config_from_mapping(data, today=date(2026, 10, 13))
         self.assertNotIn("trend", config.strategies)
+        self.assertNotIn("d0", config.strategies)
+        self.assertNotIn("d1", config.strategies)
         self.assertEqual([item.key for item in config.runs], [
             "breakout",
             "breakout_no_reduce",
             "pullback",
             "pullback_no_reduce",
         ])
+
+    def test_d0_scale_must_match_the_run_scale(self):
+        data = _raw()
+        data["structure"]["scale"] = "mid"
+        data["strategies"]["trend"]["entry"]["buy_scale"] = "mid"
+        data["strategies"]["trend"]["entry"]["sell_scale"] = "long"
+        with self.assertRaisesRegex(ValueError, "策略 D0 的尺度必须与 structure.scale 相同"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+        data = _raw()
+        data["runs"].append({
+            "key": "d0_reduce",
+            "label": "策略 D0 减仓",
+            "strategy": "d0",
+            "exhaustion_action": "reduce",
+        })
+        with self.assertRaisesRegex(ValueError, "不能减仓"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+
+    def test_d1_drawdown_is_a_fraction_below_the_high(self):
+        data = _raw()
+        data["strategies"]["d1"]["exit"]["drawdown"] = 1
+        with self.assertRaisesRegex(ValueError, "drawdown"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
+        data = _raw()
+        data["structure"]["scale"] = "mid"
+        data["strategies"]["trend"]["entry"]["buy_scale"] = "mid"
+        data["strategies"]["trend"]["entry"]["sell_scale"] = "long"
+        data["strategies"]["d0"]["entry"]["scale"] = "mid"
+        with self.assertRaisesRegex(ValueError, "策略 D1 的尺度必须与 structure.scale 相同"):
+            trend_config_from_mapping(data, today=date(2026, 10, 13))
 
 
 class EmptySessionTests(unittest.TestCase):
@@ -1631,7 +1678,7 @@ def _pullback_week(
 class EntryPluginTests(unittest.TestCase):
     def test_registry_refuses_a_plugin_without_a_stop(self):
         config = load_trend_config(today=date(2026, 10, 13))
-        self.assertEqual(list_entries(), ["breakout", "pullback", "trend"])
+        self.assertEqual(list_entries(), ["breakout", "d0", "d1", "pullback", "trend"])
         first = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         second = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         self.assertIsNot(first, second)
@@ -2239,6 +2286,154 @@ class TrendOnlyTests(unittest.TestCase):
         self.assertGreater(held.final_shares, 0)
 
 
+def _dbar(index, open_, close, *, structure, direction_start, a_t=1.0, high=None, low=None, exit_structure=None, exit_start=None):
+    return _bar(
+        f"d{index}",
+        open_,
+        max(open_, close) if high is None else high,
+        min(open_, close) if low is None else low,
+        close,
+        structure=structure,
+        category=UP_CONTINUE if structure == UPTREND else NEUTRAL,
+        a_t=a_t,
+        direction_start_index=direction_start,
+        exit_scale="mid",
+        exit_structure=exit_structure,
+        exit_direction_start_index=exit_start,
+    )
+
+
+class D0Tests(unittest.TestCase):
+    def test_buys_the_day_after_a_short_uptrend_and_sells_the_day_after_a_short_downtrend(self):
+        bars = [
+            _dbar(0, 100, 100, structure=RANGE, direction_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=1),
+            _dbar(2, 100, 101, structure=UPTREND, direction_start=1),
+            _dbar(3, 101, 101, structure=RANGE, direction_start=3),
+            _dbar(4, 101, 102, structure=UPTREND, direction_start=4, exit_structure=DOWNTREND, exit_start=4),
+            _dbar(5, 102, 90, structure=DOWNTREND, direction_start=5),
+            _dbar(6, 90, 90, structure=DOWNTREND, direction_start=5),
+            _dbar(7, 90, 90, structure=UPTREND, direction_start=7),
+            _dbar(8, 90, 91, structure=UPTREND, direction_start=7),
+        ]
+        result = _run_plugin(bars, "d0", "uniform")
+        entries = _by(result, "入场")
+        exits = _by(result, "趋势退出")
+        self.assertEqual([item.time for item in entries], ["d2", "d8"])
+        self.assertEqual(entries[0].shares_after, 1000)
+        self.assertAlmostEqual(entries[0].planned_risk, 1.0)
+        self.assertIsNone(entries[0].adjusted_stop)
+        self.assertIn("策略 D0", entries[0].text)
+        self.assertIn("下一根开盘买入", entries[0].text)
+        self.assertIn("短期", entries[0].text)
+        self.assertEqual([item.time for item in exits], ["d6"])
+        self.assertEqual(exits[0].exit_rule, "短期下降")
+        self.assertEqual(exits[0].shares_after, 0)
+        self.assertIn("不开反向仓", exits[0].text)
+        self.assertEqual(result.blocked, ())
+        self.assertGreater(result.final_shares, 0)
+
+    def test_a_gap_cancels_and_the_same_uptrend_is_not_retried(self):
+        appeared = _dbar(0, 100, 100, structure=UPTREND, direction_start=0, a_t=10)
+        cancelled = _run_plugin([
+            appeared,
+            _dbar(1, 106, 106, structure=UPTREND, direction_start=0, a_t=10),
+        ], "d0", "uniform")
+        self.assertEqual(_by(cancelled, "入场"), [])
+        self.assertEqual(_by(cancelled, "取消")[0].reason, "跳空")
+        filled = _run_plugin([
+            appeared,
+            _dbar(1, 104, 104, structure=UPTREND, direction_start=0, a_t=10),
+        ], "d0", "uniform")
+        self.assertEqual(len(_by(filled, "入场")), 1)
+
+    def test_mid_downtrend_does_not_sell_or_block_the_entry(self):
+        held = _run_plugin([
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0, exit_structure=DOWNTREND, exit_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=0, exit_structure=DOWNTREND, exit_start=0),
+            _dbar(2, 100, 100, structure=UPTREND, direction_start=0, exit_structure=DOWNTREND, exit_start=2),
+        ], "d0", "uniform")
+        self.assertEqual(len(_by(held, "入场")), 1)
+        self.assertEqual(_by(held, "趋势退出"), [])
+        self.assertEqual(held.blocked, ())
+        self.assertGreater(held.final_shares, 0)
+
+
+class D1Tests(unittest.TestCase):
+    def test_stop_is_fifteen_percent_under_the_holding_high(self):
+        bars = [
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(2, 150, 180, structure=UPTREND, direction_start=0, high=200, low=150),
+            _dbar(3, 180, 175, structure=UPTREND, direction_start=0, high=180, low=171),
+            _dbar(4, 175, 172, structure=UPTREND, direction_start=0, high=175, low=170),
+        ]
+        result = _run_plugin(bars, "d1", "uniform")
+        entry = _by(result, "入场")[0]
+        self.assertEqual(entry.time, "d1")
+        self.assertAlmostEqual(entry.adjusted_stop, 85)
+        self.assertIn("前高", entry.text)
+        self.assertIn("15%", entry.text)
+        stopped = _by(result, "止损")
+        self.assertEqual([item.time for item in stopped], ["d4"])
+        self.assertAlmostEqual(stopped[0].price, 170)
+        self.assertEqual(stopped[0].exit_rule, "前高回撤")
+        self.assertEqual(_by(result, "趋势退出"), [])
+        self.assertEqual(result.final_shares, 0)
+
+    def test_the_same_bars_high_does_not_stop_that_bars_low(self):
+        bars = [
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(1, 100, 190, structure=UPTREND, direction_start=0, high=200, low=90),
+            _dbar(2, 190, 165, structure=UPTREND, direction_start=0, high=190, low=160),
+        ]
+        result = _run_plugin(bars, "d1", "uniform")
+        stopped = _by(result, "止损")
+        self.assertEqual([item.time for item in stopped], ["d2"])
+        self.assertAlmostEqual(stopped[0].price, 170)
+
+    def test_short_downtrend_still_exits_while_the_drawdown_is_inside_fifteen_percent(self):
+        bars = [
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(2, 100, 100, structure=DOWNTREND, direction_start=2),
+            _dbar(3, 96, 96, structure=DOWNTREND, direction_start=2, high=96, low=96),
+        ]
+        result = _run_plugin(bars, "d1", "uniform")
+        exits = _by(result, "趋势退出")
+        self.assertEqual([item.time for item in exits], ["d3"])
+        self.assertEqual(exits[0].exit_rule, "短期下降")
+        self.assertAlmostEqual(exits[0].price, 96)
+        self.assertEqual(_by(result, "止损"), [])
+
+    def test_a_gap_through_the_stop_runs_before_the_trend_exit(self):
+        bars = [
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(2, 100, 100, structure=DOWNTREND, direction_start=2),
+            _dbar(3, 80, 80, structure=DOWNTREND, direction_start=2),
+        ]
+        result = _run_plugin(bars, "d1", "uniform")
+        stopped = _by(result, "止损")
+        self.assertEqual([item.time for item in stopped], ["d3"])
+        self.assertEqual(stopped[0].exit_rule, "前高回撤")
+        self.assertEqual(stopped[0].reason, "跳空穿过止损")
+        self.assertAlmostEqual(stopped[0].price, 80)
+        self.assertEqual(_by(result, "趋势退出"), [])
+
+    def test_the_same_uptrend_is_not_bought_again_after_the_stop(self):
+        bars = [
+            _dbar(0, 100, 100, structure=UPTREND, direction_start=0),
+            _dbar(1, 100, 100, structure=UPTREND, direction_start=0, high=100, low=80),
+            _dbar(2, 90, 90, structure=UPTREND, direction_start=0),
+            _dbar(3, 90, 90, structure=UPTREND, direction_start=0),
+        ]
+        result = _run_plugin(bars, "d1", "uniform")
+        self.assertEqual([item.time for item in _by(result, "入场")], ["d1"])
+        self.assertEqual([item.time for item in _by(result, "止损")], ["d1"])
+        self.assertEqual(result.final_shares, 0)
+
+
 class ReportTests(unittest.TestCase):
     def test_dividend_income_is_cash_and_is_not_also_left_in_the_price(self):
         market = self._flat_market()
@@ -2411,11 +2606,15 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(folders, [
                 "00700_breakout",
                 "00700_breakout_no_reduce",
+                "00700_d0",
+                "00700_d1",
                 "00700_pullback",
                 "00700_pullback_no_reduce",
                 "00700_trend",
                 "NVDA_breakout",
                 "NVDA_breakout_no_reduce",
+                "NVDA_d0",
+                "NVDA_d1",
                 "NVDA_pullback",
                 "NVDA_pullback_no_reduce",
                 "NVDA_trend",

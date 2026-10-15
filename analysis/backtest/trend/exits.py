@@ -46,6 +46,15 @@ def next_long_stop(
     return current
 
 
+def drawdown_stop(highest: float, fraction: float) -> float:
+    """持有以来最高价回撤到这个比例时的止损。比例是价格的百分比，不是成本亏损。"""
+    if isinstance(highest, bool) or not isinstance(highest, (int, float)) or highest <= 0:
+        raise ValueError("前高必须为正")
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < float(fraction) < 1:
+        raise ValueError("回撤比例必须在 (0, 1)")
+    return float(highest) * (1.0 - float(fraction))
+
+
 def reduce_shares(shares: int, fraction: float, lot_size: int) -> tuple[int, bool]:
     """向下取整到整手。取整为 0 或剩余不足一手时，改为全部退出。"""
     if isinstance(shares, bool) or not isinstance(shares, int) or shares < 1:
