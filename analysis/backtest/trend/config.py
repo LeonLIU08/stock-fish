@@ -160,6 +160,25 @@ class ScaleEntry:
 
 
 @dataclass(frozen=True)
+class BreakEntry:
+    """策略 F。交易尺度必须与 structure.scale 相同，参照尺度用来读中尺度突破。"""
+
+    scale: str
+    context_scale: str
+
+
+@dataclass(frozen=True)
+class BreakoutSpec:
+    """向上突破和有效支撑各加一档风险。向下突破按尺度减仓或清仓。"""
+
+    fresh_bars: int
+    step: float
+    range_break_risk: float
+    short_down: int
+    mid_down: int
+
+
+@dataclass(frozen=True)
 class OrderSpec:
     gap_cancel: float
     max_stop_distance: Optional[float]
@@ -199,10 +218,11 @@ class ExitSpec:
 @dataclass(frozen=True)
 class StrategySpec:
     name: str
-    entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry
+    entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry | BreakEntry
     order: OrderSpec
     risk: RiskSpec
     exit: ExitSpec
+    breakout: Optional[BreakoutSpec] = None
 
 
 @dataclass(frozen=True)
@@ -511,6 +531,7 @@ def trend_config_from_mapping(
     _check_d0_scale(structure, strategies)
     _check_d1_scale(structure, strategies)
     _check_book_scale(structure, strategies)
+    _check_break_scale(structure, strategies)
     runs = _runs(payload["runs"], strategies, overrides or {})
     symbols = _select_symbols(symbols, markets, overrides or {})
     symbols = _fill_missing_lots(symbols, lot_lookup)
@@ -795,7 +816,9 @@ def _strategies(value: Any) -> Dict[str, StrategySpec]:
     row = _mapping(value, "strategies")
     if set(row) == {"scale"}:
         return {"scale": _strategy("scale", row["scale"])}
-    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend", "d0", "d1", "scale"))
+    if set(row) == {"break"}:
+        return {"break": _strategy("break", row["break"])}
+    _exact(row, ("breakout", "pullback"), "strategies", optional=("trend", "d0", "d1", "scale", "break"))
     specs = {
         "breakout": _strategy("breakout", row["breakout"]),
         "pullback": _strategy("pullback", row["pullback"]),
@@ -808,6 +831,8 @@ def _strategies(value: Any) -> Dict[str, StrategySpec]:
         specs["d1"] = _strategy("d1", row["d1"])
     if "scale" in row and row["scale"] is not None:
         specs["scale"] = _strategy("scale", row["scale"])
+    if "break" in row and row["break"] is not None:
+        specs["break"] = _strategy("break", row["break"])
     return specs
 
 
@@ -816,10 +841,12 @@ def _strategy(name: str, value: Any) -> StrategySpec:
     row = _mapping(value, label)
     if name == "scale":
         _exact(row, ("entry", "order", "risk", "exit", "add"), label)
+    elif name == "break":
+        _exact(row, ("entry", "order", "risk", "exit", "add", "breakout"), label)
     else:
         _exact(row, ("entry", "order", "risk", "exit"), label)
     if name == "breakout":
-        entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry = _breakout_entry(row["entry"])
+        entry: BreakoutEntry | PullbackEntry | TrendEntry | D0Entry | ScaleEntry | BreakEntry = _breakout_entry(row["entry"])
         order, risk, exit_spec = _order(row["order"], name), _risk(row["risk"], name), _exit(row["exit"], name)
     elif name == "pullback":
         entry = _pullback_entry(row["entry"])
@@ -836,6 +863,15 @@ def _strategy(name: str, value: Any) -> StrategySpec:
     elif name == "scale":
         entry = _scale_entry(row["entry"])
         order, risk, exit_spec = _scale_order(row["order"]), _scale_risk(row["risk"]), _book_exit(row["exit"], row["add"])
+        return StrategySpec(name, entry, order, risk, exit_spec)
+    elif name == "break":
+        entry = _break_entry(row["entry"])
+        order = _scale_order(row["order"], name)
+        risk = _scale_risk(row["risk"], name)
+        spec = _breakout_spec(row["breakout"], risk)
+        exit_spec = _book_exit(row["exit"], row["add"], name, add_floor=spec.step)
+        _check_break_budget(risk, spec, name)
+        return StrategySpec(name, entry, order, risk, exit_spec, spec)
     else:
         raise ValueError(f"未知策略 {name}")
     return StrategySpec(name, entry, order, risk, exit_spec)
@@ -861,6 +897,20 @@ def _check_d0_scale(structure: StructureSpec, strategies: Mapping[str, StrategyS
 
 def _check_d1_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
     _check_same_scale(structure, strategies, "d1", "策略 D1")
+
+
+def _check_break_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
+    strategy = strategies.get("break")
+    if strategy is None:
+        return
+    entry = strategy.entry
+    if not isinstance(entry, BreakEntry):
+        raise ValueError("strategies.break 的入场参数类型不对")
+    if entry.scale != structure.scale:
+        raise ValueError(
+            "策略 F 的尺度必须与 structure.scale 相同，"
+            f"收到 {entry.scale} 和 {structure.scale}"
+        )
 
 
 def _check_book_scale(structure: StructureSpec, strategies: Mapping[str, StrategySpec]) -> None:
@@ -952,8 +1002,19 @@ def _scale_entry(value: Any) -> ScaleEntry:
     return ScaleEntry(_scale(row["scale"], f"{label}.scale"))
 
 
-def _scale_order(value: Any) -> OrderSpec:
-    label = "strategies.scale.order"
+def _break_entry(value: Any) -> BreakEntry:
+    label = "strategies.break.entry"
+    row = _mapping(value, label)
+    _exact(row, ("scale", "context_scale"), label)
+    scale = _scale(row["scale"], f"{label}.scale")
+    context = _scale(row["context_scale"], f"{label}.context_scale")
+    if context == scale:
+        raise ValueError(f"{label}.context_scale 不能与 scale 相同")
+    return BreakEntry(scale, context)
+
+
+def _scale_order(value: Any, strategy: str = "scale") -> OrderSpec:
+    label = f"strategies.{strategy}.order"
     row = _mapping(value, label)
     _exact(row, ("gap_cancel", "min_stop_distance", "slippage_rate", "max_trades_per_day"), label)
     trades = _int(row["max_trades_per_day"], f"{label}.max_trades_per_day")
@@ -968,8 +1029,8 @@ def _scale_order(value: Any) -> OrderSpec:
     )
 
 
-def _scale_risk(value: Any) -> RiskSpec:
-    label = "strategies.scale.risk"
+def _scale_risk(value: Any, strategy: str = "scale") -> RiskSpec:
+    label = f"strategies.{strategy}.risk"
     row = _mapping(value, label)
     _exact(
         row,
@@ -991,8 +1052,40 @@ def _scale_risk(value: Any) -> RiskSpec:
     return RiskSpec(tranche, one_lot, exposure, None, sizing="stop", max_open_risk=cap)
 
 
-def _book_exit(exit_value: Any, add_value: Any) -> ExitSpec:
-    label = "strategies.scale.exit"
+def _breakout_spec(value: Any, risk: RiskSpec) -> BreakoutSpec:
+    label = "strategies.break.breakout"
+    row = _mapping(value, label)
+    _exact(row, ("fresh_bars", "step", "range_break_risk", "short_down", "mid_down"), label)
+    fresh = _int(row["fresh_bars"], f"{label}.fresh_bars")
+    if fresh < 1:
+        raise ValueError(f"{label}.fresh_bars 至少为 1，收到 {fresh}")
+    step = _rate(_number(row["step"], f"{label}.step"), f"{label}.step")
+    if step <= 0:
+        raise ValueError(f"{label}.step 必须为正")
+    range_risk = _rate(_number(row["range_break_risk"], f"{label}.range_break_risk"), f"{label}.range_break_risk")
+    if range_risk <= 0:
+        raise ValueError(f"{label}.range_break_risk 必须为正")
+    if range_risk > risk.max_open_risk:
+        raise ValueError(f"{label}.range_break_risk 不得超过 max_open_risk")
+    short_down = _int(row["short_down"], f"{label}.short_down")
+    mid_down = _int(row["mid_down"], f"{label}.mid_down")
+    if short_down != 2:
+        raise ValueError(f"{label}.short_down 只接受 2，收到 {short_down}")
+    if mid_down != 3:
+        raise ValueError(f"{label}.mid_down 只接受 3，收到 {mid_down}")
+    return BreakoutSpec(fresh, step, range_risk, short_down, mid_down)
+
+
+def _check_break_budget(risk: RiskSpec, spec: BreakoutSpec, strategy: str) -> None:
+    full = risk.risk_per_trade + 2 * spec.step
+    if full > risk.max_open_risk + 1e-12:
+        raise ValueError(
+            f"strategies.{strategy} 的试仓加上两次突破增量 {full} 超过 max_open_risk {risk.max_open_risk}"
+        )
+
+
+def _book_exit(exit_value: Any, add_value: Any, strategy: str = "scale", add_floor: float = 0.0025) -> ExitSpec:
+    label = f"strategies.{strategy}.exit"
     row = _mapping(exit_value, label)
     _exact(row, ("trail_multiple", "trail_categories", "bank_multiple", "peel_on", "flatten_categories"), label)
     trail = _positive(_number(row["trail_multiple"], f"{label}.trail_multiple"), f"{label}.trail_multiple")
@@ -1004,7 +1097,7 @@ def _book_exit(exit_value: Any, add_value: Any) -> ExitSpec:
     if peel not in _CATEGORIES:
         raise ValueError(f"{label}.peel_on 有未知主状态 {peel}")
     flatten = _category_list(row["flatten_categories"], f"{label}.flatten_categories")
-    add_label = "strategies.scale.add"
+    add_label = f"strategies.{strategy}.add"
     add = _mapping(add_value, add_label)
     _exact(add, ("max_adds", "first", "second_category", "extend_multiple"), add_label)
     adds = _int(add["max_adds"], f"{add_label}.max_adds")
@@ -1023,12 +1116,13 @@ def _book_exit(exit_value: Any, add_value: Any) -> ExitSpec:
         1.0,
         "floor_lot_else_flatten",
         "none",
-        mode="scale_book",
+        mode="break_book" if strategy == "break" else "scale_book",
         bank_multiple=bank,
         peel_on=peel,
         flatten_categories=tuple(flatten),
         extend_multiple=extend,
         max_adds=adds,
+        add_floor=add_floor,
         second_category=second,
     )
 

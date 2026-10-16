@@ -971,6 +971,11 @@ def _bar(time, open_, high, low, close, **kw):
         exit_scale=kw.pop("exit_scale", None),
         exit_structure=kw.pop("exit_structure", None),
         exit_direction_start_index=kw.pop("exit_direction_start_index", None),
+        up_breaks=tuple(kw.pop("up_breaks", ())),
+        down_breaks=tuple(kw.pop("down_breaks", ())),
+        support_valid=kw.pop("support_valid", False),
+        phase_trigger=kw.pop("phase_trigger", None),
+        range_floor=kw.pop("range_floor", None),
     )
     if kw:
         raise TypeError(sorted(kw))
@@ -1678,7 +1683,7 @@ def _pullback_week(
 class EntryPluginTests(unittest.TestCase):
     def test_registry_refuses_a_plugin_without_a_stop(self):
         config = load_trend_config(today=date(2026, 10, 13))
-        self.assertEqual(list_entries(), ["breakout", "d0", "d1", "pullback", "scale", "trend"])
+        self.assertEqual(list_entries(), ["break", "breakout", "d0", "d1", "pullback", "scale", "trend"])
         first = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         second = create_entry("breakout", config.strategies["breakout"], price_axis="log")
         self.assertIsNot(first, second)
@@ -2694,7 +2699,7 @@ def _run_scale(bars, price_axis="uniform"):
     )
 
 
-def _sbar(index, open_, close, *, structure=UPTREND, category=UP_CONTINUE, direction_start=0, a_t=1.0, high=None, low=None):
+def _sbar(index, open_, close, *, structure=UPTREND, category=UP_CONTINUE, direction_start=0, a_t=1.0, high=None, low=None, **kw):
     return _bar(
         f"d{index}",
         open_,
@@ -2705,6 +2710,7 @@ def _sbar(index, open_, close, *, structure=UPTREND, category=UP_CONTINUE, direc
         category=category,
         a_t=a_t,
         direction_start_index=direction_start,
+        **kw,
     )
 
 
@@ -2837,6 +2843,195 @@ class ScaleTests(unittest.TestCase):
         self.assertIsNone(add_risk_budget(0.008, 0.01, 0.005))
         self.assertAlmostEqual(add_risk_budget(0.006, 0.01, 0.005), 0.004)
         self.assertAlmostEqual(add_risk_budget(0.0, 0.01, 0.005), 0.005)
+
+
+def _run_break(bars, price_axis="uniform"):
+    config = load_trend_config(
+        ROOT / "analysis" / "backtest" / "trend-strategy-break.yaml",
+        today=date(2026, 10, 16),
+    )
+    strategy = replace(config.strategies["break"], order=replace(config.strategies["break"].order, slippage_rate=0.0))
+    market = replace(
+        config.markets[MARKET_HK],
+        commission_rate=0.0,
+        min_commission=0.0,
+        platform_fee=0.0,
+        stamp_duty_rate=0.0,
+        exchange_fee_rate=0.0,
+        settlement_rate=0.0,
+    )
+    tactic = create_entry("break", strategy, price_axis=price_axis)
+    return run_account(
+        bars, tactic, strategy, market, lot_size=1, capital=100_000.0, price_axis=price_axis,
+    )
+
+
+class BreakTests(unittest.TestCase):
+    def test_config_uses_five_times_the_scale_budget(self):
+        config = load_trend_config(
+            ROOT / "analysis" / "backtest" / "trend-strategy-break.yaml",
+            today=date(2026, 10, 16),
+        )
+        strategy = config.strategies["break"]
+        self.assertEqual(strategy.exit.mode, "break_book")
+        self.assertEqual(strategy.risk.risk_per_trade, 0.025)
+        self.assertEqual(strategy.risk.max_open_risk, 0.05)
+        self.assertEqual(strategy.risk.max_gross_exposure, 1.0)
+        self.assertEqual(strategy.breakout.step, 0.0125)
+        self.assertEqual(strategy.breakout.range_break_risk, 0.0125)
+        self.assertEqual(strategy.exit.add_floor, 0.0125)
+        self.assertEqual(config.runs[0].key, "break")
+        data = load_trend_yaml(ROOT / "analysis" / "backtest" / "trend-strategy-break.yaml")
+        data["strategies"]["break"]["breakout"]["short_down"] = 1
+        with self.assertRaisesRegex(ValueError, "short_down"):
+            trend_config_from_mapping(data, source="break-test")
+
+    def test_plain_entry_is_five_times_the_old_tranche(self):
+        result = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+        ])
+        entry = _by(result, "入场")[0]
+        self.assertAlmostEqual(entry.planned_risk, 0.025, places=3)
+
+    def test_up_break_and_support_raise_the_tranche(self):
+        up = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=80, a_t=10, up_breaks=("short|boundary|line|up",)),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=80, a_t=10),
+        ])
+        both = _run_break([
+            _sbar(
+                0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=80, a_t=10,
+                up_breaks=("short|boundary|line|up",), support_valid=True,
+            ),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=80, a_t=10),
+        ])
+        self.assertAlmostEqual(_by(up, "入场")[0].planned_risk, 0.0375, places=3)
+        self.assertAlmostEqual(_by(both, "入场")[0].planned_risk, 0.05, places=3)
+
+    def test_down_break_blocks_the_entry_and_a_used_event_does_not_boost_the_next_order(self):
+        blocked = _run_break([
+            _sbar(
+                0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99,
+                up_breaks=("short|boundary|line|up",), down_breaks=("short|boundary|floor|down",),
+            ),
+            _sbar(1, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+        ])
+        self.assertEqual(_by(blocked, "入场"), [])
+        reused = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99, up_breaks=("short|boundary|line|up",)),
+            _sbar(1, 101, 100, category=UP_BIRTH, direction_start=1, high=101, low=99),
+            _sbar(2, 100, 100, category=UP_BIRTH, direction_start=1, high=100, low=99),
+        ])
+        self.assertEqual([item.action for item in reused.decisions if item.action in ("取消", "入场")], ["取消", "入场"])
+        self.assertAlmostEqual(_by(reused, "入场")[0].planned_risk, 0.025, places=3)
+
+    def test_short_down_peels_and_mid_down_flattens(self):
+        peeled = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 102, category=UP_CONTINUE, direction_start=0, high=103, low=99.5),
+            _sbar(2, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101, down_breaks=("short|boundary|floor|down",)),
+            _sbar(3, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102),
+        ])
+        self.assertEqual([item.time for item in _by(peeled, "减仓")], ["d3"])
+        self.assertEqual(_by(peeled, "趋势退出"), [])
+        flat = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 102, category=UP_CONTINUE, direction_start=0, high=103, low=99.5),
+            _sbar(2, 102, 103, category=UP_CONTINUE, direction_start=0, high=104, low=101, down_breaks=("mid|boundary|floor|down",)),
+            _sbar(3, 103, 103, category=UP_CONTINUE, direction_start=0, high=104, low=102),
+        ])
+        self.assertEqual([item.time for item in _by(flat, "趋势退出")], ["d3"])
+        self.assertEqual(flat.equity[3].shares, 0)
+
+    def test_range_break_buys_the_small_tranche_at_the_tighter_stop(self):
+        result = _run_break([
+            _sbar(
+                0, 100, 100, structure=RANGE, category=PENDING, direction_start=0,
+                high=100, low=99, phase_start_index=0, phase_trigger="range_break_up", range_floor=98.5,
+            ),
+            _sbar(1, 100, 100, structure=RANGE, category=PENDING, direction_start=0, high=100, low=99),
+        ])
+        entry = _by(result, "入场")[0]
+        self.assertEqual(entry.time, "d1")
+        self.assertAlmostEqual(entry.planned_risk, 0.0125, places=3)
+        self.assertAlmostEqual(entry.adjusted_stop, 98.5)
+
+    def test_downtrend_phase_still_flattens(self):
+        result = _run_break([
+            _sbar(0, 100, 100, category=UP_BIRTH, direction_start=0, high=100, low=99),
+            _sbar(1, 100, 102, category=UP_CONTINUE, direction_start=0, high=103, low=99.5),
+            _sbar(2, 102, 102, structure=DOWNTREND, category=DOWN_BIRTH, direction_start=2, high=103, low=101.5),
+            _sbar(3, 102, 101, structure=DOWNTREND, category=DOWN_BIRTH, direction_start=2, high=102, low=100.5),
+        ])
+        self.assertEqual([item.time for item in _by(result, "趋势退出")], ["d3"])
+
+    def test_break_events_are_read_only_on_their_available_bar(self):
+        from analysis.backtest.trend.breaks import read_breaks
+        from analysis.structure.series import SeriesBar, StandardSeries
+
+        params = default_params("uniform", version=PARAM_VERSION_V6)
+        series = StandardSeries(
+            (
+                SeriesBar(0, datetime(2026, 1, 2, tzinfo=HK), 101.0, 101.0, False),
+                SeriesBar(1, datetime(2026, 1, 5, tzinfo=HK), 101.0, 101.0, False),
+            ),
+            "close",
+            "uniform",
+            "1d",
+            params.version,
+            "test",
+            params,
+        )
+        view = {
+            "boundaries": [{
+                "id": "short:resistance:0-4",
+                "scale": "short",
+                "role": "resistance",
+                "status": "broken",
+                "primary": True,
+                "slope": 0.0,
+                "intercept": 90.0,
+                "volatility": 1.0,
+            }, {
+                "id": "short:support:0-4",
+                "scale": "short",
+                "role": "support",
+                "status": "validated",
+                "primary": True,
+                "slope": 0.0,
+                "intercept": 100.0,
+                "volatility": 2.0,
+            }],
+            "zones": [],
+            "events": [{
+                "event_type": "breakout",
+                "available_index": 0,
+                "object_kind": "boundary",
+                "object_id": "short:resistance:0-4",
+            }],
+            "pivots": [{
+                "scale": "short",
+                "role": "low",
+                "extreme_index": 0,
+                "confirm_index": 0,
+                "geometric_price": 100.0,
+            }],
+            "methods": {
+                "phase": {"objects": []},
+                "direction": {"objects": [{
+                    "scale": "short",
+                    "structure": "uptrend",
+                    "start_index": 0,
+                    "end_index": 0,
+                }]},
+            },
+        }
+        fresh = read_breaks(view, series, 0, ("short", "mid"), entry_scale="short")
+        later = read_breaks(view, series, 1, ("short", "mid"), entry_scale="short")
+        self.assertEqual(fresh.up, ("short|boundary|short:resistance:0-4|up",))
+        self.assertEqual(later.up, ())
+        self.assertTrue(fresh.support_valid)
 
 
 if __name__ == "__main__":

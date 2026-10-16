@@ -12,6 +12,7 @@ from datetime import date, datetime
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
 
+from analysis.backtest.trend.breaks import read_breaks
 from analysis.structure.methods.phase import _NAMES as PHASE_NAMES
 from analysis.structure.methods.phase import _STRUCTURE_NAME as STRUCTURE_NAMES
 from analysis.structure.methods.phase import INSUFFICIENT
@@ -43,6 +44,11 @@ class TapeRow:
     exit_scale: Optional[str] = None
     exit_structure: Optional[str] = None
     exit_direction_start_index: Optional[int] = None
+    up_breaks: tuple = ()
+    down_breaks: tuple = ()
+    support_valid: bool = False
+    phase_trigger: Optional[str] = None
+    range_floor: Optional[float] = None
 
 
 def canonical_row(row: TapeRow) -> str:
@@ -142,6 +148,7 @@ def build_tape(
     start_index: int = 0,
     end_index: Optional[int] = None,
     extra_scale: Optional[str] = None,
+    break_scales: Sequence[str] = (),
 ) -> tuple[TapeRow, ...]:
     """评估窗口内每一根一行。暖机只参与递推，不写出。
 
@@ -187,6 +194,9 @@ def build_tape(
                 exit_structure = str(exit_phase.get("structure"))
             if exit_direction is not None and exit_direction.get("start_index") is not None:
                 exit_start = int(exit_direction["start_index"])
+        frame = None
+        if break_scales:
+            frame = read_breaks(view, series, index, break_scales, entry_scale=scale)
         rows.append(
             TapeRow(
                 index=index,
@@ -208,6 +218,11 @@ def build_tape(
                 exit_scale=extra_scale,
                 exit_structure=exit_structure,
                 exit_direction_start_index=exit_start,
+                up_breaks=() if frame is None else frame.up,
+                down_breaks=() if frame is None else frame.down,
+                support_valid=False if frame is None else frame.support_valid,
+                phase_trigger=None if frame is None else frame.phase_trigger,
+                range_floor=None if frame is None else frame.range_floor,
             )
         )
     return tuple(rows)

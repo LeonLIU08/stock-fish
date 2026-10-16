@@ -118,6 +118,11 @@ class ReplayBar:
     exit_scale: Optional[str] = None
     exit_structure: Optional[str] = None
     exit_direction_start_index: Optional[int] = None
+    up_breaks: Tuple[str, ...] = ()
+    down_breaks: Tuple[str, ...] = ()
+    support_valid: bool = False
+    phase_trigger: Optional[str] = None
+    range_floor: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +192,7 @@ class _PendingEntry:
     text: str
     signal_index: int
     kind: str = "starter"
+    risk: Optional[float] = None
 
 
 @dataclass
@@ -277,6 +283,8 @@ class _Replay:
         self.tranches: list = []
         self.add_count = 0
         self.exhaustion_latched = False
+        self.exhaustion_peeled = False
+        self.consumed_breaks: set = set()
         self.prev_category: Optional[str] = None
         self.fills: dict = {}
         self.decisions: list = []
@@ -324,11 +332,14 @@ class _Replay:
         self._remember_phase(bar)
 
     def _remember_phase(self, bar: ReplayBar) -> None:
-        if getattr(self.tactic, "exit_kind", "") == "scale_book":
+        if self._scale_book():
             self.prev_category = bar.category
 
     def _scale_book(self) -> bool:
-        return getattr(self.tactic, "exit_kind", "") == "scale_book"
+        return getattr(self.tactic, "exit_kind", "") in ("scale_book", "break_book")
+
+    def _break_book(self) -> bool:
+        return getattr(self.tactic, "exit_kind", "") == "break_book"
 
     def _at_open(self, index: int, bar: ReplayBar) -> None:
         if self._scale_book():
@@ -391,7 +402,7 @@ class _Replay:
             open_price=fill_price,
             raw_stop=stop,
             lot_size=self.lot_size,
-            risk_per_trade=self.strategy.risk.risk_per_trade,
+            risk_per_trade=self.strategy.risk.risk_per_trade if pending.risk is None else pending.risk,
             one_lot_max_risk=self.strategy.risk.one_lot_max_risk,
             max_gross_exposure=self.strategy.risk.max_gross_exposure,
             slippage_rate=self.slippage,
@@ -692,6 +703,8 @@ class _Replay:
                 self._trend_exit(index, bar)
                 return
             if self.pending_exit == "peel" and self._can_trade(bar.time):
+                if self.pending_exit_rule == "上涨衰竭":
+                    self.exhaustion_peeled = True
                 self._peel_oldest(index, bar)
                 self._mark_trade(bar.time)
                 self.pending_exit = None
@@ -728,20 +741,111 @@ class _Replay:
             self.pending_add = None
             return
         peel = False
+        structural = self._sell_weight(index) if self._break_book() else 0
         if bar.category == self.strategy.exit.peel_on:
             if not self.exhaustion_latched:
-                peel = True
                 self.exhaustion_latched = True
-                self.pending_exit = "peel"
-                self.pending_exit_rule = "上涨衰竭"
-                self.pending_exit_text = "上涨衰竭预警第一次出现，下一根减掉最早的一笔。"
+                if structural < 2:
+                    peel = True
+                    self.pending_exit = "peel"
+                    self.pending_exit_rule = "上涨衰竭"
+                    self.pending_exit_text = "上涨衰竭预警第一次出现，下一根减掉最早的一笔。"
         else:
             self.exhaustion_latched = False
+        if structural >= 3 or (structural == 2 and self.exhaustion_peeled):
+            self.pending_exit = "flatten"
+            self.pending_exit_rule = "结构向下突破"
+            self.pending_exit_text = "向下突破达到清仓权重，下一根开盘全部退出，不开反向仓。"
+            self.pending_add = None
+            self._consume(index, "down")
+            return
+        if structural == 2:
+            self.pending_exit = "peel"
+            self.pending_exit_rule = "结构向下突破"
+            self.pending_exit_text = "短尺度向下突破，下一根减掉最早的一笔。"
+            self.pending_add = None
+            self._consume(index, "down")
+            return
         if not peel and self._starter_banked(bar):
             self.pending_exit = "peel"
             self.pending_exit_rule = "试仓止盈"
             self.pending_exit_text = "试仓上涨达到门槛，下一根只卖掉试仓。"
         self._schedule_scale_add(index, bar)
+
+    def _active(self, index: int, side: str) -> Tuple[str, ...]:
+        spec = self.strategy.breakout
+        if spec is None:
+            return ()
+        start = max(0, index - int(spec.fresh_bars) + 1)
+        found = []
+        for cursor in range(start, index + 1):
+            tokens = self.bars[cursor].up_breaks if side == "up" else self.bars[cursor].down_breaks
+            for token in tokens:
+                if token in self.consumed_breaks or token in found:
+                    continue
+                if side == "up" and self._down_since(cursor, index):
+                    continue
+                found.append(token)
+        return tuple(found)
+
+    def _down_since(self, born: int, index: int) -> bool:
+        for cursor in range(born, index + 1):
+            if self.bars[cursor].down_breaks:
+                return True
+        return False
+
+    def _sell_weight(self, index: int) -> int:
+        spec = self.strategy.breakout
+        entry = self.strategy.entry
+        if spec is None:
+            return 0
+        weight = 0
+        context = getattr(entry, "context_scale", None)
+        for token in self._active(index, "down"):
+            scale = token.split("|", 1)[0]
+            weight = max(weight, spec.mid_down if scale == context else spec.short_down)
+        return weight
+
+    def _position_risk(self, index: int) -> float:
+        spec = self.strategy.breakout
+        base = self.strategy.risk.risk_per_trade
+        if spec is None:
+            return base
+        extra = (1 if self._active(index, "up") else 0) + (1 if self.bars[index].support_valid else 0)
+        return min(base + spec.step * extra, self.strategy.risk.max_open_risk)
+
+    def _consume(self, index: int, side: str, kind: Optional[str] = None) -> None:
+        for token in self._active(index, side):
+            if kind is not None and token.split("|")[1] != kind:
+                continue
+            self.consumed_breaks.add(token)
+
+    def _schedule_range_entry(self, index: int, bar: ReplayBar) -> None:
+        spec = self.strategy.breakout
+        if spec is None or bar.phase_trigger != "range_break_up" or bar.phase_start_index != index:
+            return
+        if bar.a_t is None:
+            return
+        close = bar.close * bar.factor
+        stop = offset_price(close, bar.a_t, -self.strategy.exit.trail_buffer, self.price_axis)
+        floor = bar.range_floor
+        if floor is not None and 0 < floor < close and floor > stop:
+            stop = floor
+        if not math.isfinite(stop) or stop <= 0:
+            return
+        text = (
+            "策略 F：整理区间向上突破，方向尚未确认，下一根开盘买入小仓。"
+            f"复权止损 {_num(stop)}。"
+        )
+        self.pending_entry = _PendingEntry(
+            adjusted_stop=float(stop),
+            adjusted_close=close,
+            a_t=float(bar.a_t),
+            text=text,
+            signal_index=index,
+            risk=spec.range_break_risk,
+        )
+        self._consume(index, "up", kind="phase")
 
     def _should_flatten(self, bar: ReplayBar) -> bool:
         if bar.category in self.strategy.exit.flatten_categories:
@@ -757,6 +861,9 @@ class _Replay:
         return close >= target
 
     def _schedule_scale_add(self, index: int, bar: ReplayBar) -> None:
+        if self._break_book() and self._active(index, "down"):
+            self.pending_add = None
+            return
         if self.pending_exit == "flatten" or bar.a_t is None or self.position is None:
             return
         if self.add_count >= self.strategy.exit.max_adds:
@@ -784,7 +891,10 @@ class _Replay:
                 return
             kind = "add2"
             text = "加仓二：上涨延续里高出加仓一，止损已不低于持仓成本。"
-        self.pending_add = _PendingEntry(stop, close, float(bar.a_t), text, index, kind)
+        risk = self._position_risk(index) if self._break_book() else None
+        self.pending_add = _PendingEntry(stop, close, float(bar.a_t), text, index, kind, risk)
+        if self._break_book():
+            self._consume(index, "up")
 
     def _try_scale_add(self, index: int, bar: ReplayBar) -> None:
         pending = self.pending_add
@@ -823,7 +933,7 @@ class _Replay:
         budget = add_risk_budget(
             self._cash_open_risk(bar, equity),
             self.strategy.risk.max_open_risk,
-            self.strategy.risk.risk_per_trade,
+            self.strategy.risk.risk_per_trade if pending.risk is None else pending.risk,
             self.strategy.exit.add_floor,
         )
         if budget is None:
@@ -927,6 +1037,7 @@ class _Replay:
         self.tranches = []
         self.add_count = 0
         self.exhaustion_latched = False
+        self.exhaustion_peeled = False
 
     def _stop_rule(self) -> str:
         if self.strategy.exit.drawdown is not None:
@@ -942,6 +1053,8 @@ class _Replay:
         return "止损"
 
     def _ask(self, index: int, bar: ReplayBar) -> None:
+        if self._break_book() and self._active(index, "down"):
+            return
         prefix = tuple(self.bars[: index + 1])
         if hasattr(self.tactic, "skip_reason"):
             blocked = self.tactic.skip_reason(prefix)
@@ -953,6 +1066,8 @@ class _Replay:
         if signal is None and blocked:
             self.blocked[blocked] = self.blocked.get(blocked, 0) + 1
         if signal is None:
+            if self._break_book():
+                self._schedule_range_entry(index, bar)
             return
         if not isinstance(signal, EntrySignal):
             raise TypeError("插件必须返回 EntrySignal 或 None")
@@ -969,12 +1084,17 @@ class _Replay:
         if bar.a_t is None:
             self._cancel(index, bar, "波动单位尚未就绪", None, signal.text or "")
             return
+        risk = None
+        if self._break_book():
+            risk = self._position_risk(index)
+            self._consume(index, "up")
         self.pending_entry = _PendingEntry(
             adjusted_stop=stop,
             adjusted_close=bar.close * bar.factor,
             a_t=float(bar.a_t),
             text=signal.text or "入场信号",
             signal_index=index,
+            risk=risk,
         )
 
     def _corporate(self, index: int, bar: ReplayBar) -> None:

@@ -42,7 +42,7 @@ from analysis.backtest.metrics import compute_metrics
 from analysis.backtest.report import trade_to_dict, write_case_html, write_reports
 from analysis.backtest.trend.audit import audit_summary, decision_records, to_engine_result, write_jsonl
 from analysis.backtest.trend.baselines import simulate_buy_hold, simulate_even_dca
-from analysis.backtest.trend.config import D0Entry, HK, TrendEntry, TrendStrategyConfig
+from analysis.backtest.trend.config import BreakEntry, D0Entry, HK, TrendEntry, TrendStrategyConfig
 from analysis.backtest.trend.entries import create_entry
 from analysis.backtest.trend.entries.base import scale_label
 from analysis.backtest.trend.feed import enclose_ohlc, load_raw_bars
@@ -231,6 +231,7 @@ def _run_symbol(
         start_index=0,
         end_index=end_index,
         extra_scale=_sell_scale(config),
+        break_scales=_break_scales(config),
     )
     if len(tape) != len(series):
         raise RuntimeError(f"{symbol.code} 磁带 {len(tape)} 根，序列 {len(series)} 根")
@@ -547,6 +548,11 @@ def _replay_bars(frame, adjusted, actions: Sequence[CorporateAction], series, ta
             exit_scale=row.exit_scale,
             exit_structure=row.exit_structure,
             exit_direction_start_index=row.exit_direction_start_index,
+            up_breaks=tuple(row.up_breaks),
+            down_breaks=tuple(row.down_breaks),
+            support_valid=bool(row.support_valid),
+            phase_trigger=row.phase_trigger,
+            range_floor=row.range_floor,
         ))
     return tuple(bars)
 
@@ -577,6 +583,18 @@ def _preamble(config: TrendStrategyConfig, symbol, run, structure: dict, hold_in
     )
 
 
+def _break_scales(config: TrendStrategyConfig) -> Tuple[str, ...]:
+    found = []
+    for strategy in config.strategies.values():
+        entry = strategy.entry
+        if not isinstance(entry, BreakEntry):
+            continue
+        for scale in (entry.scale, entry.context_scale):
+            if scale not in found:
+                found.append(scale)
+    return tuple(found)
+
+
 def _sell_scale(config: TrendStrategyConfig) -> Optional[str]:
     found = []
     for run in config.runs:
@@ -596,6 +614,8 @@ def _scale_text(config: TrendStrategyConfig, strategy) -> str:
         return entry.scale
     if isinstance(entry, TrendEntry):
         return f"{entry.buy_scale}/{entry.sell_scale}"
+    if isinstance(entry, BreakEntry):
+        return f"{entry.scale}/{entry.context_scale}"
     return config.structure.scale
 
 
@@ -614,6 +634,11 @@ def _scale_sentence(config: TrendStrategyConfig, run) -> str:
     if isinstance(entry, TrendEntry):
         return (
             f"买入尺度 {scale_label(entry.buy_scale)}，卖出尺度 {scale_label(entry.sell_scale)}，"
+            f"策略 {config.version}，run {run.key}。"
+        )
+    if isinstance(entry, BreakEntry):
+        return (
+            f"买卖尺度 {scale_label(entry.scale)}，参照尺度 {scale_label(entry.context_scale)}，"
             f"策略 {config.version}，run {run.key}。"
         )
     return f"尺度 {config.structure.scale}，策略 {config.version}，run {run.key}。"
