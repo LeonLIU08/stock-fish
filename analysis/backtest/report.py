@@ -26,7 +26,7 @@ def _num(v, digits=2) -> str:
 def trade_to_dict(t: Trade) -> Dict[str, Any]:
     ts = t.timestamp
     ts_s = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-    return {
+    payload = {
         "timestamp": ts_s,
         "side": t.side,
         "price": round(t.price, 4),
@@ -39,6 +39,18 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "reason": t.reason,
         "skipped": t.skipped,
     }
+    if getattr(t, "action", ""):
+        payload.update({
+            "action": t.action,
+            "tactic": getattr(t, "tactic", ""),
+            "stop_price": None if t.stop_price is None else round(float(t.stop_price), 4),
+            "planned_risk": t.planned_risk,
+            "position_fraction": t.position_fraction,
+            "basis": getattr(t, "basis", ""),
+            "one_lot": bool(getattr(t, "one_lot", False)),
+            "shares_after": t.shares_after,
+        })
+    return payload
 
 
 def _img_b64(path: Optional[Path]) -> str:
@@ -86,6 +98,65 @@ def render_kpi_markdown(split: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _trend_trades(trades: List[Dict[str, Any]]) -> bool:
+    return any(item.get("action") or item.get("basis") for item in trades)
+
+
+def _trend_trips(trips: List[Dict[str, Any]]) -> bool:
+    return any(item.get("exit_reason") for item in trips)
+
+
+def _pct_or_blank(value) -> str:
+    if value is None:
+        return ""
+    return _pct(value)
+
+
+def _audit_markdown(row: Dict[str, Any]) -> str:
+    audit = row.get("audit")
+    if not audit:
+        return ""
+    cancels = audit.get("cancels") or {}
+    blocked = audit.get("blocked") or {}
+    lines = [
+        "#### 衰竭减仓",
+        "",
+        f"- 本 run {'启用' if audit.get('exhaustion_enabled') else '未启用'}衰竭减仓",
+    ]
+    if audit.get("exhaustion_enabled"):
+        lines.append(f"- 减仓次数: {audit.get('exhaustion_reduces', 0)}")
+    lines += [
+        "",
+        "#### 取消与跳过",
+        "",
+        f"- 跳空: {cancels.get('跳空', 0)}",
+        f"- 开盘价不高于止损: {cancels.get('开盘价不高于止损', 0)}",
+        f"- 止损距离: {cancels.get('止损距离', 0)}",
+        f"- 股数为 0 / 风险预算: {cancels.get('风险预算', 0)}",
+        f"- 股数为 0 / 现金: {cancels.get('现金', 0)}",
+        f"- 股数为 0 / 占用上限: {cancels.get('占用上限', 0)}",
+        f"- 环境不允许: {blocked.get('环境不允许', 0)}",
+        f"- 按一手规则成交: {audit.get('one_lot_fills', 0)}",
+        "",
+        f"- 最大连续亏损次数: {audit.get('max_consecutive_losses', 0)}",
+    ]
+    return "\n".join(lines)
+
+
+def _audit_html(row: Dict[str, Any]) -> str:
+    text = _audit_markdown(row)
+    if not text:
+        return ""
+    parts = ["<div class='card'>"]
+    for line in text.splitlines():
+        if line.startswith("#### "):
+            parts.append(f"<h2>{html.escape(line[5:])}</h2>")
+        elif line.startswith("- "):
+            parts.append(f"<p>{html.escape(line[2:])}</p>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _chart_rel(chart_path: Optional[str], output_dir: Path) -> Optional[str]:
     if not chart_path:
         return None
@@ -124,10 +195,19 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
             f"- {spec.get('name', key)} (`{key}`): 收益 {_pct(b.get('buy_hold_return'))}"
             f"，数据 {b.get('coverage', 'n/a')}，来源 `{b.get('source', 'n/a')}`"
         )
-    lines.append(
-        "- 均匀定投（每只股票独立）：起点收盘价可买手数 N，间隔 = 交易日数 / N，"
-        "每隔该间隔买入 1 手（开盘成交，含佣金/印花税，剩余现金留在账户）"
-    )
+        lines.append(
+            "- 均匀定投（每只股票独立）：起点收盘价可买手数 N，间隔 = 交易日数 / N，"
+            "每隔该间隔买入 1 手（开盘成交，含佣金/印花税，剩余现金留在账户）"
+        )
+    comparison = payload.get("comparison_markdown")
+    if comparison:
+        lines += ["", comparison]
+    failures = payload.get("failures") or []
+    if failures:
+        lines += ["", "## 跳过", "", "这些股票没有写入账户结果。", ""]
+        for item in failures:
+            name = item.get("name") or item.get("symbol")
+            lines.append(f"- {name} `{item.get('symbol')}`：{item.get('error')}")
 
     lines += ["", "## 分股成绩（成本后 · 全样本）", ""]
     bench_keys = list((config.benchmarks or {}).keys())
@@ -217,6 +297,18 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
         lines.append("#### 开平仓回合")
         if not trips:
             lines.append("无完整开平仓回合。")
+        elif _trend_trips(trips):
+            lines.append("| 开仓 | 平仓 | 股数 | 成本前盈亏 | 成本后盈亏 | 净收益率 | 退出原因 | 计划风险 | 一手规则 | 实际亏损大于计划风险 |")
+            lines.append("|---|---|---:|---:|---:|---:|---|---:|---|---|")
+            for trip in trips:
+                lines.append(
+                    f"| {trip.get('entry')} | {trip.get('exit')} | {trip.get('shares')} "
+                    f"| {trip.get('pnl_gross')} | {trip.get('pnl_net')} | {_pct(trip.get('return_net'))} "
+                    f"| {trip.get('exit_reason') or ''} | {_pct_or_blank(trip.get('planned_risk'))} "
+                    f"| {'是' if trip.get('one_lot') else '否'} "
+                    f"| {'是' if trip.get('loss_exceeds_plan') else '否'} |"
+                )
+            lines.append("")
         else:
             lines.append("| 开仓 | 平仓 | 股数 | 成本前盈亏 | 成本后盈亏 | 净收益率 |")
             lines.append("|---|---|---:|---:|---:|---:|")
@@ -231,6 +323,16 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
         lines.append("#### 交易明细")
         if not trades:
             lines.append("无成交。")
+        elif _trend_trades(trades):
+            lines.append("| 时间 | 动作 | 策略 | 价格 | 股数 | 仓位占比 | 计划风险 | 生效止损 | 依据 |")
+            lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
+            for t in trades:
+                lines.append(
+                    f"| {t.get('timestamp', '')} | {t.get('action') or t.get('side')} | {t.get('tactic', '')} "
+                    f"| {t.get('price')} | {t.get('shares')} | {_pct_or_blank(t.get('position_fraction'))} "
+                    f"| {_pct_or_blank(t.get('planned_risk'))} | {t.get('stop_price') if t.get('stop_price') is not None else ''} "
+                    f"| {t.get('basis') or t.get('reason') or ''} |"
+                )
         else:
             lines.append("| 时间 | 方向 | 价格 | 股数 | 费用 | 成本后权益 |")
             lines.append("|---|---|---:|---:|---:|---:|")
@@ -239,6 +341,9 @@ def render_markdown(payload: Dict[str, Any], config: BacktestConfig, output_dir:
                     f"| {t.get('timestamp', '')} | {t.get('side')} | {t.get('price')} "
                     f"| {t.get('shares')} | {t.get('fee')} | {t.get('equity_after')} |"
                 )
+        audit_md = _audit_markdown(row)
+        if audit_md:
+            lines += ["", audit_md]
     lines.append("")
     return "\n".join(lines)
 
@@ -286,27 +391,74 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
             )
         ext_html += "</tbody></table>"
 
-    trade_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(t.get('timestamp', '')))}</td>"
-        f"<td>{html.escape(str(t.get('side')))}</td>"
-        f"<td>{t.get('price')}</td><td>{t.get('shares')}</td>"
-        f"<td>{t.get('fee')}</td><td>{t.get('equity_after')}</td>"
-        "</tr>"
-        for t in (row.get("trades") or [])
-    ) or "<tr><td colspan='6'>无成交</td></tr>"
+    trades = row.get("trades") or []
+    trend_trades = _trend_trades(trades)
+    if trend_trades:
+        trade_head = "<tr><th>时间</th><th>动作</th><th>策略</th><th>价格</th><th>股数</th><th>仓位占比</th><th>计划风险</th><th>生效止损</th><th>依据</th></tr>"
+        trade_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(t.get('timestamp', '')))}</td>"
+            f"<td>{html.escape(str(t.get('action') or t.get('side')))}</td>"
+            f"<td>{html.escape(str(t.get('tactic', '')))}</td>"
+            f"<td>{t.get('price')}</td><td>{t.get('shares')}</td>"
+            f"<td>{_pct_or_blank(t.get('position_fraction'))}</td>"
+            f"<td>{_pct_or_blank(t.get('planned_risk'))}</td>"
+            f"<td>{'' if t.get('stop_price') is None else t.get('stop_price')}</td>"
+            f"<td>{html.escape(str(t.get('basis') or t.get('reason') or ''))}</td>"
+            "</tr>"
+            for t in trades
+        ) or "<tr><td colspan='9'>无成交</td></tr>"
+    else:
+        trade_head = "<tr><th>时间</th><th>方向</th><th>价格</th><th>股数</th><th>费用</th><th>成本后权益</th></tr>"
+        trade_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(t.get('timestamp', '')))}</td>"
+            f"<td>{html.escape(str(t.get('side')))}</td>"
+            f"<td>{t.get('price')}</td><td>{t.get('shares')}</td>"
+            f"<td>{t.get('fee')}</td><td>{t.get('equity_after')}</td>"
+            "</tr>"
+            for t in trades
+        ) or "<tr><td colspan='6'>无成交</td></tr>"
 
-    trip_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(t.get('entry', '')))}</td>"
-        f"<td>{html.escape(str(t.get('exit', '')))}</td>"
-        f"<td>{t.get('shares')}</td>"
-        f"<td>{t.get('pnl_gross')}</td>"
-        f"<td>{t.get('pnl_net')}</td>"
-        f"<td>{_pct(t.get('return_net'))}</td>"
-        "</tr>"
-        for t in (row.get("round_trips") or [])
-    ) or "<tr><td colspan='6'>无完整开平仓回合</td></tr>"
+    trips = row.get("round_trips") or []
+    if _trend_trips(trips):
+        trip_head = (
+            "<tr><th>开仓</th><th>平仓</th><th>股数</th><th>成本前盈亏</th><th>成本后盈亏</th>"
+            "<th>净收益率</th><th>退出原因</th><th>计划风险</th><th>一手规则</th><th>实际亏损大于计划风险</th></tr>"
+        )
+        trip_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(t.get('entry', '')))}</td>"
+            f"<td>{html.escape(str(t.get('exit', '')))}</td>"
+            f"<td>{t.get('shares')}</td>"
+            f"<td>{t.get('pnl_gross')}</td>"
+            f"<td>{t.get('pnl_net')}</td>"
+            f"<td>{_pct(t.get('return_net'))}</td>"
+            f"<td>{html.escape(str(t.get('exit_reason') or ''))}</td>"
+            f"<td>{_pct_or_blank(t.get('planned_risk'))}</td>"
+            f"<td>{'是' if t.get('one_lot') else '否'}</td>"
+            f"<td>{'是' if t.get('loss_exceeds_plan') else '否'}</td>"
+            "</tr>"
+            for t in trips
+        ) or "<tr><td colspan='10'>无完整开平仓回合</td></tr>"
+    else:
+        trip_head = "<tr><th>开仓</th><th>平仓</th><th>股数</th><th>成本前盈亏</th><th>成本后盈亏</th><th>净收益率</th></tr>"
+        trip_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(t.get('entry', '')))}</td>"
+            f"<td>{html.escape(str(t.get('exit', '')))}</td>"
+            f"<td>{t.get('shares')}</td>"
+            f"<td>{t.get('pnl_gross')}</td>"
+            f"<td>{t.get('pnl_net')}</td>"
+            f"<td>{_pct(t.get('return_net'))}</td>"
+            "</tr>"
+            for t in trips
+        ) or "<tr><td colspan='6'>无完整开平仓回合</td></tr>"
+    preamble = "".join(f"<p class='muted'>{html.escape(str(line))}</p>" for line in (row.get("preamble") or []))
+    back = ""
+    if row.get("summary_href"):
+        back = f"<p><a href=\"{html.escape(str(row['summary_href']), quote=True)}\">返回汇总</a></p>"
+    audit_html = _audit_html(row)
 
     gaps = "".join(f"<li>{html.escape(g)}</li>" for g in (row.get("gaps") or []))
     variant_label = row.get("variant_label") or row.get("variant") or row.get("scheme", "")
@@ -340,8 +492,10 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
   </style>
 </head>
 <body>
+  {back}
   <h1>{html.escape(name)} `{html.escape(row['symbol'])}` · {html.escape(variant_label)}</h1>
   <p class="muted">{html.escape(str(row.get('coverage', '')))} · 来源 {html.escape(str(row.get('bar_source', '')))}</p>
+  {preamble}
   <div class="card">
     <h2>关键指标（成本前/成本后，样本内/样本外）</h2>
     <p class="muted">样本内截止 {html.escape(str(split.get('is_end')))}，样本外起点 {html.escape(str(split.get('oos_start')))}</p>
@@ -368,17 +522,18 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
   <div class="card">
     <h2>开平仓回合</h2>
     <table>
-      <thead><tr><th>开仓</th><th>平仓</th><th>股数</th><th>成本前盈亏</th><th>成本后盈亏</th><th>净收益率</th></tr></thead>
+      <thead>{trip_head}</thead>
       <tbody>{trip_rows}</tbody>
     </table>
   </div>
   <div class="card">
     <h2>交易明细</h2>
     <table>
-      <thead><tr><th>时间</th><th>方向</th><th>价格</th><th>股数</th><th>费用</th><th>成本后权益</th></tr></thead>
+      <thead>{trade_head}</thead>
       <tbody>{trade_rows}</tbody>
     </table>
   </div>
+  {audit_html}
 </body>
 </html>
 """
@@ -425,6 +580,7 @@ th,td {{ border:1px solid #334155; padding:8px 10px; }} th {{ background:#1e293b
 <body>
 <h1>策略回测索引</h1>
 <p>{html.escape(str(payload.get('generated_at', '')))} · 策略 {html.escape(str(strategy_name))} · {html.escape(str((payload.get('config') or {}).get('start')))} ~ {html.escape(str((payload.get('config') or {}).get('end')))}</p>
+{payload.get('comparison_html') or ''}
 <table><thead><tr><th>股票</th><th>参数方案</th><th>收益</th><th>最大回撤</th><th>夏普</th><th>成交</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 <p><a href="summary.md">Markdown 总览</a> · <a href="summary.json">JSON</a></p>

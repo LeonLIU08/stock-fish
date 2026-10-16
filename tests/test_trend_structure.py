@@ -28,7 +28,9 @@ from analysis.structure.config import (
     params_kwargs_from_payload,
 )
 from analysis.structure.boundaries import build_boundaries, format_boundaries
-from analysis.structure.html_report import render_report, write_result
+from analysis.structure.html_report import recognition_sections, render_report, write_result
+from analysis.structure.replay import build_replay, select_frame_index
+from analysis.structure.view_model import display_snapshot as _display_snapshot
 from analysis.structure.lifecycle import build_lifecycle, format_events
 from analysis.structure.snapshot import build_snapshot, resolve_requested_window
 from analysis.structure.view_model import (
@@ -1480,7 +1482,7 @@ class ReportTests(unittest.TestCase):
             self.assertAlmostEqual(price, math.exp(slope * index + intercept))
         self.assertEqual(html.count('data-table="primary" data-status="validated" data-role="support"'), 1)
         self.assertIn('id="validated-support-count" data-count="1"', html)
-        self.assertIn("TrendChart.mount(chartRoot, viewModel)", html)
+        self.assertIn("TrendChart.mount(chartRoot, viewModel, replay)", html)
         self.assertIn(READING_NOTE, html)
         self.assertIn(SCALE_DEFINITION_NOTE, html)
         self.assertIn("横向区间", html)
@@ -1635,6 +1637,105 @@ class ReportTests(unittest.TestCase):
             self.assertIn("对数价格", log_written["report"].read_text(encoding="utf-8"))
             again = write_result(folder, log_snapshot)
             self.assertEqual(again["snapshot"], log_written["snapshot"])
+
+
+class ReplayTests(unittest.TestCase):
+    def test_later_prices_do_not_change_earlier_frames(self):
+        params = default_params()
+        series = _series_from_levels(_warm(12) + [0.03, 0.0, 0.04, 0.01, 0.05], params=params)
+        original = build_replay(series, symbol="REPLAY", engine_version="test")
+        closes = [bar.close for bar in series.bars]
+        cut = len(closes) // 2
+        closes[-1] = closes[-1] * 1.4
+        mutated = build_series(
+            [bar.timestamp for bar in series.bars],
+            closes,
+            interval=series.interval,
+            params=series.params,
+        )
+        changed = build_replay(mutated, symbol="REPLAY", engine_version="test")
+        self.assertEqual(original["frames"][:cut], changed["frames"][:cut])
+        self.assertEqual(len(original["frames"]), len(series))
+
+    def test_frame_matches_an_independent_prefix_and_keeps_open_stats(self):
+        params = default_params(version=PARAM_VERSION_V2)
+        series = _series_from_levels(_warm(18) + [0.05, 0.0, 0.06, 0.01, 0.07, 0.02, 0.08], params=params)
+        replay = build_replay(series, symbol="REPLAY", engine_version="test", visible_scales="mid")
+        full = build_snapshot(series, symbol="REPLAY", engine_version="test", visible_scales="mid")
+        interesting = {1, len(series) // 2, len(series)}
+        for event in full["events"]:
+            interesting.add(int(event["available_index"]) + 1)
+        open_checked = False
+        for count in sorted(index for index in interesting if 1 <= index <= len(series)):
+            prefix = series.prefix(count)
+            snapshot = build_snapshot(
+                prefix,
+                symbol="REPLAY",
+                engine_version="test",
+                visible_scales="mid",
+            )
+            model = build_view_model(snapshot)
+            frame = replay["frames"][count - 1]
+            chart = frame["chart"]
+            self.assertEqual(chart["as_of_index"], count - 1)
+            self.assertEqual(chart["boundaries"], model["boundaries"])
+            self.assertEqual(chart["zones"], model["zones"])
+            self.assertEqual(chart["pivots"], model["pivots"])
+            self.assertEqual(chart["segments"], model["segments"])
+            self.assertEqual(chart["marks"], model["marks"])
+            sections = recognition_sections(snapshot)
+            self.assertEqual(frame["counts"], sections["counts"])
+            self.assertEqual(frame["sections"]["pivots"], sections["pivots"])
+            self.assertEqual(frame["sections"]["boundaries"], sections["boundaries"])
+            self.assertEqual(frame["sections"]["zones"], sections["zones"])
+            self.assertEqual(frame["sections"]["methods"], sections["methods"])
+            self.assertEqual(frame["sections"]["events"], sections["events"])
+            for item in (snapshot.get("methods") or {}).get("direction", {}).get("objects") or []:
+                if not item.get("stats"):
+                    continue
+                shown = _display_snapshot(_with_as_of(full, prefix.bars[-1].timestamp))
+                filtered = next(
+                    (
+                        row
+                        for row in (shown.get("methods") or {}).get("direction", {}).get("objects") or []
+                        if row.get("id") == item["id"]
+                    ),
+                    None,
+                )
+                if filtered is not None and "stats" not in filtered:
+                    self.assertIn(str(item["stats"]["bar_count"]), frame["sections"]["methods"])
+                    open_checked = True
+                    break
+            if open_checked:
+                break
+        self.assertTrue(open_checked, "前缀帧里应该保留进行中区段的 stats")
+
+    def test_report_opens_on_the_requested_as_of(self):
+        series = _series_from_levels(_warm(8) + [0.02, 0.0, 0.03], params=default_params())
+        replay = build_replay(series, symbol="REPLAY", engine_version="test")
+        chosen = series.bars[4]
+        snapshot = build_snapshot(
+            series,
+            symbol="REPLAY",
+            engine_version="test",
+            as_of=chosen.timestamp.date().isoformat(),
+        )
+        self.assertEqual(select_frame_index(replay["frames"], snapshot["identity"]["as_of"]), 4)
+        html = render_report(snapshot, replay)
+        self.assertIn("截止到该根的 K 线", html)
+        self.assertIn("竖线右侧的价格只是对照", html)
+        self.assertIn('id="structure-replay"', html)
+        self.assertIn(replay["frames"][4]["label"], html)
+        self.assertIn("抓住 as-of 竖线", html)
+        saved_snapshot = _embedded_json(html, "structure-snapshot")
+        self.assertEqual(saved_snapshot["identity"]["bar_count"], len(series))
+
+
+def _with_as_of(snapshot, when):
+    copied = dict(snapshot)
+    copied["identity"] = dict(snapshot["identity"])
+    copied["identity"]["as_of"] = when.isoformat()
+    return copied
 
 
 def _one_support_snapshot(slope, intercept, price_axis="log"):

@@ -1,0 +1,114 @@
+# 策略 E，风险预算为 trend-strategy-scale.yaml 的 10 倍。买卖规则不变。
+# 10 倍的 40% 占用上限是 400%，加载器不允许杠杆，所以占用上限放到 100%。
+# 典型止损距离下，仓位仍由风险预算决定，中位仓位大约从 6% 放到 65%。
+version: trend-strategy-v0
+
+structure:
+  param_version: structure-params-v6
+  price_axis: log          # log | uniform
+  scale: short             # short | mid | long。短期更容易确认方向，信号更密
+  # 传开盘、最高、最低、成交量。开盘价让阶段影线分可计算
+
+prices:                    # 第 4.4 节。第一期只接受这一组
+  signal: adjusted         # 结构、a_t、EMA10、突破、止损
+  fill: raw                # 成交、股数、现金、费用
+  adjustment: proportional_from_first_bar
+  dividends: cash_on_ex_date   # 扣预扣税后入账，不再投资
+
+unit:                      # 第 7 节
+  kind: log_true_range
+  span: 14
+  floor: 0.003
+
+markets:                   # 第 8.1 节。费率是初值，按券商对账单改
+  hk:
+    currency: HKD
+    timezone: Asia/Hong_Kong
+    capital: 1000000
+    commission_rate: 0.0003
+    min_commission: 3
+    platform_fee: 0              # 每单固定收费
+    stamp_duty_rate: 0.001       # 买卖双方，进到整数港元
+    exchange_fee_rate: 0.000085  # 交易费、证监会征费、会财局征费合计，买卖都收
+    settlement_rate: 0.00002     # 交收费，第一期只按比例收，按对账单核对
+    dividend_withholding: 0.0
+    benchmark: tracker_fund
+  us:
+    currency: USD
+    timezone: America/New_York
+    capital: 100000
+    lot_size: 1
+    commission_per_share: 0.005
+    min_commission: 1.0
+    max_commission_rate: 0.01
+    sec_fee_rate: 0.0000278      # 只在卖出；费率逐年变，按回测年份核对
+    taf_per_share: 0.000166      # 只在卖出
+    taf_max: 8.30
+    dividend_withholding: 0.30
+    benchmark: spy
+
+universe:
+  allow_short: false
+  symbols:                 # 可逐只写 lot_size、dividend_withholding。港股没写 lot_size 就从 Longbridge 取
+    - code: "00700"
+      name: "腾讯控股"
+      lot_size: 100
+    - code: "09988"
+      name: "阿里巴巴"
+      lot_size: 100
+    - code: "NVDA"
+      name: "英伟达"
+
+window:
+  start: null
+  end: null
+  lookback_years: 3
+  warmup_bars: 250
+  interval: 1d             # 第一期只接受 1d
+
+strategies:
+  scale:
+    entry:
+      scale: short
+    exit:
+      trail_multiple: 3.0
+      trail_categories: [up_continue, up_pullback, up_exhaustion]
+      bank_multiple: 6.0
+      peel_on: up_exhaustion
+      flatten_categories: [down_birth, down_continue, down_rebound, down_exhaustion, suspected_distribution]
+    add:
+      max_adds: 2
+      first: pullback_to_continue
+      second_category: up_continue
+      extend_multiple: 3.0
+    order:
+      gap_cancel: 0.5
+      min_stop_distance: 1.0
+      slippage_rate: 0.0005
+      max_trades_per_day: 2
+    risk:
+      risk_per_tranche: 0.05    # 原 0.005
+      max_open_risk: 0.10       # 原 0.01。按当前止损，三笔未实现亏损合计
+      max_gross_exposure: 1.00  # 原 0.40。10 倍会超过 1，这里取满仓
+      one_lot_max_risk: 0.10    # 原 0.01。只用于试仓
+
+benchmarks:
+  tracker_fund:
+    name: 盈富基金
+    yahoo: "2800.HK"
+  spy:
+    name: SPDR 标普 500 ETF
+    yahoo: "SPY"
+
+evaluation:
+  oos_ratio: 0.3
+  rolling_window_days: 252
+  extreme_days: 5
+  audit: trades_and_cancels
+
+runs:
+  - key: scale10
+    label: 策略 E×10
+    strategy: scale
+
+output_dir: backtest_results

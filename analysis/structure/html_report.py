@@ -56,11 +56,48 @@ _PARAM_LABELS = {
 }
 
 
-def render_report(snapshot: dict) -> str:
-    """生成完整 HTML。快照和 view model 都内嵌在文件里。"""
-    shown = display_snapshot(snapshot)
-    model = build_view_model(snapshot)
+def recognition_sections(snapshot: dict) -> dict:
+    """某一天的识别表。调用方传入的快照已经是那天的拟合结果，这里不再按 as-of 过滤。"""
+    counts = _recognition_counts(snapshot)
+    return {
+        "counts": counts,
+        "pivots": _pivot_section(snapshot),
+        "boundaries": _boundary_section(snapshot),
+        "zones": _zone_section(snapshot),
+        "methods": _method_sections(snapshot, snapshot),
+        "events": _event_section(snapshot),
+        "relations": _relation_section(snapshot),
+        "appendix": _appendix(snapshot, snapshot),
+        "phase": _phase_key(snapshot),
+    }
+
+
+def render_report(snapshot: dict, replay: dict | None = None) -> str:
+    """生成完整 HTML。快照和 view model 都内嵌在文件里。
+
+    传入 replay 时，图和识别表用打开时那一帧的前缀拟合。整段快照仍嵌在页面里，只作区间终点的留档。
+    """
+    scrub = None
+    if replay:
+        from analysis.structure.replay import compose_view_model, select_frame_index
+
+        index = select_frame_index(replay["frames"], (snapshot.get("identity") or {}).get("as_of"))
+        frame = replay["frames"][index]
+        model = compose_view_model(replay, frame)
+        sections = frame["sections"]
+        scrub = frame
+    else:
+        shown = display_snapshot(snapshot)
+        model = build_view_model(snapshot)
+        sections = recognition_sections(shown)
     title = _title(snapshot)
+    replay_script = ""
+    if replay:
+        from analysis.structure.replay import slim_replay
+
+        replay_script = (
+            f'<script type="application/json" id="structure-replay">{_json_for_script(slim_replay(replay))}</script>'
+        )
     parts = [
         "<!DOCTYPE html>",
         '<html lang="zh-CN">',
@@ -73,22 +110,23 @@ def render_report(snapshot: dict) -> str:
         "</style>",
         "</head>",
         "<body>",
-        _header(snapshot, shown),
+        _header(snapshot, sections, scrub),
         _reading(snapshot),
-        _chart_section(snapshot, shown, model),
+        _chart_section(snapshot, model, sections, scrub is not None),
         _quality_section(snapshot),
         _volatility_section(snapshot),
-        _pivot_section(shown),
-        _boundary_section(shown),
-        _zone_section(shown),
-        _method_sections(shown, snapshot),
-        _event_section(shown),
-        _relation_section(shown),
-        _appendix(shown, snapshot),
+        sections["pivots"],
+        sections["boundaries"],
+        sections["zones"],
+        f'<div id="method-sections">{sections["methods"]}</div>',
+        sections["events"],
+        sections["relations"],
+        sections["appendix"],
         _params_section(snapshot),
         _glossary(),
         f'<script type="application/json" id="structure-snapshot">{_json_for_script(snapshot)}</script>',
         f'<script type="application/json" id="structure-view-model">{_json_for_script(model)}</script>',
+        replay_script,
         "<script>",
         _asset("echarts.min.js"),
         "</script>",
@@ -105,7 +143,7 @@ def render_report(snapshot: dict) -> str:
     return "\n".join(parts)
 
 
-def write_result(output_root, snapshot: dict) -> dict:
+def write_result(output_root, snapshot: dict, replay: dict | None = None) -> dict:
     """把 snapshot.json 和 report.html 写进运行目录。同一身份再次运行会覆盖同名文件。"""
     identity = snapshot["identity"]
     directory = result_directory(
@@ -120,7 +158,7 @@ def write_result(output_root, snapshot: dict) -> dict:
     snapshot_path = directory / "snapshot.json"
     report_path = directory / "report.html"
     snapshot_path.write_text(dump_snapshot(snapshot), encoding="utf-8")
-    report_path.write_text(render_report(snapshot), encoding="utf-8")
+    report_path.write_text(render_report(snapshot, replay), encoding="utf-8")
     return {"directory": directory, "snapshot": snapshot_path, "report": report_path}
 
 
@@ -128,7 +166,7 @@ def dump_snapshot(snapshot: dict) -> str:
     return json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
 
 
-def _header(snapshot: dict, shown: dict) -> str:
+def _header(snapshot: dict, sections: dict, scrub: dict | None = None) -> str:
     identity = snapshot.get("identity") or {}
     version = identity.get("engine_version") or ""
     version_text = version or (identity.get("engine_version_note") or "引擎代码版本留空")
@@ -149,7 +187,18 @@ def _header(snapshot: dict, shown: dict) -> str:
     banner = ""
     if history_note:
         banner = f'<p class="banner">{esc(history_note)}</p>'
-    if as_of:
+    if scrub is not None:
+        label = scrub.get("label") or "—"
+        error = scrub.get("error")
+        error_hidden = "" if error else " hidden"
+        error_text = f"这一天没有拟合结果：{error}" if error else ""
+        banner += (
+            '<p class="banner" id="asof-banner">竖线在 '
+            f'<span id="asof-date">{esc(label)}</span>。'
+            "这一天的识别只用了截止到该根的 K 线。竖线右侧的价格只是对照，没有参与计算。</p>"
+            f'<p class="banner" id="asof-error"{error_hidden}>{esc(error_text)}</p>'
+        )
+    elif as_of:
         banner += (
             '<p class="banner">页面按 as-of '
             f"{esc(fmt_time(as_of))} 显示：只保留当时已经可用的拐点、线和区间。"
@@ -180,7 +229,7 @@ def _header(snapshot: dict, shown: dict) -> str:
   <p><strong>请求区间</strong> {requested}</p>
   <p><strong>实际 K 线</strong> {actual}</p>
   {banner}
-  <div class="counts">{_count_cards(shown, snapshot)}</div>
+  <div class="counts">{_count_cards(snapshot, sections["counts"])}</div>
 </section>
 """
 
@@ -301,8 +350,8 @@ def _plain_num(value, default: float) -> str:
     return f"{number:.3f}".rstrip("0").rstrip(".")
 
 
-def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
-    supports = _validated_supports(shown)
+def _chart_section(snapshot: dict, model: dict, sections: dict, scrub: bool = False) -> str:
+    supports = int((sections.get("counts") or {}).get("supports") or 0)
     visible = set((snapshot.get("identity") or {}).get("visible_scales") or ["mid"])
     scale_buttons = []
     for scale in ("short", "mid", "long"):
@@ -324,7 +373,7 @@ def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
 <section class="panel" id="chart-panel">
   <div class="section-head">
     <h2>走势、趋势线与趋势区间</h2>
-    <p id="validated-support-count" data-count="{len(supports)}">已验证支撑 {len(supports)} 条</p>
+    <p id="validated-support-count" data-count="{supports}">已验证支撑 {supports} 条</p>
   </div>
   <div class="toolbar">
     <button type="button" id="reset-chart">复位</button>
@@ -335,8 +384,9 @@ def _chart_section(snapshot: dict, shown: dict, model: dict) -> str:
   </div>
   <p class="muted">纵轴是{esc(axis)}。趋势线在这根轴上是直线。</p>
   <div id="chart"></div>
-  {_phase_key(shown)}
+  <div id="phase-key-slot">{sections.get("phase") or ""}</div>
   <p class="muted">横轴是 K 线序号，刻度是日期。滚轮以指针位置缩放，按住拖拽平移，底部滑块选择序号区间，双击图或按复位回到全部 K 线，已选中的趋势线或方向线段仍留在图上。点击表格里的一行，会在图上定位该对象。悬停显示实际股价；拐点同时显示极值时间和确认时间。鼠标停在主图下方的色块上，会显示这一段的名称。</p>
+  {('<p class="muted">抓住 as-of 竖线左右拖动，吸附到某一根 K 线。拖动时只改图和日期，松开后更新下面的识别表。没有抓到竖线时，仍是缩放和平移。</p>' if scrub else '')}
   <p class="muted">图上默认是已验证的主结果。实线覆盖拟合用的序号，虚线是向后的投影。被收盘价突破的线保留到突破那一根，突破点用菱形标出。{zone_sentence}候选、拒绝、备选和其他边界对不进这张图。</p>
   {_zone_key(snapshot)}
 </section>
@@ -1030,20 +1080,34 @@ def _zone_table(rows: list, table_id: str, table_name: str) -> str:
 """
 
 
-def _count_cards(shown: dict, snapshot: dict) -> str:
-    quality = snapshot.get("quality") or {}
+def _recognition_counts(shown: dict) -> dict:
     boundaries = shown.get("boundaries") or []
     zones = shown.get("zones") or []
     events = shown.get("events") or []
+    return {
+        "pivots": len(shown.get("pivots") or []),
+        "lines": sum(1 for item in boundaries if item.get("primary") and item.get("status") == "validated"),
+        "zones": sum(1 for item in zones if item.get("primary") and item.get("status") == "validated"),
+        "breakouts": sum(1 for item in events if item.get("event_type") == "breakout"),
+        "supports": len(_validated_supports(shown)),
+    }
+
+
+def _count_cards(snapshot: dict, counts: dict) -> str:
+    quality = snapshot.get("quality") or {}
     cards = [
-        ("K 线", (snapshot.get("identity") or {}).get("bar_count")),
-        ("间断", quality.get("gap_count")),
-        ("已确认拐点", len(shown.get("pivots") or [])),
-        ("已验证趋势线", sum(1 for item in boundaries if item.get("primary") and item.get("status") == "validated")),
-        ("已验证区间", sum(1 for item in zones if item.get("primary") and item.get("status") == "validated")),
-        ("突破事件", sum(1 for item in events if item.get("event_type") == "breakout")),
+        ("K 线", (snapshot.get("identity") or {}).get("bar_count"), None),
+        ("间断", quality.get("gap_count"), None),
+        ("已确认拐点", counts.get("pivots"), "count-pivots"),
+        ("已验证趋势线", counts.get("lines"), "count-lines"),
+        ("已验证区间", counts.get("zones"), "count-zones"),
+        ("突破事件", counts.get("breakouts"), "count-breakouts"),
     ]
-    return "".join(f'<div class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in cards)
+    pieces = []
+    for label, value, node_id in cards:
+        ident = f' id="{node_id}"' if node_id else ""
+        pieces.append(f'<div class="card"><span>{esc(label)}</span><strong{ident}>{esc(value)}</strong></div>')
+    return "".join(pieces)
 
 
 def _group_row(item: dict, kind: str) -> str:
@@ -1360,8 +1424,10 @@ summary { cursor: pointer; color: #f6e2c2; }
 
 _BOOT = """
 var viewModel = JSON.parse(document.getElementById("structure-view-model").textContent);
+var replayNode = document.getElementById("structure-replay");
+var replay = replayNode ? JSON.parse(replayNode.textContent) : null;
 var chartRoot = document.getElementById("chart");
-var api = TrendChart.mount(chartRoot, viewModel);
+var api = TrendChart.mount(chartRoot, viewModel, replay);
 var resetButton = document.getElementById("reset-chart");
 if (resetButton) resetButton.addEventListener("click", function () { api.reset(); });
 var scaleButtons = Array.prototype.slice.call(document.querySelectorAll("[data-scale]"));
@@ -1397,31 +1463,77 @@ document.querySelectorAll("[data-extra]").forEach(function (button) {
 });
 api.onChange(paint);
 paint(api.state());
-document.querySelectorAll("[data-object-id]").forEach(function (row) {
-  row.addEventListener("click", function () {
-    document.querySelectorAll("tr.is-selected").forEach(function (item) { item.classList.remove("is-selected"); });
-    row.classList.add("is-selected");
-    api.focus(row.getAttribute("data-object-id"));
-    var panel = document.getElementById("chart-panel");
-    if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
-  });
+document.body.addEventListener("click", function (event) {
+  var row = event.target.closest ? event.target.closest("tr[data-object-id]") : null;
+  if (!row) return;
+  document.querySelectorAll("tr.is-selected").forEach(function (item) { item.classList.remove("is-selected"); });
+  row.classList.add("is-selected");
+  api.focus(row.getAttribute("data-object-id"));
+  var panel = document.getElementById("chart-panel");
+  if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
 });
-document.querySelectorAll("[data-filter-for]").forEach(function (group) {
-  var table = document.getElementById(group.getAttribute("data-filter-for"));
-  group.querySelectorAll("[data-mode]").forEach(function (button) {
-    button.addEventListener("click", function () {
-      group.querySelectorAll("[data-mode]").forEach(function (item) {
-        item.setAttribute("aria-pressed", item === button ? "true" : "false");
-      });
-      var mode = button.getAttribute("data-mode");
-      table.querySelectorAll("tbody tr").forEach(function (row) {
-        var status = row.getAttribute("data-status");
-        if (!status) return;
-        if (mode === "all") row.hidden = false;
-        else if (mode === "live") row.hidden = ["validated", "broken", "expired"].indexOf(status) < 0;
-        else row.hidden = status !== mode;
+function bindFilters(root) {
+  (root || document).querySelectorAll("[data-filter-for]").forEach(function (group) {
+    if (group.getAttribute("data-bound") === "true") return;
+    group.setAttribute("data-bound", "true");
+    var table = document.getElementById(group.getAttribute("data-filter-for"));
+    group.querySelectorAll("[data-mode]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        group.querySelectorAll("[data-mode]").forEach(function (item) {
+          item.setAttribute("aria-pressed", item === button ? "true" : "false");
+        });
+        var mode = button.getAttribute("data-mode");
+        table.querySelectorAll("tbody tr").forEach(function (row) {
+          var status = row.getAttribute("data-status");
+          if (!status) return;
+          if (mode === "all") row.hidden = false;
+          else if (mode === "live") row.hidden = ["validated", "broken", "expired"].indexOf(status) < 0;
+          else row.hidden = status !== mode;
+        });
       });
     });
   });
-});
+}
+bindFilters(document);
+function replaceSection(id, html) {
+  if (html == null) return;
+  var node = document.getElementById(id);
+  if (!node) return;
+  node.outerHTML = html;
+  bindFilters(document.getElementById(id) || document);
+}
+function setCount(id, value) {
+  var node = document.getElementById(id);
+  if (node) node.textContent = value;
+}
+if (replay && api.onAsOf) {
+  api.onAsOf(function (frame, committed) {
+    var dateNode = document.getElementById("asof-date");
+    if (dateNode) dateNode.textContent = frame.label || "—";
+    if (!committed) return;
+    var errorNode = document.getElementById("asof-error");
+    if (errorNode) {
+      errorNode.hidden = !frame.error;
+      errorNode.textContent = frame.error ? ("这一天没有拟合结果：" + frame.error) : "";
+    }
+    var sections = frame.sections || {};
+    ["pivots", "boundaries", "zones", "events", "relations", "appendix"].forEach(function (id) {
+      replaceSection(id, sections[id]);
+    });
+    var methods = document.getElementById("method-sections");
+    if (methods && sections.methods != null) methods.innerHTML = sections.methods;
+    var phase = document.getElementById("phase-key-slot");
+    if (phase && sections.phase != null) phase.innerHTML = sections.phase;
+    var counts = frame.counts || {};
+    setCount("count-pivots", counts.pivots);
+    setCount("count-lines", counts.lines);
+    setCount("count-zones", counts.zones);
+    setCount("count-breakouts", counts.breakouts);
+    var support = document.getElementById("validated-support-count");
+    if (support) {
+      support.textContent = "已验证支撑 " + (counts.supports || 0) + " 条";
+      support.setAttribute("data-count", String(counts.supports || 0));
+    }
+  });
+}
 """

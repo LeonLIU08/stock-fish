@@ -17,6 +17,7 @@
     python scripts/run_trend_structure.py --symbol 00700 --start 2024-01-01 --end 2024-12-31
     python scripts/run_trend_structure.py --symbol 600519 --years 2 --price-axis uniform --scales short,mid,long
     python scripts/run_trend_structure.py --symbol 00700 --years 1 --as-of 2025-06-01
+    # --as-of 是页面打开时竖线的位置。报告里可以拖到区间内任意一根已加载 K 线。
     python scripts/run_trend_structure.py --samples
 """
 from __future__ import annotations
@@ -46,6 +47,7 @@ from analysis.structure.config import (
     series_quote_fields,
 )
 from analysis.structure.html_report import write_result
+from analysis.structure.replay import build_replay
 from analysis.structure.lifecycle import build_lifecycle
 from analysis.structure.methods import method_failure_text, registered_methods
 from analysis.structure.series import NonPositivePriceError, build_series
@@ -100,7 +102,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="mid",
         help="主图初次打开的尺度，逗号分隔：short,mid,long。三个尺度都会拟合",
     )
-    parser.add_argument("--as-of", help="只显示该时刻已经可用的拐点、线和区间。YYYY-MM-DD 或更精确的时间")
+    parser.add_argument(
+        "--as-of",
+        help="页面打开时竖线所在的交易日。报告可以拖到区间内其他交易日。YYYY-MM-DD 或更精确的时间",
+    )
     parser.add_argument("--output-dir", default="structure_results", help="输出根目录")
     parser.add_argument(
         "--workers",
@@ -209,7 +214,17 @@ def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_d
         visible_methods=methods,
         data_source=source,
     )
-    written = write_result(output_dir, snapshot)
+    replay = build_replay(
+        series,
+        symbol=symbol,
+        requested_start=start,
+        requested_end=end,
+        visible_scales=scales,
+        visible_methods=methods,
+        data_source=source,
+        engine_version=snapshot["identity"].get("engine_version") or "",
+    )
+    written = write_result(output_dir, snapshot, replay)
     identity = snapshot["identity"]
     failure = method_failure_text(snapshot)
     if failure:
@@ -218,6 +233,7 @@ def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_d
             "error": f"{failure}。快照仍已写出：{written['snapshot']}",
             "snapshot": written["snapshot"],
             "report": written["report"],
+            "frames": len(replay["frames"]),
         }
     return {
         "symbol": symbol,
@@ -225,6 +241,7 @@ def _run_symbol(symbol, *, interval, start, end, params, as_of, scales, output_d
         "source": identity["data_source"],
         "snapshot": written["snapshot"],
         "report": written["report"],
+        "frames": len(replay["frames"]),
         "history_note": identity.get("history_note") or "",
     }
 
@@ -288,6 +305,8 @@ def _print_symbol_result(outcome: dict) -> None:
     if outcome.get("history_note"):
         print(outcome["history_note"], flush=True)
     print(f"K 线: {outcome['bar_count']} 根，来源 {outcome['source']}", flush=True)
+    if outcome.get("frames"):
+        print(f"as-of 帧: {outcome['frames']} 根", flush=True)
     print(f"快照: {outcome['snapshot']}", flush=True)
     print(f"报告: {outcome['report']}", flush=True)
 
@@ -850,6 +869,29 @@ def _version_for_method(method_key: str) -> str:
     return chosen
 
 
+def _write_sample(output_root, series, symbol: str):
+    """合成页也带上每一根的前缀帧，方便不访问网络就拖竖线。"""
+    snapshot = build_snapshot(
+        series,
+        symbol=symbol,
+        requested_start=series.bars[0].timestamp.date(),
+        requested_end=series.bars[-1].timestamp.date(),
+        visible_scales=list(SCALE_NAMES),
+        data_source="synthetic",
+        engine_version="sample",
+    )
+    replay = build_replay(
+        series,
+        symbol=symbol,
+        requested_start=series.bars[0].timestamp.date(),
+        requested_end=series.bars[-1].timestamp.date(),
+        visible_scales=list(SCALE_NAMES),
+        data_source="synthetic",
+        engine_version="sample",
+    )
+    return write_result(output_root, snapshot, replay)
+
+
 def _write_samples(output_root: Path, price_axis: str) -> int:
     """基础检查页，外加一份均匀轴对照，再加各判断方法自己的检查页。形状固定，不作为阈值来源。"""
     cases = [
@@ -865,16 +907,7 @@ def _write_samples(output_root: Path, price_axis: str) -> int:
     index_rows = []
     for symbol, title, blurb, levels, axis in cases:
         series = _series_from_levels(levels, price_axis=axis)
-        snapshot = build_snapshot(
-            series,
-            symbol=symbol,
-            requested_start=series.bars[0].timestamp.date(),
-            requested_end=series.bars[-1].timestamp.date(),
-            visible_scales=list(SCALE_NAMES),
-            data_source="synthetic",
-            engine_version="sample",
-        )
-        written = write_result(output_root, snapshot)
+        written = _write_sample(output_root, series, symbol)
         index_rows.append((title, blurb, written["report"], axis))
         print(f"{title}: {written['report']}")
     for method in registered_methods():
@@ -892,16 +925,7 @@ def _write_samples(output_root: Path, price_axis: str) -> int:
                 )
             else:
                 series = _series_from_levels(sample.levels, price_axis=sample.price_axis, params=params)
-            snapshot = build_snapshot(
-                series,
-                symbol=sample.symbol,
-                requested_start=series.bars[0].timestamp.date(),
-                requested_end=series.bars[-1].timestamp.date(),
-                visible_scales=list(SCALE_NAMES),
-                data_source="synthetic",
-                engine_version="sample",
-            )
-            written = write_result(output_root, snapshot)
+            written = _write_sample(output_root, series, sample.symbol)
             index_rows.append((sample.title, sample.blurb, written["report"], sample.price_axis))
             print(f"{sample.title}: {written['report']}")
     index = output_root / "_samples" / "index.html"

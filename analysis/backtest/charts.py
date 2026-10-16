@@ -202,6 +202,8 @@ def plot_daily_kline_with_trades(
             ax.plot(xs, daily["ma_slow"], color="#60a5fa", lw=1.1, label=f"MA{slow_n or '慢'}", zorder=4)
 
     buy_x, buy_y, sell_x, sell_y = _trade_points(trades, dates)
+    if "stop" in daily.columns and daily["stop"].notna().any():
+        ax.plot(xs, daily["stop"], color="#e2e8f0", lw=1.0, label="止损", zorder=5)
     if buy_x:
         ax.scatter(buy_x, buy_y, marker="^", s=72, color="#ef4444", edgecolors="#fecaca", linewidths=0.8, label="买入", zorder=6)
     if sell_x:
