@@ -1,0 +1,189 @@
+# 港股 Qlib 基线的唯一配置。
+# 各段互相独立：改标签不改模型，改切分不改回测，改报告不改数据。
+# 训练程序只读本文件，不在代码里写死这些值。
+# 模型参数来自镜像内 qlib 官方 Alpha158 示例。
+
+version: hk-qlib-baseline-v0
+
+runtime:
+  docker_image: zhuhai123/qlib-rdagent:v1
+  provider_uri: /root/.qlib/qlib_data/hk_data_20261016
+
+# 行情从哪来、落到哪、用什么价格。不含训练起止日。
+data:
+  download_start: 2014-01-01
+  download_end: null                 # null 表示数据源能给到的最后一天
+  calendar_instrument: "02800"       # 交易日历以这只标的的交易日为准
+  price_adjustment: qfq              # 前复权写入 open/high/low/close
+  code_width: 5
+  sources: [longbridge, yahoo, akshare]
+  freeze_dirname: hk_data_20261016   # 落盘后实验固定使用这个目录，不重新下载改历史
+  fields: [open, high, low, close, volume, vwap, factor]
+  checks:
+    min_names_per_year: 50
+
+# 每个交易日谁可以进入训练和回测。不含基准、费用。
+universe:
+  min_history_days: 250
+  median_amount_days: 60
+  min_median_amount: 20000000        # 港元，T 之前若干日的中位成交额
+  require_positive_volume: true
+  exclude: ["02800"]                 # 基准不进股票池，也不进训练标签
+
+# 特征日的日历边界。标签向前看几天由 label.horizon_trading_days 决定，
+# 训练程序用它把 train.end / valid.end 往前空出相应交易日，避免标签跨段。
+segments:
+  freq: day
+  warmup:
+    start: 2014-01-01
+    end: 2014-12-31                  # 只算特征，不产生训练样本
+  train:
+    start: 2015-01-01
+    end: 2025-06-30
+  valid:
+    start: 2025-07-01
+    end: 2025-09-30                  # 3 个月
+  test:
+    start: 2025-10-01
+    end: 2025-12-31                  # 3 个月，截止 2025 年底
+
+# 预测目标。与特征、模型、回测费用无关。
+label:
+  name: alpha158_close_t1_t2
+  expr: "Ref($close, -2)/Ref($close, -1) - 1"
+  column: LABEL0
+  horizon_trading_days: 2           # 标签用到 T+2 收盘；切分边界空出这么多交易日
+
+# 输入特征。附加列留给二期趋势因子，一期为空。
+features:
+  class: Alpha158
+  module_path: qlib.contrib.data.handler
+  dataset_class: DatasetH
+  dataset_module_path: qlib.data.dataset
+  kwargs: {}
+  extra: []                         # 二期按日期、五位代码拼到 Alpha158 后面
+
+# 算法。每个模型一份。dataset_kind 不是 tabular 的，一期训练循环跳过。
+models:
+  linear:
+    enabled: true
+    dataset_kind: tabular
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ols
+  lightgbm:
+    enabled: true
+    dataset_kind: tabular
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      colsample_bytree: 0.8879
+      learning_rate: 0.2
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 4
+      num_leaves: 15
+      num_threads: 20
+  xgboost:
+    enabled: true
+    dataset_kind: tabular
+    class: XGBModel
+    module_path: qlib.contrib.model.xgboost
+    kwargs:
+      eval_metric: rmse
+      colsample_bytree: 0.8879
+      eta: 0.0421
+      max_depth: 8
+      n_estimators: 647
+      subsample: 0.8789
+      nthread: 20
+  catboost:
+    enabled: true
+    dataset_kind: tabular
+    class: CatBoostModel
+    module_path: qlib.contrib.model.catboost_model
+    kwargs:
+      loss: RMSE
+      learning_rate: 0.0421
+      subsample: 0.8789
+      max_depth: 6
+      num_leaves: 100
+      thread_count: 20
+      grow_policy: Lossguide
+      bootstrap_type: Poisson
+  double_ensemble:
+    enabled: true
+    dataset_kind: tabular
+    class: DEnsembleModel
+    module_path: qlib.contrib.model.double_ensemble
+    kwargs:
+      base_model: gbm
+      loss: mse
+      num_models: 3
+      enable_sr: true
+      enable_fs: true
+      alpha1: 1
+      alpha2: 1
+      bins_sr: 10
+      bins_fs: 5
+      decay: 0.5
+      sample_ratios: [0.8, 0.7, 0.6, 0.5, 0.4]
+      sub_weights: [1, 1, 1]
+      epochs: 28
+      colsample_bytree: 0.8879
+      learning_rate: 0.2
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 20
+      verbosity: -1
+
+# 怎么把分数变成持仓。不含报告里展示哪些指标。
+# 单边成本由下面几项相加，买卖两边都含印花税。不在这里写死合计。
+backtest:
+  strategy_class: TopkDropoutStrategy
+  strategy_module_path: qlib.contrib.strategy
+  topk: 50
+  n_drop: 5
+  account: 1000000
+  deal_price: close
+  limit_threshold: null              # 港股无涨跌停
+  benchmark: "02800"
+  rebalance_freq: day
+  respect_lot_size: true          # 只约束回测下单，不进入训练样本
+  default_lot_size: 100           # 查不到每手股数时用这个
+  costs:
+    commission_rate: 0.0003
+    stamp_duty_rate: 0.001
+    exchange_fee_rate: 0.000085
+    settlement_rate: 0.00002
+    slippage_rate: 0.0005
+    min_commission: 3
+    stamp_both_sides: true
+
+# 写出什么、用哪一段选模型。不包含持仓规则和费率。
+report:
+  segments: [valid, test]
+  metrics:
+    - rank_ic
+    - ic
+    - icir
+    - interval_return
+    - max_drawdown
+    - turnover
+    - excess_return
+  also_record:
+    - annualized_return             # 测试段太短，只记录，不参与选模
+    - universe_count_by_year
+  selection:
+    segment: valid
+    rank_by: [rank_ic, excess_return]
+    prefer_lower: [turnover]
+  publish_test_for: selected_only    # 未选中模型的测试集数字进附录
+  copy_config_into_output: true
+  lock_test_after_first_run: true

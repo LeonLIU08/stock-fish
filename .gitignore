@@ -14,9 +14,10 @@ build/
 .eggs/
 *.whl
 
-# Qlib 推理缓存
+# Qlib 推理缓存与港股基线报告
 qlib-zh/DATA/
 qlib-zh/models/
+qlib-zh/hk/output/
 
 # 批量分析缓存
 batch_results/
