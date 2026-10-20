@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -23,7 +22,9 @@ def floor_to_lot(amount: float, lot: int) -> float:
 
 
 def cache_path(freeze_dirname: str) -> Path:
-    return Path.home() / ".qlib" / "hk_staging" / freeze_dirname / "lot_sizes.csv"
+    from run_baseline import cache_dir
+
+    return cache_dir(freeze_dirname) / "lot_sizes.csv"
 
 
 def _read_cache(path: Path) -> dict[str, int]:
@@ -86,9 +87,11 @@ def load_lot_sizes(codes: list[str], freeze_dirname: str, default_lot: int = 100
 
 
 def tradable_codes(config_path: Path) -> tuple[str, list[str]]:
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    from run_baseline import load_config, provider_dir
+
+    cfg = load_config(config_path)
     freeze = cfg["data"]["freeze_dirname"]
-    inst = Path.home() / ".qlib" / "qlib_data" / freeze / "instruments" / "tradable.txt"
+    inst = provider_dir(cfg) / "instruments" / "tradable.txt"
     codes = []
     for line in inst.read_text(encoding="utf-8").splitlines():
         if line.strip():

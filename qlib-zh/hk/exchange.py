@@ -13,17 +13,19 @@ class HKLotExchange(Exchange):
     """用调用时填入的 lot_sizes，把成交股数向下取整到该股票的整手。"""
 
     lot_sizes: dict[str, int] = {}
+    default_lot: int = 100
     _round_stock_id: str | None = None
 
     def _lot_for(self, stock_id: str | None) -> int | None:
         if not stock_id:
             return None
-        code = str(stock_id).strip().upper()
+        raw = str(stock_id).strip().upper()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        code = digits.zfill(5) if digits else raw
         if code in self.lot_sizes:
             return int(self.lot_sizes[code])
-        padded = code.zfill(5)
-        if padded in self.lot_sizes:
-            return int(self.lot_sizes[padded])
+        if raw in self.lot_sizes:
+            return int(self.lot_sizes[raw])
         return None
 
     def round_amount_by_trade_unit(
@@ -36,7 +38,10 @@ class HKLotExchange(Exchange):
     ):
         stock_id = stock_id or self._round_stock_id
         lot = self._lot_for(stock_id)
-        if lot is None or lot <= 1:
+        if lot is None and stock_id:
+            lot = self.default_lot
+        if lot is None:
+            # 策略内部先按 1 股取整，此时还没有股票代码，但带了复权因子。
             return super().round_amount_by_trade_unit(
                 deal_amount, factor, stock_id, start_time, end_time
             )
@@ -65,6 +70,8 @@ class LotTopkDropoutStrategy(TopkDropoutStrategy):
                     order.amount,
                     getattr(order, "factor", None),
                     stock_id=order.stock_id,
+                    start_time=order.start_time,
+                    end_time=order.end_time,
                 )
                 if order.amount <= 0:
                     continue

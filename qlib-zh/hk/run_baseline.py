@@ -29,6 +29,15 @@ def load_config(path: Path) -> dict:
     return cfg
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def cache_dir(freeze_dirname: str) -> Path:
+    """训练复用的缓存。放在工程内，不写到用户主目录或容器 /root。"""
+    return repo_root() / "qlib-zh" / "hk" / "cache" / freeze_dirname
+
+
 def provider_dir(cfg: dict) -> Path:
     uri = str(cfg["runtime"]["provider_uri"])
     path = Path(uri)
@@ -37,6 +46,58 @@ def provider_dir(cfg: dict) -> Path:
         if home.exists():
             return home
     return path
+
+
+def init_qlib(data_dir: Path, run_dir: Path, kernels: int = 1, experiment: str = "hk") -> None:
+    """MLflow 和 qlib 磁盘缓存都放进本次输出目录。不启用表达式缓存。"""
+    import qlib
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    mlruns = run_dir / "mlruns"
+    mlruns.mkdir(parents=True, exist_ok=True)
+    qlib.init(
+        provider_uri=str(data_dir),
+        region="us",
+        kernels=kernels,
+        expression_cache=None,
+        dataset_cache=None,
+        exp_manager={
+            "class": "MLflowExpManager",
+            "module_path": "qlib.workflow.expm",
+            "kwargs": {
+                "uri": mlruns.resolve().as_uri(),
+                "default_exp_name": experiment,
+            },
+        },
+    )
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def attach_log(path: Path) -> None:
+    """把标准输出和 qlib 日志追加到工程内的 run.log。"""
+    import logging
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, handle)
+    sys.stderr = _Tee(sys.stderr, handle)
+    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+    logging.getLogger("qlib").addHandler(file_handler)
 
 
 def load_calendar(path: Path) -> pd.DatetimeIndex:
@@ -71,6 +132,58 @@ def side_cost(costs: dict) -> float:
     if costs.get("stamp_both_sides", True):
         total += float(costs["stamp_duty_rate"])
     return total
+
+
+def universe_symbols(cfg: dict) -> set[str] | None:
+    """名单是股票范围的硬边界。没有配置名单时不额外限制。"""
+    universe = cfg.get("universe") or {}
+    raw = universe.get("symbols_file")
+    if not raw:
+        return None
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = repo_root() / path
+    if not path.exists():
+        raise FileNotFoundError(f"股票名单不存在: {path}")
+    width = int(cfg["data"]["code_width"])
+    excluded = set()
+    for code in universe.get("exclude") or []:
+        digits = "".join(ch for ch in str(code) if ch.isdigit())
+        if digits:
+            excluded.add(digits.zfill(width))
+    found: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        token = text.split()[0]
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if not digits or len(digits) > width:
+            raise ValueError(f"无法解析港股代码: {token}")
+        code = digits.zfill(width)
+        if code not in excluded:
+            found.add(code)
+    if not found:
+        raise ValueError(f"股票名单是空的: {path}")
+    return found
+
+
+def _instrument_codes(index: pd.Index, width: int) -> pd.Index:
+    names = index.get_level_values("instrument").astype(str)
+    return names.str.replace(r"\D", "", regex=True).str.zfill(width)
+
+
+def limit_instruments(data: pd.DataFrame | pd.Series, cfg: dict):
+    """丢掉名单以外的行。截面标准化和选股都发生在这之后。"""
+    allowed = universe_symbols(cfg)
+    if not allowed or len(data) == 0:
+        return data
+    codes = _instrument_codes(data.index, int(cfg["data"]["code_width"]))
+    mask = np.asarray(codes.isin(allowed), dtype=bool)
+    limited = data.loc[mask]
+    if len(limited) == 0:
+        raise RuntimeError(f"股票名单和当前数据没有交集: {cfg['universe'].get('symbols_file')}")
+    return limited
 
 
 def universe_expression(universe: dict) -> str:
@@ -123,6 +236,17 @@ def selected_models(cfg: dict, choice: str) -> list[tuple[str, dict]]:
     if not models:
         raise ValueError(f"没有可跑的模型: {choice}")
     return models
+
+
+def model_config_and_fit_options(model_cfg: dict) -> tuple[dict, dict]:
+    """verbose_eval 只控制终端打印，不能放进 LightGBM 的参数。"""
+    kwargs = dict(model_cfg.get("kwargs") or {})
+    fit_options = {}
+    if "verbose_eval" in kwargs:
+        fit_options["verbose_eval"] = int(kwargs.pop("verbose_eval"))
+    cleaned = dict(model_cfg)
+    cleaned["kwargs"] = kwargs
+    return cleaned, fit_options
 
 
 def score_frame(pred) -> pd.Series:
@@ -193,6 +317,104 @@ def portfolio_summary(report_df: pd.DataFrame) -> dict:
     }
 
 
+def _plain_curves(evals_result: dict, spec: dict) -> dict:
+    """LightGBM 留下 {split: {metric: [...]}}。XGBoost 在拟合后把每个 split 收成一条列表。"""
+    metric_name = str((spec.get("kwargs") or {}).get("eval_metric") or "loss")
+    curves = {}
+    for split, metrics in evals_result.items():
+        if isinstance(metrics, dict):
+            curves[str(split)] = {
+                str(key): [float(value) for value in values] for key, values in metrics.items()
+            }
+        else:
+            curves[str(split)] = {metric_name: [float(value) for value in metrics]}
+    return curves
+
+
+def evaluate_segment(
+    name: str,
+    pred: pd.Series,
+    label_s: pd.Series,
+    segment: str,
+    start: str,
+    end: str,
+    calendar: pd.DatetimeIndex,
+    cfg: dict,
+    pred_dir: Path,
+) -> dict:
+    from qlib.contrib.evaluate import backtest_daily
+    from qlib.contrib.strategy import TopkDropoutStrategy
+
+    backtest = cfg["backtest"]
+    cost = side_cost(backtest["costs"])
+    pred = limit_instruments(pred, cfg)
+    label_s = limit_instruments(label_s, cfg)
+    summary = ic_summary(pred, label_s)
+    daily = summary.pop("daily")
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    daily.to_csv(pred_dir / f"{segment}_ic.csv")
+    pred.to_frame("score").to_pickle(pred_dir / f"{segment}_pred.pkl")
+    if pd.Timestamp(end) >= calendar[-1]:
+        end = calendar[-2].strftime("%Y-%m-%d")
+    print(f"[{name}] 回测 {segment} {start} ~ {end}", flush=True)
+    strategy_cls = TopkDropoutStrategy
+    saved_exchange = None
+    if backtest.get("respect_lot_size", False):
+        import qlib.backtest as qbacktest
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from exchange import HKLotExchange, LotTopkDropoutStrategy
+        from lots import load_lot_sizes
+
+        codes = pred.index.get_level_values("instrument").unique().tolist()
+        lot_sizes, fallback = load_lot_sizes(
+            codes,
+            cfg["data"]["freeze_dirname"],
+            default_lot=int(backtest.get("default_lot_size", 100)),
+        )
+        print(
+            f"[{name}] 回测每手股数 {len(lot_sizes)} 只，"
+            f"其中 {fallback} 只按 {int(backtest.get('default_lot_size', 100))} 股",
+            flush=True,
+        )
+        HKLotExchange.lot_sizes = lot_sizes
+        HKLotExchange.default_lot = int(backtest.get("default_lot_size", 100))
+        saved_exchange = qbacktest.Exchange
+        qbacktest.Exchange = HKLotExchange
+        strategy_cls = LotTopkDropoutStrategy
+    try:
+        report_df, _positions = backtest_daily(
+            start_time=start,
+            end_time=end,
+            strategy=strategy_cls(
+                signal=pred,
+                topk=int(backtest["topk"]),
+                n_drop=int(backtest["n_drop"]),
+            ),
+            account=float(backtest["account"]),
+            benchmark=str(backtest["benchmark"]),
+            exchange_kwargs={
+                "limit_threshold": backtest.get("limit_threshold"),
+                "deal_price": backtest["deal_price"],
+                "open_cost": cost,
+                "close_cost": cost,
+                "min_cost": float(backtest["costs"]["min_commission"]),
+            },
+        )
+    finally:
+        if saved_exchange is not None:
+            import qlib.backtest as qbacktest
+
+            qbacktest.Exchange = saved_exchange
+    report_df.to_csv(pred_dir / f"{segment}_backtest.csv")
+    portfolio = portfolio_summary(report_df)
+    print(
+        f"[{name}] {segment} rank_ic={summary['rank_ic']} excess={portfolio['excess_return']}",
+        flush=True,
+    )
+    return {**summary, **portfolio}
+
+
 def run_model(
     name: str,
     spec: dict,
@@ -213,17 +435,29 @@ def run_model(
     features = cfg["features"]
     rule = universe_expression(universe)
     cost = side_cost(backtest["costs"])
+    allowed = universe_symbols(cfg)
+    instruments = "tradable" if allowed is None else sorted(allowed)
     handler = {
         "class": features["class"],
         "module_path": features["module_path"],
         "kwargs": {
-            "instruments": "tradable",
+            "instruments": instruments,
             "start_time": handler_span["start"],
             "end_time": handler_span["end"],
             "fit_start_time": resolved["train"][0],
             "fit_end_time": resolved["train"][1],
             "freq": "day",
             "label": ([label["expr"]], [label["column"]]),
+            # 先丢掉没有未来收益的标签，再做截面标准化。
+            # 标准化在当天只有一只股票或收益完全相同时会产生 NaN / inf，最后再滤掉。
+            "learn_processors": [
+                {"class": "DropnaLabel"},
+                {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+                {"class": "DropInvalidLabel", "module_path": "processors"},
+            ],
+            "infer_processors": [
+                {"class": "SanitizeFeature", "module_path": "processors"},
+            ],
             "filter_pipe": [
                 {
                     "filter_type": "ExpressionDFilter",
@@ -243,24 +477,23 @@ def run_model(
             "segments": resolved,
         },
     }
-    model_cfg = {
-        "class": spec["class"],
-        "module_path": spec["module_path"],
-        "kwargs": spec.get("kwargs") or {},
-    }
+    model_cfg, fit_options = model_config_and_fit_options(
+        {
+            "class": spec["class"],
+            "module_path": spec["module_path"],
+            "kwargs": spec.get("kwargs") or {},
+        }
+    )
     print(f"[{name}] 拟合 {spec['class']}", flush=True)
     dataset = init_instance_by_config(dataset_cfg)
     model = init_instance_by_config(model_cfg)
     evals_result: dict = {}
     try:
-        model.fit(dataset, evals_result=evals_result)
+        model.fit(dataset, evals_result=evals_result, **fit_options)
     except TypeError:
         model.fit(dataset)
         evals_result = {}
-    evals_result = {
-        str(split): {str(key): [float(value) for value in values] for key, values in metrics.items()}
-        for split, metrics in evals_result.items()
-    }
+    evals_result = _plain_curves(evals_result, spec)
 
     result = {
         "model": name,
@@ -270,6 +503,16 @@ def run_model(
         "segments": {key: list(value) for key, value in resolved.items()},
         "train_curves": evals_result,
         "metrics": {},
+        "parameters": {
+            "version": cfg.get("version"),
+            "class": spec["class"],
+            "module_path": spec["module_path"],
+            "kwargs": {
+                key: value
+                for key, value in (spec.get("kwargs") or {}).items()
+                if key != "verbose_eval"
+            },
+        },
     }
     pred_dir = out_dir / name
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -277,70 +520,9 @@ def run_model(
         pred = score_frame(model.predict(dataset, segment=segment))
         label_df = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_I)
         label_s = score_frame(label_df)
-        summary = ic_summary(pred, label_s)
-        daily = summary.pop("daily")
-        daily.to_csv(pred_dir / f"{segment}_ic.csv")
-        pred.to_frame("score").to_pickle(pred_dir / f"{segment}_pred.pkl")
         start, end = resolved[segment]
-        # 回测最后一步会读下一个交易日。停在日历倒数第二天，避免越界。
-        if pd.Timestamp(end) >= calendar[-1]:
-            end = calendar[-2].strftime("%Y-%m-%d")
-        print(f"[{name}] 回测 {segment} {start} ~ {end}", flush=True)
-        strategy_cls = TopkDropoutStrategy
-        saved_exchange = None
-        if backtest.get("respect_lot_size", False):
-            import qlib.backtest as qbacktest
-
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
-            from exchange import HKLotExchange, LotTopkDropoutStrategy
-            from lots import load_lot_sizes
-
-            codes = pred.index.get_level_values("instrument").unique().tolist()
-            lot_sizes, fallback = load_lot_sizes(
-                codes,
-                cfg["data"]["freeze_dirname"],
-                default_lot=int(backtest.get("default_lot_size", 100)),
-            )
-            print(
-                f"[{name}] 回测每手股数 {len(lot_sizes)} 只，"
-                f"其中 {fallback} 只按 {int(backtest.get('default_lot_size', 100))} 股",
-                flush=True,
-            )
-            HKLotExchange.lot_sizes = lot_sizes
-            saved_exchange = qbacktest.Exchange
-            qbacktest.Exchange = HKLotExchange
-            strategy_cls = LotTopkDropoutStrategy
-        try:
-            report_df, _positions = backtest_daily(
-                start_time=start,
-                end_time=end,
-                strategy=strategy_cls(
-                    signal=pred,
-                    topk=int(backtest["topk"]),
-                    n_drop=int(backtest["n_drop"]),
-                ),
-                account=float(backtest["account"]),
-                benchmark=str(backtest["benchmark"]),
-                exchange_kwargs={
-                    "limit_threshold": backtest.get("limit_threshold"),
-                    "deal_price": backtest["deal_price"],
-                    "open_cost": cost,
-                    "close_cost": cost,
-                    "min_cost": float(backtest["costs"]["min_commission"]),
-                },
-            )
-        finally:
-            if saved_exchange is not None:
-                import qlib.backtest as qbacktest
-
-                qbacktest.Exchange = saved_exchange
-        report_df.to_csv(pred_dir / f"{segment}_backtest.csv")
-        portfolio = portfolio_summary(report_df)
-        result["metrics"][segment] = {**summary, **portfolio}
-        print(
-            f"[{name}] {segment} rank_ic={summary['rank_ic']} "
-            f"excess={portfolio['excess_return']}",
-            flush=True,
+        result["metrics"][segment] = evaluate_segment(
+            name, pred, label_s, segment, start, end, calendar, cfg, pred_dir
         )
     (pred_dir / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
@@ -354,8 +536,6 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("qlib-zh/hk/baseline.yaml"))
     parser.add_argument("--model", default="lightgbm", help="模型名，或 all")
     args = parser.parse_args()
-
-    import qlib
 
     cfg = load_config(args.config)
     data_dir = provider_dir(cfg)
@@ -371,16 +551,30 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.config, out_dir / "baseline.yaml")
 
+    attach_log(out_dir / "run.log")
     print(f"数据 {data_dir}", flush=True)
     print(f"切分 {resolved}", flush=True)
-    qlib.init(provider_uri=str(data_dir), region="us", kernels=4)
+    init_qlib(data_dir, out_dir, kernels=4, experiment="baseline")
     reports = []
     for name, spec in selected_models(cfg, args.model):
         reports.append(run_model(name, spec, cfg, resolved, handler_span, calendar, out_dir))
+    symbols = universe_symbols(cfg)
+    universe = cfg.get("universe") or {}
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "provider_uri": str(data_dir),
         "partial_download": True,
+        "symbols_file": None if symbols is None else str(universe.get("symbols_file")),
+        "symbol_count": None if symbols is None else len(symbols),
+        "universe": {
+            "symbols_file": universe.get("symbols_file"),
+            "symbol_count": None if symbols is None else len(symbols),
+            "min_history_days": universe.get("min_history_days"),
+            "median_amount_days": universe.get("median_amount_days"),
+            "min_median_amount": universe.get("min_median_amount"),
+            "require_positive_volume": bool(universe.get("require_positive_volume")),
+            "exclude": universe.get("exclude") or [],
+        },
         "models": reports,
     }
     (out_dir / "summary.json").write_text(

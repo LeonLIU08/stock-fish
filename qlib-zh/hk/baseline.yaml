@@ -23,7 +23,9 @@ data:
     min_names_per_year: 50
 
 # 每个交易日谁可以进入训练和回测。不含基准、费用。
+# symbols_file 有值时，只使用这份名单。名单外不进特征、标签标准化和选股。
 universe:
+  symbols_file: scripts/hkamount_2000w_17Oct.txt
   min_history_days: 250
   median_amount_days: 60
   min_median_amount: 20000000        # 港元，T 之前若干日的中位成交额
@@ -39,13 +41,19 @@ segments:
     end: 2014-12-31                  # 只算特征，不产生训练样本
   train:
     start: 2015-01-01
-    end: 2025-06-30
+    end: 2025-09-30
   valid:
-    start: 2025-07-01
-    end: 2025-09-30                  # 3 个月
-  test:
     start: 2025-10-01
-    end: 2025-12-31                  # 3 个月，截止 2025 年底
+    end: 2025-12-31                  # 3 个月
+  test:
+    start: 2026-01-01
+    end: 2026-03-31                  # 3 个月
+
+# 扩展窗口滚动。步长是交易日。验证段和测试段连起来，每步重训并只预测这一步。
+rolling:
+  step: 1
+  rtype: expanding
+  early_stop_days: 20                # 每版模型用预测起点之前的这段做早停
 
 # 预测目标。与特征、模型、回测费用无关。
 label:
@@ -87,6 +95,9 @@ models:
       max_depth: 4
       num_leaves: 15
       num_threads: 20
+      num_boost_round: 5000          # 1000 轮时验证损失仍在下降，提高上限
+      early_stopping_rounds: 50      # 验证损失连续 50 轮不降就停
+      verbose_eval: 200              # 终端每隔这么多轮打印一次，不进入模型参数
   xgboost:
     enabled: true
     dataset_kind: tabular

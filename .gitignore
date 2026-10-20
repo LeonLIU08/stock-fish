@@ -18,6 +18,8 @@ build/
 qlib-zh/DATA/
 qlib-zh/models/
 qlib-zh/hk/output/
+qlib-zh/hk/cache/
+mlruns/
 
 # 批量分析缓存
 batch_results/
