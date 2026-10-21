@@ -21,6 +21,33 @@ def floor_to_lot(amount: float, lot: int) -> float:
     return float(int(amount + 1e-6) // int(lot) * int(lot))
 
 
+def _code_digits(stock_id: str) -> str:
+    digits = "".join(ch for ch in str(stock_id) if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:]
+    return digits
+
+
+def cn_buy_amount(amount: float, stock_id: str) -> float:
+    """A 股买入取整。主板和创业板为 100 股；科创板至少 200 股，超出部分按 1 股。"""
+    if amount <= 0:
+        return 0.0
+    code = _code_digits(stock_id)
+    if code.startswith(("688", "689")):
+        if amount < 200:
+            return 0.0
+        return float(int(amount + 1e-6))
+    return floor_to_lot(amount, 100)
+
+
+def cn_limit_ratio(stock_id: str) -> float:
+    """当前涨跌停幅度。创业板、科创板按 19.5%，其余按 9.5%，给价格四舍五入留余量。"""
+    code = _code_digits(stock_id)
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.195
+    return 0.095
+
+
 def cache_path(freeze_dirname: str) -> Path:
     from run_baseline import cache_dir
 

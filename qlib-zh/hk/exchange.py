@@ -6,7 +6,7 @@ from qlib.backtest.decision import Order
 from qlib.backtest.exchange import Exchange
 from qlib.contrib.strategy import TopkDropoutStrategy
 
-from lots import floor_to_lot
+from lots import cn_buy_amount, cn_limit_ratio, floor_to_lot
 
 
 class HKLotExchange(Exchange):
@@ -14,6 +14,7 @@ class HKLotExchange(Exchange):
 
     lot_sizes: dict[str, int] = {}
     default_lot: int = 100
+    lot_rule: str = "hk"
     _round_stock_id: str | None = None
 
     def _lot_for(self, stock_id: str | None) -> int | None:
@@ -37,6 +38,8 @@ class HKLotExchange(Exchange):
         end_time=None,
     ):
         stock_id = stock_id or self._round_stock_id
+        if self.lot_rule == "cn" and stock_id:
+            return cn_buy_amount(float(deal_amount), stock_id)
         lot = self._lot_for(stock_id)
         if lot is None and stock_id:
             lot = self.default_lot
@@ -55,6 +58,29 @@ class HKLotExchange(Exchange):
             return super().deal_order(order, trade_account, position, dealt_order_amount)
         finally:
             self._round_stock_id = None
+
+
+class CNLotExchange(HKLotExchange):
+    """A 股买入按板块取整，涨跌停按板块分开。卖出仍一次卖完已有持仓。"""
+
+    lot_rule = "cn"
+
+    def _update_limit(self, limit_threshold=None) -> None:
+        import pandas as pd
+
+        suspended = self.quote_df["$close"].isna()
+        change = self.quote_df["$change"]
+        index = self.quote_df.index
+        if isinstance(index, pd.MultiIndex) and "instrument" in index.names:
+            codes = index.get_level_values("instrument")
+        else:
+            codes = index.get_level_values(0)
+        ratios = pd.Series(
+            [cn_limit_ratio(code) for code in codes],
+            index=self.quote_df.index,
+        )
+        self.quote_df["limit_buy"] = change.ge(ratios) | suspended
+        self.quote_df["limit_sell"] = change.le(-ratios) | suspended
 
 
 class LotTopkDropoutStrategy(TopkDropoutStrategy):

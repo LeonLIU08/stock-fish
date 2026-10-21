@@ -31,6 +31,8 @@ from run_baseline import (
     load_config,
     model_config_and_fit_options,
     provider_dir,
+    require_calendar,
+    run_output_dir,
     score_frame,
     selected_models,
     universe_expression,
@@ -52,14 +54,14 @@ def _extra_mod(task: dict, rolling_gen) -> None:
     handler["end_time"] = segments["test"][1]
 
 
-def _handler(cfg: dict, start: str, end: str) -> dict:
+def _handler(cfg: dict, start: str, end: str, instruments="tradable") -> dict:
     features = cfg["features"]
     label = cfg["label"]
     return {
         "class": features["class"],
         "module_path": features["module_path"],
         "kwargs": {
-            "instruments": "tradable",
+            "instruments": instruments,
             "start_time": start,
             "end_time": end,
             "fit_start_time": start,
@@ -150,7 +152,13 @@ def _segment_dates(task: dict) -> dict[str, tuple[str, str]]:
 
 
 def _init_qlib(cfg: dict, data_dir: Path, out_dir: Path) -> None:
-    init_qlib(data_dir, out_dir, kernels=1, experiment="rolling")
+    init_qlib(
+        data_dir,
+        out_dir,
+        kernels=1,
+        experiment="rolling",
+        region=str((cfg.get("runtime") or {}).get("region") or "us"),
+    )
 
 
 def _fit_and_predict(task: dict, spec: dict, cfg: dict):
@@ -193,20 +201,77 @@ def _run_fold_worker(task_path: Path, fold_dir: Path, config_path: Path) -> None
     subprocess.run(cmd, check=True)
 
 
-def build_panel(cfg: dict, run_dir: Path) -> None:
+def _tradable_codes(start: str, end: str) -> list[str]:
+    from qlib.data import D
+
+    listed = D.list_instruments(
+        D.instruments("tradable"),
+        start_time=start,
+        end_time=end,
+        as_list=True,
+    )
+    if isinstance(listed, dict):
+        listed = list(listed)
+    codes = [str(code) for code in listed]
+    if not codes:
+        raise RuntimeError("tradable 股票池是空的")
+    return codes
+
+
+def _keep_universe(frame: pd.DataFrame, cfg: dict, code: str, start: str, end: str) -> pd.DataFrame:
+    """单只股票不走全市场 filter_pipe，用同一条表达式留下可交易的日期。"""
+    from qlib.data import D
+
+    rule = universe_expression(cfg["universe"])
+    mask = D.features([code], [rule], start_time=start, end_time=end, freq="day")
+    if mask is None or mask.empty:
+        return frame.iloc[0:0]
+    values = mask.iloc[:, 0]
+    if values.index.nlevels == 2 and frame.index.nlevels == 2:
+        if list(values.index.names) != list(frame.index.names):
+            values = values.swaplevel()
+    values = values.reindex(frame.index)
+    return frame.loc[values.fillna(0).astype(bool)]
+
+
+def _prepare_symbol(cfg: dict, code: str, start: str, end: str) -> pd.DataFrame:
     from qlib.data.dataset.handler import DataHandlerLP
     from qlib.utils import init_instance_by_config
 
-    from panel import append_panel, extendable_end, panel_dir, panel_ready, write_panel
+    task = {
+        "class": cfg["features"]["dataset_class"],
+        "module_path": cfg["features"]["dataset_module_path"],
+        "kwargs": {
+            "handler": _handler(cfg, start, end, instruments=[code]),
+            "segments": {"all": (start, end)},
+        },
+    }
+    dataset = init_instance_by_config(task)
+    try:
+        frame = dataset.prepare("all", col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
+    finally:
+        del dataset
+        gc.collect()
+    if frame is None or len(frame) == 0:
+        return frame
+    return _keep_universe(frame, cfg, code, start, end)
+
+
+def build_panel(cfg: dict, run_dir: Path) -> None:
+    from panel import (
+        extendable_end,
+        finish_stream,
+        mark_symbol_done,
+        merge_symbol_frame,
+        panel_dir,
+        panel_ready,
+        resume_symbols,
+    )
 
     if panel_ready(cfg):
-        print(f"复用已落盘的 Alpha158: {panel_dir(cfg['data']['freeze_dirname'])}", flush=True)
+        print(f"复用已落盘的 Alpha158: {panel_dir(cfg)}", flush=True)
         return
     cached_end = extendable_end(cfg)
-    if cached_end:
-        print(f"补齐 Alpha158 {cached_end} 之后至 {cfg['segments']['test']['end']}", flush=True)
-    else:
-        print("计算 Alpha158 并按月写入磁盘", flush=True)
     data_dir = provider_dir(cfg)
     _init_qlib(cfg, data_dir, run_dir)
     segments = cfg["segments"]
@@ -214,23 +279,23 @@ def build_panel(cfg: dict, run_dir: Path) -> None:
     if cached_end:
         # Alpha158 最长回看约 60 个交易日，往前多取半年，只保留缓存结束日之后的行。
         start = (pd.Timestamp(cached_end) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+        print(f"补齐 Alpha158 {cached_end} 之后至 {end}", flush=True)
     else:
         start = str(segments["warmup"]["start"])[:10]
-    task = {
-        "class": cfg["features"]["dataset_class"],
-        "module_path": cfg["features"]["dataset_module_path"],
-        "kwargs": {
-            "handler": _handler(cfg, start, end),
-            "segments": {"all": (start, end)},
-        },
-    }
-    dataset = init_instance_by_config(task)
-    frame = dataset.prepare("all", col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
-    del dataset
-    gc.collect()
-    path = append_panel(frame, cfg, cached_end) if cached_end else write_panel(frame, cfg)
-    del frame
-    gc.collect()
+        print("按股票计算 Alpha158，算完一只就落盘", flush=True)
+    codes = _tradable_codes(start, end)
+    done = resume_symbols(cfg, cached_end)
+    print(f"股票 {len(codes)} 只，已落盘 {len(done)} 只", flush=True)
+    for index, code in enumerate(codes, start=1):
+        if code in done:
+            continue
+        frame = _prepare_symbol(cfg, code, start, end)
+        rows = merge_symbol_frame(frame, cfg, cached_end)
+        mark_symbol_done(cfg, code)
+        del frame
+        gc.collect()
+        print(f"[{index}/{len(codes)}] {code} 已落盘 {rows} 行", flush=True)
+    path = finish_stream(cfg)
     print(f"Alpha158 已写入 {path}", flush=True)
 
 
@@ -477,9 +542,7 @@ def main() -> int:
         return worker_main(args)
 
     cfg = load_config(args.config)
-    data_dir = provider_dir(cfg)
-    calendar = load_calendar(data_dir / "calendars" / "day.txt")
-    repo_root = Path(__file__).resolve().parents[2]
+    data_dir, calendar = require_calendar(cfg)
     if args.scores_from:
         if args.topk is None or args.n_drop is None:
             raise ValueError("复用预测分数时需要同时给出 --topk 和 --n-drop")
@@ -492,17 +555,14 @@ def main() -> int:
         out_dir = args.resume
     elif args.scores_from:
         account_tag = f"-acct{int(args.account)}" if args.account is not None else ""
-        out_dir = (
-            repo_root
-            / "qlib-zh"
-            / "hk"
-            / "output"
-            / cfg["data"]["freeze_dirname"]
-            / f"{run_stamp}-topk{args.topk}-drop{args.n_drop}{account_tag}"
+        out_dir = run_output_dir(
+            cfg,
+            args.config,
+            f"{run_stamp}-topk{args.topk}-drop{args.n_drop}{account_tag}",
         )
     else:
         suffix = "train-tail" if args.eval_start and args.eval_end else "rolling"
-        out_dir = repo_root / "qlib-zh" / "hk" / "output" / cfg["data"]["freeze_dirname"] / f"{run_stamp}-{suffix}"
+        out_dir = run_output_dir(cfg, args.config, f"{run_stamp}-{suffix}")
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
         if args.scores_from:

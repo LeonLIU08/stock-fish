@@ -1,0 +1,196 @@
+# A股 Qlib 回测。模型、标签和切分与港股 baseline 相同。
+# 交易规则、费用和股票范围按 A 股改。训练程序只读本文件。
+
+version: cn-qlib-baseline-v0
+
+runtime:
+  docker_image: zhuhai123/qlib-rdagent:v1
+  provider_uri: /work/qlib-zh/cn/data/cn_data
+  region: cn
+  output_dir: qlib-zh/cn/output
+  cache_dir: qlib-zh/cn/cache
+
+# 行情写在工程目录 qlib-zh/cn/data，不使用 ~/.qlib。
+data:
+  download_start: 2010-01-01
+  download_end: null
+  calendar_instrument: SH000905
+  price_adjustment: qfq
+  code_width: 6
+  sources: []
+  freeze_dirname: cn_data
+  fields: [open, high, low, close, volume, vwap, factor]
+  checks:
+    min_names_per_year: 50
+
+# 股票范围是 2026-10-19 的中证500成分。不再套用港股的成交额门槛。
+universe:
+  symbols_file: scripts/csi500_19Oct.txt
+  min_history_days: 250
+  median_amount_days: 60
+  min_median_amount: null
+  require_positive_volume: true
+  exclude: []
+
+# 训练、验证、测试和预热与港股 baseline 相同。
+segments:
+  freq: day
+  warmup:
+    start: 2014-01-01
+    end: 2014-12-31                  # 只算特征，不产生训练样本
+  train:
+    start: 2015-01-01
+    end: 2025-09-30
+  valid:
+    start: 2025-10-01
+    end: 2025-12-31
+  test:
+    start: 2026-01-01
+    end: 2026-09-30
+
+rolling:
+  step: 1
+  rtype: expanding
+  early_stop_days: 20
+
+label:
+  name: alpha158_close_t1_t2
+  expr: "Ref($close, -2)/Ref($close, -1) - 1"
+  column: LABEL0
+  horizon_trading_days: 2
+
+features:
+  class: Alpha158
+  module_path: qlib.contrib.data.handler
+  dataset_class: DatasetH
+  dataset_module_path: qlib.data.dataset
+  kwargs: {}
+  extra: []
+
+# 与 qlib-zh/hk/baseline.yaml 的 models 相同。
+models:
+  linear:
+    enabled: true
+    dataset_kind: tabular
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ols
+  lightgbm:
+    enabled: true
+    dataset_kind: tabular
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      colsample_bytree: 0.8879
+      learning_rate: 0.2
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 4
+      num_leaves: 15
+      num_threads: 20
+      num_boost_round: 5000
+      early_stopping_rounds: 50
+      verbose_eval: 200
+  xgboost:
+    enabled: true
+    dataset_kind: tabular
+    class: XGBModel
+    module_path: qlib.contrib.model.xgboost
+    kwargs:
+      eval_metric: rmse
+      colsample_bytree: 0.8879
+      eta: 0.0421
+      max_depth: 8
+      n_estimators: 647
+      subsample: 0.8789
+      nthread: 20
+  catboost:
+    enabled: true
+    dataset_kind: tabular
+    class: CatBoostModel
+    module_path: qlib.contrib.model.catboost_model
+    kwargs:
+      loss: RMSE
+      learning_rate: 0.0421
+      subsample: 0.8789
+      max_depth: 6
+      num_leaves: 100
+      thread_count: 20
+      grow_policy: Lossguide
+      bootstrap_type: Poisson
+  double_ensemble:
+    enabled: true
+    dataset_kind: tabular
+    class: DEnsembleModel
+    module_path: qlib.contrib.model.double_ensemble
+    kwargs:
+      base_model: gbm
+      loss: mse
+      num_models: 3
+      enable_sr: true
+      enable_fs: true
+      alpha1: 1
+      alpha2: 1
+      bins_sr: 10
+      bins_fs: 5
+      decay: 0.5
+      sample_ratios: [0.8, 0.7, 0.6, 0.5, 0.4]
+      sub_weights: [1, 1, 1]
+      epochs: 28
+      colsample_bytree: 0.8879
+      learning_rate: 0.2
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 20
+      verbosity: -1
+
+# A股交易规则。每日调仓只卖已有持仓，买入的股票当天不卖，对应 T+1。
+# 涨跌停在回测里按板块分开：主板 9.5%，创业板和科创板 19.5%。
+backtest:
+  strategy_class: TopkDropoutStrategy
+  strategy_module_path: qlib.contrib.strategy
+  topk: 50
+  n_drop: 5
+  account: 1000000
+  deal_price: close
+  limit_threshold: board
+  benchmark: SH000905
+  rebalance_freq: day
+  respect_lot_size: true
+  lot_rule: cn
+  default_lot_size: 100
+  costs:
+    commission_rate: 0.00025       # 佣金万 2.5，双边，券商费率假设
+    stamp_duty_rate: 0.0005        # 印花税 0.05%，只在卖出收取
+    exchange_fee_rate: 0.0000341   # 经手费 0.341 bp，双边
+    settlement_rate: 0.00003       # 证管费 0.2 bp + 过户费 0.1 bp，双边
+    slippage_rate: 0.0005
+    min_commission: 5
+    stamp_both_sides: false
+
+report:
+  segments: [valid, test]
+  metrics:
+    - rank_ic
+    - ic
+    - icir
+    - interval_return
+    - max_drawdown
+    - turnover
+    - excess_return
+  also_record:
+    - annualized_return
+    - universe_count_by_year
+  selection:
+    segment: valid
+    rank_by: [rank_ic, excess_return]
+    prefer_lower: [turnover]
+  publish_test_for: selected_only
+  copy_config_into_output: true
+  lock_test_after_first_run: true

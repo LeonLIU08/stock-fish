@@ -33,22 +33,56 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def cache_dir(freeze_dirname: str) -> Path:
+def runtime_path(cfg: dict, key: str, default: Path) -> Path:
+    raw = (cfg.get("runtime") or {}).get(key)
+    if not raw:
+        return default
+    path = Path(str(raw))
+    return path if path.is_absolute() else repo_root() / path
+
+
+def cache_dir(freeze_dirname: str, cfg: dict | None = None) -> Path:
     """训练复用的缓存。放在工程内，不写到用户主目录或容器 /root。"""
-    return repo_root() / "qlib-zh" / "hk" / "cache" / freeze_dirname
+    root = runtime_path(cfg or {}, "cache_dir", repo_root() / "qlib-zh" / "hk" / "cache")
+    return root / freeze_dirname
+
+
+def run_output_dir(cfg: dict, config_path: Path, *parts: str) -> Path:
+    root = runtime_path(cfg, "output_dir", config_path.resolve().parent / "output")
+    return root.joinpath(cfg["data"]["freeze_dirname"], *parts)
 
 
 def provider_dir(cfg: dict) -> Path:
+    """容器里的 /work 对应仓库根目录。港股旧数据仍兼容 ~/.qlib。"""
     uri = str(cfg["runtime"]["provider_uri"])
+    if uri.startswith("/work/"):
+        return repo_root() / uri[len("/work/") :]
     path = Path(uri)
-    if not path.exists():
-        home = Path.home() / ".qlib" / "qlib_data" / cfg["data"]["freeze_dirname"]
-        if home.exists():
-            return home
+    if path.exists():
+        return path
+    home = Path.home() / ".qlib" / "qlib_data" / cfg["data"]["freeze_dirname"]
+    if home.exists():
+        return home
     return path
 
 
-def init_qlib(data_dir: Path, run_dir: Path, kernels: int = 1, experiment: str = "hk") -> None:
+def require_calendar(cfg: dict) -> tuple[Path, pd.DatetimeIndex]:
+    data_dir = provider_dir(cfg)
+    calendar_path = data_dir / "calendars" / "day.txt"
+    if calendar_path.exists():
+        return data_dir, load_calendar(calendar_path)
+    raise FileNotFoundError(
+        f"找不到行情日历 {calendar_path}。配置里的 provider_uri 是 {cfg['runtime']['provider_uri']}"
+    )
+
+
+def init_qlib(
+    data_dir: Path,
+    run_dir: Path,
+    kernels: int = 1,
+    experiment: str = "hk",
+    region: str = "us",
+) -> None:
     """MLflow 和 qlib 磁盘缓存都放进本次输出目录。不启用表达式缓存。"""
     import qlib
 
@@ -57,7 +91,7 @@ def init_qlib(data_dir: Path, run_dir: Path, kernels: int = 1, experiment: str =
     mlruns.mkdir(parents=True, exist_ok=True)
     qlib.init(
         provider_uri=str(data_dir),
-        region="us",
+        region=region,
         kernels=kernels,
         expression_cache=None,
         dataset_cache=None,
@@ -122,16 +156,27 @@ def embargo_end(calendar: pd.DatetimeIndex, day: str, horizon: int) -> pd.Timest
     return calendar[pos]
 
 
-def side_cost(costs: dict) -> float:
-    total = (
+def _fee_base(costs: dict) -> float:
+    return (
         float(costs["commission_rate"])
         + float(costs["exchange_fee_rate"])
         + float(costs["settlement_rate"])
         + float(costs["slippage_rate"])
     )
+
+
+def trade_costs(costs: dict) -> tuple[float, float]:
+    """买入成本和卖出成本。印花税默认买卖都收；A 股只在卖出时收。"""
+    base = _fee_base(costs)
+    stamp = float(costs["stamp_duty_rate"])
     if costs.get("stamp_both_sides", True):
-        total += float(costs["stamp_duty_rate"])
-    return total
+        return base + stamp, base + stamp
+    return base, base + stamp
+
+
+def side_cost(costs: dict) -> float:
+    buy, _sell = trade_costs(costs)
+    return buy
 
 
 def universe_symbols(cfg: dict) -> set[str] | None:
@@ -159,13 +204,33 @@ def universe_symbols(cfg: dict) -> set[str] | None:
         token = text.split()[0]
         digits = "".join(ch for ch in token if ch.isdigit())
         if not digits or len(digits) > width:
-            raise ValueError(f"无法解析港股代码: {token}")
+            raise ValueError(f"无法解析股票代码: {token}")
         code = digits.zfill(width)
         if code not in excluded:
             found.add(code)
     if not found:
         raise ValueError(f"股票名单是空的: {path}")
     return found
+
+
+def qlib_instruments(cfg: dict) -> str | list[str]:
+    """交给 qlib 的代码。A股数据目录用 SH/SZ 前缀，名单里是六位数字。"""
+    allowed = universe_symbols(cfg)
+    if allowed is None:
+        return "tradable"
+    if cfg.get("backtest", {}).get("lot_rule") != "cn":
+        return sorted(allowed)
+
+    def prefixed(code: str) -> str:
+        if code.startswith(("SH", "SZ", "BJ")):
+            return code
+        if code.startswith(("5", "6", "9")):
+            return f"SH{code}"
+        if code.startswith(("4", "8")):
+            return f"BJ{code}"
+        return f"SZ{code}"
+
+    return sorted(prefixed(code) for code in allowed)
 
 
 def _instrument_codes(index: pd.Index, width: int) -> pd.Index:
@@ -222,17 +287,22 @@ def segments_for(cfg: dict, calendar: pd.DatetimeIndex) -> dict[str, tuple[str, 
 
 
 def selected_models(cfg: dict, choice: str) -> list[tuple[str, dict]]:
+    wanted = {item.strip() for item in str(choice).split(",") if item.strip()}
     models = []
     for name, spec in cfg["models"].items():
         if spec.get("dataset_kind", "tabular") != "tabular":
             continue
-        if choice != "all" and name != choice:
+        if choice != "all" and name not in wanted:
             continue
         if choice == "all" and not spec.get("enabled", False):
             continue
-        if choice != "all" and name == choice and not spec.get("enabled", False):
+        if choice != "all" and name in wanted and not spec.get("enabled", False):
             raise ValueError(f"模型 {name} 在配置里是 enabled: false")
         models.append((name, spec))
+    if choice != "all":
+        missing = wanted - {name for name, _spec in models}
+        if missing:
+            raise ValueError(f"没有可跑的模型: {', '.join(sorted(missing))}")
     if not models:
         raise ValueError(f"没有可跑的模型: {choice}")
     return models
@@ -346,7 +416,7 @@ def evaluate_segment(
     from qlib.contrib.strategy import TopkDropoutStrategy
 
     backtest = cfg["backtest"]
-    cost = side_cost(backtest["costs"])
+    buy_cost, sell_cost = trade_costs(backtest["costs"])
     pred = limit_instruments(pred, cfg)
     label_s = limit_instruments(label_s, cfg)
     summary = ic_summary(pred, label_s)
@@ -359,28 +429,38 @@ def evaluate_segment(
     print(f"[{name}] 回测 {segment} {start} ~ {end}", flush=True)
     strategy_cls = TopkDropoutStrategy
     saved_exchange = None
+    limit_threshold = backtest.get("limit_threshold")
+    trade_unit = None
     if backtest.get("respect_lot_size", False):
         import qlib.backtest as qbacktest
 
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from exchange import HKLotExchange, LotTopkDropoutStrategy
-        from lots import load_lot_sizes
+        from exchange import CNLotExchange, HKLotExchange, LotTopkDropoutStrategy
 
-        codes = pred.index.get_level_values("instrument").unique().tolist()
-        lot_sizes, fallback = load_lot_sizes(
-            codes,
-            cfg["data"]["freeze_dirname"],
-            default_lot=int(backtest.get("default_lot_size", 100)),
-        )
-        print(
-            f"[{name}] 回测每手股数 {len(lot_sizes)} 只，"
-            f"其中 {fallback} 只按 {int(backtest.get('default_lot_size', 100))} 股",
-            flush=True,
-        )
-        HKLotExchange.lot_sizes = lot_sizes
-        HKLotExchange.default_lot = int(backtest.get("default_lot_size", 100))
-        saved_exchange = qbacktest.Exchange
-        qbacktest.Exchange = HKLotExchange
+        if backtest.get("lot_rule") == "cn":
+            print(f"[{name}] A股下单：主板/创业板 100 股，科创板最少 200 股", flush=True)
+            saved_exchange = qbacktest.Exchange
+            qbacktest.Exchange = CNLotExchange
+            limit_threshold = 0.095
+            trade_unit = 1
+        else:
+            from lots import load_lot_sizes
+
+            codes = pred.index.get_level_values("instrument").unique().tolist()
+            lot_sizes, fallback = load_lot_sizes(
+                codes,
+                cfg["data"]["freeze_dirname"],
+                default_lot=int(backtest.get("default_lot_size", 100)),
+            )
+            print(
+                f"[{name}] 回测每手股数 {len(lot_sizes)} 只，"
+                f"其中 {fallback} 只按 {int(backtest.get('default_lot_size', 100))} 股",
+                flush=True,
+            )
+            HKLotExchange.lot_sizes = lot_sizes
+            HKLotExchange.default_lot = int(backtest.get("default_lot_size", 100))
+            saved_exchange = qbacktest.Exchange
+            qbacktest.Exchange = HKLotExchange
         strategy_cls = LotTopkDropoutStrategy
     try:
         report_df, _positions = backtest_daily(
@@ -394,11 +474,12 @@ def evaluate_segment(
             account=float(backtest["account"]),
             benchmark=str(backtest["benchmark"]),
             exchange_kwargs={
-                "limit_threshold": backtest.get("limit_threshold"),
+                "limit_threshold": limit_threshold,
                 "deal_price": backtest["deal_price"],
-                "open_cost": cost,
-                "close_cost": cost,
+                "open_cost": buy_cost,
+                "close_cost": sell_cost,
                 "min_cost": float(backtest["costs"]["min_commission"]),
+                **({} if trade_unit is None else {"trade_unit": trade_unit}),
             },
         )
     finally:
@@ -434,9 +515,8 @@ def run_model(
     backtest = cfg["backtest"]
     features = cfg["features"]
     rule = universe_expression(universe)
-    cost = side_cost(backtest["costs"])
-    allowed = universe_symbols(cfg)
-    instruments = "tradable" if allowed is None else sorted(allowed)
+    buy_cost, sell_cost = trade_costs(backtest["costs"])
+    instruments = qlib_instruments(cfg)
     handler = {
         "class": features["class"],
         "module_path": features["module_path"],
@@ -499,7 +579,8 @@ def run_model(
         "model": name,
         "class": spec["class"],
         "universe_rule": rule,
-        "side_cost": cost,
+        "open_cost": buy_cost,
+        "close_cost": sell_cost,
         "segments": {key: list(value) for key, value in resolved.items()},
         "train_curves": evals_result,
         "metrics": {},
@@ -536,25 +617,30 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("qlib-zh/hk/baseline.yaml"))
     parser.add_argument("--model", default="lightgbm", help="模型名，或 all")
     args = parser.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
     cfg = load_config(args.config)
-    data_dir = provider_dir(cfg)
-    calendar = load_calendar(data_dir / "calendars" / "day.txt")
+    data_dir, calendar = require_calendar(cfg)
     resolved = segments_for(cfg, calendar)
     handler_span = {
         "start": str(cfg["segments"]["warmup"]["start"])[:10],
         "end": calendar[-1].strftime("%Y-%m-%d"),
     }
-    repo_root = Path(__file__).resolve().parents[2]
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    out_dir = repo_root / "qlib-zh" / "hk" / "output" / cfg["data"]["freeze_dirname"] / run_stamp
+    out_dir = run_output_dir(cfg, args.config, run_stamp)
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.config, out_dir / "baseline.yaml")
 
     attach_log(out_dir / "run.log")
     print(f"数据 {data_dir}", flush=True)
     print(f"切分 {resolved}", flush=True)
-    init_qlib(data_dir, out_dir, kernels=4, experiment="baseline")
+    init_qlib(
+        data_dir,
+        out_dir,
+        kernels=4,
+        experiment="baseline",
+        region=str((cfg.get("runtime") or {}).get("region") or "us"),
+    )
     reports = []
     for name, spec in selected_models(cfg, args.model):
         reports.append(run_model(name, spec, cfg, resolved, handler_span, calendar, out_dir))
@@ -581,9 +667,6 @@ def main() -> int:
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    import sys
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from report_html import write_report
 
     report_path = out_dir / "report.html"

@@ -19,6 +19,9 @@ qlib-zh/DATA/
 qlib-zh/models/
 qlib-zh/hk/output/
 qlib-zh/hk/cache/
+qlib-zh/cn/output/
+qlib-zh/cn/cache/
+qlib-zh/cn/data/
 mlruns/
 
 # 批量分析缓存
