@@ -309,11 +309,16 @@ def selected_models(cfg: dict, choice: str) -> list[tuple[str, dict]]:
 
 
 def model_config_and_fit_options(model_cfg: dict) -> tuple[dict, dict]:
-    """verbose_eval 只控制终端打印，不能放进 LightGBM 的参数。"""
+    """verbose_eval 只控制终端打印，不能放进 LightGBM 的参数。
+
+    XGBModel.fit 用 num_boost_round 控制轮数。n_estimators 放进 xgb.train 的 params 会被忽略。
+    """
     kwargs = dict(model_cfg.get("kwargs") or {})
     fit_options = {}
     if "verbose_eval" in kwargs:
         fit_options["verbose_eval"] = int(kwargs.pop("verbose_eval"))
+    if model_cfg.get("class") == "XGBModel" and "n_estimators" in kwargs:
+        fit_options["num_boost_round"] = int(kwargs.pop("n_estimators"))
     cleaned = dict(model_cfg)
     cleaned["kwargs"] = kwargs
     return cleaned, fit_options

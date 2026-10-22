@@ -67,7 +67,7 @@ features:
   kwargs: {}
   extra: []
 
-# 与 qlib-zh/hk/baseline.yaml 的 models 相同。
+# 模型结构和超参与 qlib-zh/hk/baseline.yaml 相同。线程数按 32 核机器设置。
 models:
   linear:
     enabled: true
@@ -90,7 +90,7 @@ models:
       lambda_l2: 580.9768
       max_depth: 4
       num_leaves: 15
-      num_threads: 20
+      num_threads: 32
       num_boost_round: 5000
       early_stopping_rounds: 50
       verbose_eval: 200
@@ -106,7 +106,7 @@ models:
       max_depth: 8
       n_estimators: 647
       subsample: 0.8789
-      nthread: 20
+      nthread: 32
   catboost:
     enabled: true
     dataset_kind: tabular
@@ -118,7 +118,7 @@ models:
       subsample: 0.8789
       max_depth: 6
       num_leaves: 100
-      thread_count: 20
+      thread_count: 32
       grow_policy: Lossguide
       bootstrap_type: Poisson
   double_ensemble:
@@ -147,8 +147,25 @@ models:
       lambda_l2: 580.9768
       max_depth: 8
       num_leaves: 210
-      num_threads: 20
+      num_threads: 32
       verbosity: -1
+  # 本机没有 GPU。GPU: 0 在无 CUDA 时会落到 CPU。输入维度是已缓存的 158 个特征。
+  mlp:
+    enabled: true
+    dataset_kind: tabular
+    class: DNNModelPytorch
+    module_path: qlib.contrib.model.pytorch_nn
+    kwargs:
+      loss: mse
+      lr: 0.002
+      optimizer: adam
+      max_steps: 8000
+      batch_size: 8192
+      GPU: 0
+      early_stop_rounds: 50
+      weight_decay: 0.0002
+      pt_model_kwargs:
+        input_dim: 158
 
 # A股交易规则。每日调仓只卖已有持仓，买入的股票当天不卖，对应 T+1。
 # 涨跌停在回测里按板块分开：主板 9.5%，创业板和科创板 19.5%。

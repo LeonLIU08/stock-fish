@@ -5,6 +5,7 @@
 #   bash scripts/run_cn_qlib_rolling.sh
 #   bash scripts/run_cn_qlib_rolling.sh --dry-run
 #   bash scripts/run_cn_qlib_rolling.sh --model lightgbm
+#   bash scripts/run_cn_qlib_rolling.sh --resume qlib-zh/cn/output/cn_data/20261021-1041-rolling --model lightgbm
 
 set -euo pipefail
 
@@ -14,6 +15,9 @@ cd "$ROOT"
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
+  -e OMP_NUM_THREADS=32 \
+  -e MKL_NUM_THREADS=1 \
+  -e OPENBLAS_NUM_THREADS=1 \
   -v "${ROOT}:/work" \
   -w /work \
   zhuhai123/qlib-rdagent:v1 \
