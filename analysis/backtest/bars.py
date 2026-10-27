@@ -221,10 +221,14 @@ class BarLoader:
         bars = warmup_bars if warmup_bars is not None else 20
         padded_start = config.start - timedelta(days=config.warmup_calendar_days(bars))
         symbols = (spec["yahoo"],) + tuple(spec.get("fallbacks") or ())
-        fetchers = [
+        fetchers = []
+        qq = {"hsi": "hkHSI", "hstech": "hkHSTECH"}.get(key)
+        if qq:
+            fetchers.append(lambda qq=qq: self._from_tencent_daily(qq, padded_start, config.end))
+        fetchers.extend(
             (lambda yahoo=yahoo: self._from_yahoo(yahoo, padded_start, config.end, "1d"))
             for yahoo in symbols
-        ]
+        )
         return self._load(
             cache_key=f"bench_{key}_1d_{padded_start}_{config.end}",
             fetchers=fetchers,
@@ -328,13 +332,12 @@ class BarLoader:
     def _from_longbridge(
         self, symbol: str, start: date, end: date, interval: str
     ) -> Optional[Tuple[pd.DataFrame, str]]:
-        manager = self._get_manager()
-        fetcher = manager._get_fetcher_by_name("LongbridgeFetcher", capability="daily_data")
-        if fetcher is None or not hasattr(fetcher, "fetch_history_bars"):
+        from market_data.data_fetchers.longbridge_fetcher import LongbridgeFetcher
+
+        fetcher = LongbridgeFetcher()
+        if not hasattr(fetcher, "fetch_history_bars"):
             return None
-        df = manager._call_fetcher_method(
-            fetcher,
-            "fetch_history_bars",
+        df = fetcher.fetch_history_bars(
             symbol,
             start.isoformat(),
             end.isoformat(),
@@ -343,6 +346,39 @@ class BarLoader:
         if df is None or df.empty:
             return None
         return df, "longbridge"
+
+    def _from_tencent_daily(
+        self, qq_symbol: str, start: date, end: date
+    ) -> Optional[Tuple[pd.DataFrame, str]]:
+        """Daily bars from Tencent. Row order is date, open, close, high, low, volume."""
+        import json
+        import urllib.request
+
+        url = (
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+            f"?param={qq_symbol},day,,,500,qfq"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        data = (payload.get("data") or {}).get(qq_symbol) or {}
+        rows = data.get("qfqday") or data.get("day") or []
+        if not rows:
+            return None
+        frame = pd.DataFrame(rows)
+        # date, open, close, high, low, volume, ...
+        out = pd.DataFrame({
+            "datetime": frame.iloc[:, 0],
+            "open": frame.iloc[:, 1],
+            "close": frame.iloc[:, 2],
+            "high": frame.iloc[:, 3],
+            "low": frame.iloc[:, 4],
+            "volume": frame.iloc[:, 5] if frame.shape[1] > 5 else 0,
+        })
+        out = _normalize_ohlcv(out)
+        if out.empty:
+            return None
+        return out, f"tencent:{qq_symbol}"
 
     def _from_yahoo(
         self, yahoo_symbol: str, start: date, end: date, interval: str

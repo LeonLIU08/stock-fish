@@ -17,7 +17,9 @@ MONTHS = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月"
 
 
 def _cjk_font_path() -> str | None:
+    here = Path(__file__).resolve().parent
     candidates = [
+        here / "fonts" / "wqy-microhei.ttc",
         Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
         Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttf"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),

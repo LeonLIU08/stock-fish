@@ -210,6 +210,11 @@ def _longbridge_config_kwargs() -> Dict[str, Any]:
     return kw
 
 
+def _history_symbol_capped(exc: Exception) -> bool:
+    """Account can query historical candles for only 100 symbols."""
+    return "symbol count out of limit" in str(exc)
+
+
 def _is_us_code(stock_code: str) -> bool:
     normalized = stock_code.strip().upper()
     return is_us_stock_code(normalized) or is_us_index_code(normalized)
@@ -776,6 +781,13 @@ class LongbridgeFetcher(BaseFetcher):
                     chunk_end,
                 )
             except Exception as e:
+                if _history_symbol_capped(e) and interval != "1d":
+                    logger.warning(
+                        "[Longbridge] %s 历史K线标的数已到上限，改取最近 1000 根 %s",
+                        symbol,
+                        interval,
+                    )
+                    return self._recent_candlesticks(ctx, symbol, period)
                 if self._is_connection_error(e):
                     self._mark_connection_cooldown(e)
                 raise
@@ -805,6 +817,19 @@ class LongbridgeFetcher(BaseFetcher):
         df = df.reset_index(drop=True)
         return df
 
+    def _recent_candlesticks(self, ctx, symbol: str, period) -> pd.DataFrame:
+        """Latest 1000 bars. This call is outside the 100-symbol history cap."""
+        from longbridge.openapi import AdjustType
+
+        candles = ctx.candlesticks(symbol, period, 1000, AdjustType.ForwardAdjust)
+        if not candles:
+            return pd.DataFrame(
+                columns=["datetime", "open", "high", "low", "close", "volume", "amount"]
+            )
+        df = self._candles_to_bar_frame(candles)
+        logger.info("[Longbridge] %s 最近K线 %s 根", symbol, len(df))
+        return df
+
     @staticmethod
     def _interval_to_period(interval: str):
         from longbridge.openapi import Period
@@ -829,9 +854,13 @@ class LongbridgeFetcher(BaseFetcher):
             if ts is None:
                 continue
             t = pd.Timestamp(ts)
+            # SDK returns naive exchange-local clocks (HK session 09:30–16:00).
+            # Treating them as UTC shifts every bar by 8 hours and moves the
+            # closing bar onto the next calendar day.
             if t.tzinfo is None:
-                t = t.tz_localize("UTC")
-            t = t.tz_convert("Asia/Hong_Kong")
+                t = t.tz_localize("Asia/Hong_Kong")
+            else:
+                t = t.tz_convert("Asia/Hong_Kong")
             rows.append({
                 "datetime": t,
                 "open": safe_float(getattr(c, "open", None)),

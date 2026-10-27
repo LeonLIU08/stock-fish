@@ -372,9 +372,14 @@ def render_html_case(row: Dict[str, Any], config: BacktestConfig, chart_paths: D
     )
 
     def section(title: str, key: str) -> str:
-        img = _img_b64(chart_paths.get(key))
-        if not img:
+        path = chart_paths.get(key)
+        if path is None or not Path(path).is_file():
             return f"<h2>{html.escape(title)}</h2><p class='muted'>无数据</p>"
+        name = Path(path).name
+        img = (
+            f'<img src="{html.escape(name, quote=True)}" '
+            f'alt="{html.escape(title)}" />'
+        )
         return f"<h2>{html.escape(title)}</h2><div class='chart'>{img}</div>"
 
     extremes = row.get("extremes") or {}

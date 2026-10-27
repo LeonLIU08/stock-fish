@@ -82,26 +82,64 @@ def run_backtest(config: BacktestConfig) -> Dict:
                 "buy_hold_return": None,
             }
 
+    lot_ready: Optional[set] = None
+    if config.fetch_lot_sizes:
+        from analysis.backtest.trend.lots import fetch_hk_lot_sizes
+
+        found = fetch_hk_lot_sizes(config.symbols)
+        if not found:
+            raise RuntimeError("没有取到任何港股每手股数，已停止，避免按错误手数成交")
+        for code, (lot, name) in found.items():
+            config.symbol_lot_sizes[code] = int(lot)
+            if name:
+                config.symbol_names.setdefault(code, name)
+        lot_ready = set(found)
+        logger.info(f"每手股数已更新 {len(lot_ready)} / {len(config.symbols)}")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_root = Path(config.output_dir) / f"{stamp}_{config.interval}_{config.strategy_name}"
     results: List[Dict] = []
+    failures: List[Dict] = []
 
     for symbol in config.symbols:
         logger.info(f"加载 {symbol} {config.interval} ...")
-        bars, source = loader.load_symbol(symbol, config, warmup_bars=warmup_bars)
-        eval_bars = slice_eval_window(bars, config.start, config.end)
-        if eval_bars.empty:
-            raise RuntimeError(f"{symbol} 在 {config.start} ~ {config.end} 无可用 K 线")
+        try:
+            if lot_ready is not None and symbol not in lot_ready:
+                raise RuntimeError("Longbridge 没有返回每手股数")
+            bars, source = loader.load_symbol(
+                symbol,
+                config,
+                warmup_bars=warmup_bars,
+                allow_short_history=config.allow_short_history,
+            )
+            eval_bars = slice_eval_window(bars, config.start, config.end)
+            if eval_bars.empty:
+                raise RuntimeError(f"{symbol} 在 {config.start} ~ {config.end} 无可用 K 线")
+        except Exception as exc:
+            if not config.skip_symbol_errors:
+                raise
+            logger.warning(f"{symbol} 跳过: {exc}")
+            failures.append({
+                "symbol": symbol,
+                "name": config.symbol_names.get(symbol),
+                "error": str(exc),
+            })
+            continue
 
         for variant in variants:
+          try:
             prepared = strategy.prepare(bars, config, variant)
             signaled = slice_eval_window(prepared.bars, config.start, config.end)
-            engine_result = simulate(
-                signaled,
-                config,
-                symbol=symbol,
-                overlay_columns=prepared.overlay_columns,
-            )
+            custom = getattr(strategy, "simulate", None)
+            if callable(custom):
+                engine_result = custom(signaled, config, variant, symbol)
+            else:
+                engine_result = simulate(
+                    signaled,
+                    config,
+                    symbol=symbol,
+                    overlay_columns=prepared.overlay_columns,
+                )
             metrics = compute_metrics(
                 engine_result,
                 config.capital,
@@ -132,15 +170,16 @@ def run_backtest(config: BacktestConfig) -> Dict:
             case_dir = out_root / f"{symbol}_{variant.key}"
             case_dir.mkdir(parents=True, exist_ok=True)
             charts: Dict[str, Optional[Path]] = {}
-            overlays = strategy.chart_overlays(variant)
-            charts["kline"] = _safe_chart(
-                plot_daily_kline_with_trades,
-                prepared.bars,
-                engine_result.trades,
-                case_dir,
-                overlays=overlays,
-            )
-            if not daily.empty and "equity" in daily.columns:
+            if config.write_charts:
+                overlays = strategy.chart_overlays(variant)
+                charts["kline"] = _safe_chart(
+                    plot_daily_kline_with_trades,
+                    prepared.bars,
+                    engine_result.trades,
+                    case_dir,
+                    overlays=overlays,
+                )
+            if config.write_charts and not daily.empty and "equity" in daily.columns:
                 strat_nav = nav_from_price(daily["equity"])
                 bench_navs = {}
                 bench_rets = {}
@@ -193,13 +232,29 @@ def run_backtest(config: BacktestConfig) -> Dict:
                 f"{symbol} {variant.key}: return={metrics['total_return']:.2%} "
                 f"dd={metrics['max_drawdown']:.2%} trades={metrics['n_trades']}"
             )
+          except Exception as exc:
+            if not config.skip_symbol_errors:
+                raise
+            logger.warning(f"{symbol} {variant.key} 跳过: {exc}")
+            failures.append({
+                "symbol": symbol,
+                "name": config.symbol_names.get(symbol),
+                "error": str(exc),
+            })
 
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "config": config.to_dict(),
         "benchmarks": bench_meta,
         "results": results,
+        "failures": failures,
     }
+    summarize = getattr(strategy, "summarize_results", None)
+    if callable(summarize) and results:
+        text = summarize(results)
+        if failures:
+            text += f"\n\n未能回测 {len(failures)} 只，原因见跳过列表。"
+        payload["comparison_markdown"] = text
     md_path = write_reports(out_root, payload, config)
     payload["output_dir"] = str(out_root)
     payload["report_md"] = str(md_path)

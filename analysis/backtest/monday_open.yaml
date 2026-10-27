@@ -1,0 +1,67 @@
+# 每个交易日开盘买入，小时检查 +10% 止盈 / -5% 止损
+# 运行: python scripts/run_backtest.py --config analysis/backtest/monday_open.yaml
+#
+# 每只股票一个独立的 100 万港币账户。
+# 空仓在每个交易日第一根小时 K 的开盘买入；当天没有 K 线就跳过。
+# 已有持仓不加仓。开盘若用于止盈/止损，当天不再开仓。
+# 跳空按当根开盘价卖出；收盘才越过阈值的，下一根开盘卖出。
+# 小时线最高价、最低价不触发。刚好 +10% 或刚好 -5% 不卖。
+
+universe:
+  independent: true
+  symbol_file: scripts/hkamount_1000w_17Oct.txt
+  fetch_lot_sizes: true
+  skip_symbol_errors: true
+  allow_short_history: true
+
+window:
+  # 长桥「按日期拉历史K线」每个账户只能覆盖 100 只股票。
+  # 其余股票改用最近 1000 根小时线，大约从 2026-03 末开始。
+  # 起点放在 4 月中，让两种来源评的是同一段。
+  start: 2026-04-15
+  end: null
+  lookback_years: 2
+  timezone: "Asia/Hong_Kong"
+
+capital:
+  per_symbol: 1000000
+
+bars:
+  interval: "60m"
+
+strategy:
+  name: monday_open
+  long_only: true
+  max_trades_per_day: 2
+  signal_on: close
+  fill_on: next_open
+  position_mode: all_in
+  params:
+    take_profit: 0.10
+    stop_loss: 0.05
+  variants: []
+
+costs:
+  commission_rate: 0.0003
+  stamp_duty_rate: 0.001
+  lot_size: 100
+
+benchmarks:
+  hsi:
+    name: "恒生指数"
+    yahoo: "^HSI"
+    fallbacks: ["HSI.HI"]
+  hstech:
+    name: "恒生科技指数"
+    yahoo: "HSTECH.HK"
+    fallbacks: ["3033.HK"]
+
+evaluation:
+  oos_start: null
+  oos_ratio: 0.3
+  rolling_window_days: 252
+  extreme_days: 5
+
+output:
+  dir: "backtest_results"
+  charts: true

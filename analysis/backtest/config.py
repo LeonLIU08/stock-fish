@@ -107,6 +107,11 @@ class BacktestConfig:
     extreme_days: int = 5
     output_dir: str = "backtest_results"
     config_path: Optional[str] = None
+    symbol_file: Optional[str] = None
+    fetch_lot_sizes: bool = False
+    skip_symbol_errors: bool = False
+    allow_short_history: bool = False
+    write_charts: bool = True
 
     def __post_init__(self) -> None:
         self.symbols = [str(s).strip() for s in self.symbols if str(s).strip()]
@@ -193,6 +198,11 @@ class BacktestConfig:
             "extreme_days": self.extreme_days,
             "output_dir": self.output_dir,
             "config_path": self.config_path,
+            "symbol_file": self.symbol_file,
+            "fetch_lot_sizes": self.fetch_lot_sizes,
+            "skip_symbol_errors": self.skip_symbol_errors,
+            "allow_short_history": self.allow_short_history,
+            "write_charts": self.write_charts,
         }
 
 
@@ -243,6 +253,42 @@ def _normalize_strategy_block(strategy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _load_symbol_file(path: Path) -> List[str]:
+    codes: List[str] = []
+    seen = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        code = text.split()[0]
+        if code.isdigit():
+            code = code.zfill(5)
+        if code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+    if not codes:
+        raise ValueError(f"股票名单是空的: {path}")
+    return codes
+
+
+def _resolve_symbol_file(raw: str, config_path: Optional[str]) -> Path:
+    path = Path(raw)
+    if path.is_file():
+        return path
+    bases = []
+    if config_path:
+        cfg = Path(config_path).resolve()
+        bases.append(cfg.parent)
+        if len(cfg.parents) > 2:
+            bases.append(cfg.parents[2])
+    for base in bases:
+        candidate = base / raw
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"股票名单不存在: {raw}")
+
+
 def load_backtest_yaml(path: Optional[str | Path] = None) -> Dict[str, Any]:
     cfg_path = Path(path) if path else DEFAULT_CONFIG_PATH
     if not cfg_path.is_file():
@@ -269,7 +315,12 @@ def backtest_config_from_mapping(
     output = data.get("output") or {}
     overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
 
-    raw_symbols = universe.get("symbols") or list(DEFAULT_SYMBOLS)
+    symbol_file_raw = universe.get("symbol_file")
+    symbol_file = str(symbol_file_raw).strip() if symbol_file_raw else None
+    if symbol_file:
+        raw_symbols = _load_symbol_file(_resolve_symbol_file(symbol_file, data.get("_config_path")))
+    else:
+        raw_symbols = universe.get("symbols") or list(DEFAULT_SYMBOLS)
     symbols: List[str] = []
     names = dict(DEFAULT_SYMBOL_NAMES)
     lot_sizes = dict(DEFAULT_SYMBOL_LOT_SIZES)
@@ -344,6 +395,11 @@ def backtest_config_from_mapping(
         extreme_days=int(evaluation.get("extreme_days", 5)),
         output_dir=str(overrides.get("output_dir", output.get("dir", "backtest_results"))),
         config_path=data.get("_config_path"),
+        symbol_file=symbol_file,
+        fetch_lot_sizes=bool(universe.get("fetch_lot_sizes", False)),
+        skip_symbol_errors=bool(universe.get("skip_symbol_errors", False)),
+        allow_short_history=bool(universe.get("allow_short_history", False)),
+        write_charts=bool(output.get("charts", True)),
     )
     return cfg
 
