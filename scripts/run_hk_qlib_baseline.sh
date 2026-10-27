@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="/Users/leon/PyVenv/q_stock/bin/python"
+PYTHON="/usr/bin/python3"
 cd "$ROOT"
 
 echo "把已下载行情写成 qlib bin ..."
@@ -20,6 +20,7 @@ echo "补齐回测用的每手股数 ..."
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
+  -e CUDA_VISIBLE_DEVICES= \
   -v "${HOME}/.qlib:/root/.qlib" \
   -v "${ROOT}:/work" \
   -w /work \

@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="/Users/leon/PyVenv/q_stock/bin/python"
+PYTHON="/usr/bin/python3"
 cd "$ROOT"
 
 exec "$PYTHON" qlib-zh/cn/fetch_data.py "$@"

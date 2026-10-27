@@ -17,6 +17,7 @@ cd "$ROOT"
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
+  -e CUDA_VISIBLE_DEVICES= \
   -v "${ROOT}:/work" \
   -w /work \
   zhuhai123/qlib-rdagent:v1 \

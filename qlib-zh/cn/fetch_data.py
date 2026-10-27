@@ -3,9 +3,9 @@
 读取 qlib-zh/cn/baseline.yaml。中间 pickle 在 qlib-zh/cn/data/staging/，
 qlib 目录在 qlib-zh/cn/data/cn_data/。已成功的股票会跳过，中断后可续跑。
 
-    /Users/leon/PyVenv/q_stock/bin/python qlib-zh/cn/fetch_data.py
-    /Users/leon/PyVenv/q_stock/bin/python qlib-zh/cn/fetch_data.py --dump-only
-    /Users/leon/PyVenv/q_stock/bin/python qlib-zh/cn/fetch_data.py --symbols 600519,000001
+    /usr/bin/python3 qlib-zh/cn/fetch_data.py
+    /usr/bin/python3 qlib-zh/cn/fetch_data.py --dump-only
+    /usr/bin/python3 qlib-zh/cn/fetch_data.py --symbols 600519,000001
 """
 
 from __future__ import annotations

@@ -6,6 +6,7 @@
 #   bash scripts/run_cn_qlib_rolling.sh --dry-run
 #   bash scripts/run_cn_qlib_rolling.sh --model lightgbm
 #   bash scripts/run_cn_qlib_rolling.sh --resume qlib-zh/cn/output/cn_data/20261021-1041-rolling --model lightgbm
+#   bash scripts/run_cn_qlib_rolling.sh --resume qlib-zh/cn/output/cn_data/20261022-0050-rolling --model xgboost,double_ensemble,catboost,mlp,linear --fold-workers 4
 
 set -euo pipefail
 
@@ -15,6 +16,7 @@ cd "$ROOT"
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
+  -e CUDA_VISIBLE_DEVICES= \
   -e OMP_NUM_THREADS=32 \
   -e MKL_NUM_THREADS=1 \
   -e OPENBLAS_NUM_THREADS=1 \

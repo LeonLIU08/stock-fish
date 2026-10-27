@@ -3879,8 +3879,8 @@ def main() -> None:
         workspace_root = str(ROOT)
         if template_str.startswith(workspace_root):
             template_path = ROOT / template_path.relative_to(workspace_root)
-        elif template_str.startswith("/Users/apple/gitee/qlib"):
-            rel = Path(template_str[len("/Users/apple/gitee/qlib"):].lstrip("/"))
+        elif template_str.startswith("/data2/stock-fish/qlib-zh"):
+            rel = Path(template_str[len("/data2/stock-fish/qlib-zh"):].lstrip("/"))
             template_path = ROOT / rel
         elif template_str.startswith("/work"):
             rel = Path(template_str[len("/work"):].lstrip("/"))

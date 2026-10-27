@@ -120,12 +120,15 @@ models:
       num_leaves: 100
       thread_count: 32
       grow_policy: Lossguide
-      bootstrap_type: Poisson
+      task_type: CPU
+      # Poisson 只支持 GPU。CPU 用 Bernoulli，仍然按 subsample 抽样本。
+      bootstrap_type: Bernoulli
+  # 特征筛选走 fast_double_ensemble：numpy 打乱列，并按列并行预测。
   double_ensemble:
     enabled: true
     dataset_kind: tabular
     class: DEnsembleModel
-    module_path: qlib.contrib.model.double_ensemble
+    module_path: fast_double_ensemble
     kwargs:
       base_model: gbm
       loss: mse
@@ -149,7 +152,7 @@ models:
       num_leaves: 210
       num_threads: 32
       verbosity: -1
-  # 本机没有 GPU。GPU: 0 在无 CUDA 时会落到 CPU。输入维度是已缓存的 158 个特征。
+  # 只在 CPU 上训练。GPU 写成 cpu 时不会探测 CUDA。输入维度是已缓存的 158 个特征。
   mlp:
     enabled: true
     dataset_kind: tabular
@@ -161,7 +164,7 @@ models:
       optimizer: adam
       max_steps: 8000
       batch_size: 8192
-      GPU: 0
+      GPU: cpu
       early_stop_rounds: 50
       weight_decay: 0.0002
       pt_model_kwargs:

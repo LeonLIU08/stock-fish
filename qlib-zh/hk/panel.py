@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from run_baseline import cache_dir, limit_instruments, universe_expression
@@ -220,11 +221,23 @@ def load_panel(cfg: dict, start: str, end: str) -> pd.DataFrame:
     return limit_instruments(_restore(flat, meta["columns"]), cfg)
 
 
+def _fill_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """神经网络不能接受缺失值。无穷大和缺失都填成 0。"""
+    feature_cols = [col for col in frame.columns if col[0] == "feature"]
+    if not feature_cols:
+        return frame
+    filled = frame.loc[:, feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out = frame.copy()
+    out.loc[:, feature_cols] = filled
+    return out
+
+
 class PanelDataset:
     """从已落盘的特征里按日期切片。学习集在切片上做截面标准化。"""
 
-    def __init__(self, frame: pd.DataFrame, segments: dict):
+    def __init__(self, frame: pd.DataFrame, segments: dict, fill_features: bool = False):
         self._frame = frame
+        self.fill_features = fill_features
         self.segments = {
             key: (pd.Timestamp(value[0]), pd.Timestamp(value[1])) for key, value in segments.items()
         }
@@ -251,6 +264,8 @@ class PanelDataset:
         frame = self._slice(segments)
         if data_key == DataHandlerLP.DK_L:
             frame = self._learn(frame)
+        if self.fill_features:
+            frame = _fill_features(frame)
         if col_set is None or isinstance(col_set, (list, tuple)):
             return frame
         return frame[col_set]

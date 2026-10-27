@@ -124,12 +124,15 @@ models:
       num_leaves: 100
       thread_count: 20
       grow_policy: Lossguide
-      bootstrap_type: Poisson
+      task_type: CPU
+      # Poisson 只支持 GPU。CPU 用 Bernoulli，仍然按 subsample 抽样本。
+      bootstrap_type: Bernoulli
+  # 特征筛选走 fast_double_ensemble：numpy 打乱列，并按列并行预测。
   double_ensemble:
     enabled: true
     dataset_kind: tabular
     class: DEnsembleModel
-    module_path: qlib.contrib.model.double_ensemble
+    module_path: fast_double_ensemble
     kwargs:
       base_model: gbm
       loss: mse

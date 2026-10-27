@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_OUTPUT_DIR = Path("/Users/apple/github/qlib/DATA/myquant")
+DEFAULT_OUTPUT_DIR = Path("/data2/stock-fish/qlib-zh/DATA/myquant")
 DEFAULT_INDEX = "SHSE.000300"
 DEFAULT_START_DATE = "2018-01-01"
 

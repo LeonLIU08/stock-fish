@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import pickle
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -170,7 +173,9 @@ def _fit_and_predict(task: dict, spec: dict, cfg: dict):
     start = min(_stamp(segments[key][0]) for key in ("train", "valid", "test"))
     end = _stamp(segments["test"][1])
     frame = load_panel(cfg, start, end)
-    dataset = PanelDataset(frame, segments)
+    # 树模型能直接用缺失值。DNN 遇到缺失会在第一步把权重更新成 NaN，早停时检查点还是空文件。
+    fill_features = str(task["model"].get("class")) == "DNNModelPytorch"
+    dataset = PanelDataset(frame, segments, fill_features=fill_features)
     del frame
     model_cfg, fit_options = model_config_and_fit_options(task["model"])
     model = init_instance_by_config(model_cfg)
@@ -187,8 +192,8 @@ def _fit_and_predict(task: dict, spec: dict, cfg: dict):
     return pred, curves
 
 
-def _run_fold_worker(task_path: Path, fold_dir: Path, config_path: Path) -> None:
-    cmd = [
+def _fold_worker_cmd(task_path: Path, fold_dir: Path, config_path: Path) -> list[str]:
+    return [
         sys.executable,
         str(Path(__file__).resolve()),
         "--config",
@@ -198,7 +203,79 @@ def _run_fold_worker(task_path: Path, fold_dir: Path, config_path: Path) -> None
         "--worker-out",
         str(fold_dir),
     ]
-    subprocess.run(cmd, check=True)
+
+
+def _fold_worker_env(fold_workers: int) -> dict:
+    """多折同时跑时，把 OpenMP 线程按折数拆开。单折保持容器原来的设置。"""
+    env = os.environ.copy()
+    env["QLIB_FOLD_WORKERS"] = str(fold_workers)
+    if fold_workers > 1:
+        per_fold = max(1, (os.cpu_count() or 1) // fold_workers)
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env[key] = str(per_fold)
+    return env
+
+
+def _run_fold_worker(task_path: Path, fold_dir: Path, config_path: Path) -> None:
+    subprocess.run(_fold_worker_cmd(task_path, fold_dir, config_path), check=True)
+
+
+def _train_folds(jobs: list[dict], config_path: Path, fold_workers: int) -> None:
+    """同时启动有限个折。某一折失败时停掉已经启动的其它折。"""
+    if fold_workers < 1:
+        raise ValueError("fold-workers 至少为 1")
+    if fold_workers == 1 or len(jobs) <= 1:
+        for job in jobs:
+            _run_fold_worker(job["task_path"], job["fold_dir"], config_path)
+        return
+
+    env = _fold_worker_env(fold_workers)
+    running: list[subprocess.Popen] = []
+    lock = threading.Lock()
+
+    def launch(job: dict) -> None:
+        prefix = job["prefix"]
+        proc = subprocess.Popen(
+            _fold_worker_cmd(job["task_path"], job["fold_dir"], config_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        with lock:
+            running.append(proc)
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(f"{prefix}{line}", end="", flush=True)
+            code = proc.wait()
+            if code != 0:
+                raise subprocess.CalledProcessError(code, job["fold_dir"])
+        finally:
+            with lock:
+                if proc in running:
+                    running.remove(proc)
+
+    def stop_running() -> None:
+        with lock:
+            procs = list(running)
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+
+    pool = ThreadPoolExecutor(max_workers=fold_workers)
+    futures = [pool.submit(launch, job) for job in jobs]
+    try:
+        for future in as_completed(futures):
+            future.result()
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        stop_running()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _tradable_codes(start: str, end: str) -> list[str]:
@@ -332,12 +409,14 @@ def worker_main(args) -> int:
     }
     pred, curves = _fit_and_predict(task, spec, cfg)
     fold_dir.mkdir(parents=True, exist_ok=True)
-    pred.to_frame("score").to_pickle(fold_dir / "pred.pkl")
-    (fold_dir / "train_curves.json").write_text(
-        json.dumps(curves, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print(f"已写入 {fold_dir / 'pred.pkl'}", flush=True)
+    pred_path = fold_dir / "pred.pkl"
+    tmp_pred = fold_dir / "pred.pkl.tmp"
+    pred.to_frame("score").to_pickle(tmp_pred)
+    tmp_pred.replace(pred_path)
+    tmp_curve = fold_dir / "train_curves.json.tmp"
+    tmp_curve.write_text(json.dumps(curves, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp_curve.replace(fold_dir / "train_curves.json")
+    print(f"已写入 {pred_path}", flush=True)
     return 0
 
 
@@ -370,6 +449,7 @@ def run_rolling(
     config_path: Path,
     eval_start: str | None = None,
     eval_end: str | None = None,
+    fold_workers: int = 1,
 ) -> dict:
     tasks = build_tasks(cfg, spec, calendar, eval_start, eval_end)
     folds = [_segment_dates(task) for task in tasks]
@@ -385,31 +465,44 @@ def run_rolling(
         return {"model": name, "folds": [{key: list(value) for key, value in fold.items()} for fold in folds]}
 
     ensure_panel(cfg, out_dir, config_path)
-    parts = []
-    curves = {}
     end_limit = pd.Timestamp(eval_end or cfg["segments"]["test"]["end"])
+    pending = []
     for index, task in enumerate(tasks, start=1):
         fold = folds[index - 1]
         fold_dir = out_dir / name / "folds" / f"{index:02d}"
         pred_path = fold_dir / "pred.pkl"
-        if pred_path.exists():
+        if pred_path.exists() and pred_path.stat().st_size > 0:
             print(f"[{name}] 跳过已完成 {index}/{len(tasks)} {fold['test'][0]} ~ {fold['test'][1]}", flush=True)
-            pred = pd.read_pickle(pred_path)["score"]
-            curve_path = fold_dir / "train_curves.json"
-            if curve_path.exists():
-                curves = json.loads(curve_path.read_text(encoding="utf-8"))
-        else:
-            fold_dir.mkdir(parents=True, exist_ok=True)
-            (fold_dir / "fold.json").write_text(
-                json.dumps({key: list(value) for key, value in fold.items()}, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            task_path = fold_dir / "task.pkl"
-            task_path.write_bytes(pickle.dumps(task))
-            print(f"[{name}] 训练 {index}/{len(tasks)} 预测 {fold['test'][0]} ~ {fold['test'][1]}", flush=True)
-            _run_fold_worker(task_path, fold_dir, config_path)
-            pred = pd.read_pickle(pred_path)["score"]
-            curves = json.loads((fold_dir / "train_curves.json").read_text(encoding="utf-8"))
+            continue
+        if pred_path.exists():
+            pred_path.unlink()
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        (fold_dir / "fold.json").write_text(
+            json.dumps({key: list(value) for key, value in fold.items()}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        task_path = fold_dir / "task.pkl"
+        task_path.write_bytes(pickle.dumps(task))
+        print(f"[{name}] 训练 {index}/{len(tasks)} 预测 {fold['test'][0]} ~ {fold['test'][1]}", flush=True)
+        pending.append(
+            {
+                "task_path": task_path,
+                "fold_dir": fold_dir,
+                "prefix": f"[{name} {index}/{len(tasks)}] ",
+            }
+        )
+    if pending:
+        workers = min(fold_workers, len(pending))
+        print(f"[{name}] 未完成 {len(pending)} 折，同时训练 {workers} 折", flush=True)
+        _train_folds(pending, config_path, workers)
+    parts = []
+    curves = {}
+    for index, _task in enumerate(tasks, start=1):
+        fold_dir = out_dir / name / "folds" / f"{index:02d}"
+        pred = pd.read_pickle(fold_dir / "pred.pkl")["score"]
+        curve_path = fold_dir / "train_curves.json"
+        if curve_path.exists():
+            curves = json.loads(curve_path.read_text(encoding="utf-8"))
         dates = pd.to_datetime(pred.index.get_level_values("datetime"))
         parts.append(pred.loc[dates <= end_limit])
     stitched = pd.concat(parts)
@@ -534,7 +627,15 @@ def main() -> int:
     parser.add_argument("--topk", type=int, default=None, help="覆盖持有只数")
     parser.add_argument("--n-drop", type=int, default=None, help="覆盖每个交易日替换只数")
     parser.add_argument("--account", type=float, default=None, help="覆盖回测初始资金")
+    parser.add_argument(
+        "--fold-workers",
+        type=int,
+        default=1,
+        help="同时训练的折数。1 表示一折结束再开下一折",
+    )
     args = parser.parse_args()
+    if args.fold_workers < 1:
+        raise SystemExit("fold-workers 至少为 1")
     if args.build_panel:
         build_panel(load_config(args.config), args.build_panel)
         return 0
@@ -619,6 +720,7 @@ def main() -> int:
                     args.config,
                     args.eval_start,
                     args.eval_end,
+                    args.fold_workers,
                 )
             )
     if args.dry_run:
