@@ -7,12 +7,12 @@ alwaysApply: true
 
 在本仓库里运行 Python 时，使用：
 
-`/Users/leon/PyVenv/q_stock/bin/python`
+`/usr/bin/python3`
 
 ```bash
-/Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_structure.py --symbol 00700
+/usr/bin/python3 scripts/run_trend_structure.py --symbol 00700
 ```
 
-不要使用系统 `python` / `python3`，也不要 `source activate`。这条规则只作用于当前仓库，不要改用户级 Cursor 设置或其他工程。
+调用时写这个绝对路径，不要改用别的解释器，也不要 `source activate`。这条规则只作用于当前仓库，不要改用户级 Cursor 设置或其他工程。
 
 已有脚本里写死的 `python3`（Qlib 训练/推理、MiroFish）保持原样，除非用户明确要求改那些入口。

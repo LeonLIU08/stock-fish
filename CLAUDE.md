@@ -485,4 +485,4 @@ Compress a Qlib model directory into `csi300-alpha158.tar.gz` and push it to `gi
 4. `gh release create csi300-alpha158` with the tar.gz to `freenowill/stock-fish`
 5. Verify the uploaded asset
 
-**Note:** Always uses `TMPDIR=/Users/apple/github/stock_predict/StockFish` for `gh` commands to avoid `/private/tmp` disk-full issues.
+**Note:** Always uses `TMPDIR=/data2/stock-fish` for `gh` commands to avoid `/private/tmp` disk-full issues.

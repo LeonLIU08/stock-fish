@@ -15,7 +15,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PYTHON="/Users/leon/PyVenv/q_stock/bin/python"
+PYTHON="/usr/bin/python3"
 if [[ ! -x "$PYTHON" ]]; then
   echo "找不到 Python: $PYTHON" >&2
   exit 1

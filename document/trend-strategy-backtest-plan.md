@@ -46,8 +46,8 @@ backtest_results/{时间戳}_{周期}_trend_state/
 命令：
 
 ```bash
-/Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py
-/Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py \
+/usr/bin/python3 scripts/run_trend_backtest.py
+/usr/bin/python3 scripts/run_trend_backtest.py \
   --config analysis/backtest/trend-strategy-v0.yaml \
   --symbols 00700,09988,NVDA --runs breakout,pullback --years 3
 ```

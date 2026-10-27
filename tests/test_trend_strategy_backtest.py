@@ -75,7 +75,7 @@ from analysis.structure.view_model import display_snapshot
 
 HK = ZoneInfo("Asia/Hong_Kong")
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = "/Users/leon/PyVenv/q_stock/bin/python"
+PYTHON = "/usr/bin/python3"
 
 
 def _raw():

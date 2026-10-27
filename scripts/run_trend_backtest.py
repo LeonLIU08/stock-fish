@@ -5,8 +5,8 @@
 策略 A、策略 B、策略 C、策略 D0 和策略 D1 分开记账。策略 C 在短尺度上升趋势出现后的下一根开盘买入，在中尺度下降趋势出现后的下一根开盘卖出。策略 D0 的买卖都用短尺度。策略 D1 在 D0 上再加持有以来最高价回撤 15% 的止损。
 
 示例:
-    /Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py
-    /Users/leon/PyVenv/q_stock/bin/python scripts/run_trend_backtest.py \
+    /usr/bin/python3 scripts/run_trend_backtest.py
+    /usr/bin/python3 scripts/run_trend_backtest.py \
         --symbols-file scripts/hkconnect_06Oct.txt --years 3
 """
 from __future__ import annotations
