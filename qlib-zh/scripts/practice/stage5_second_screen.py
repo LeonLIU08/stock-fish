@@ -236,8 +236,19 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     print(f"✓ 过滤高风险/ST/停牌: {before} → {len(filtered)} 只")
 
     if filtered.empty:
-        print("  ⚠ 严格约束后无剩余股票，将放宽为仅排除停牌/ST")
-        filtered = risk_df[(~is_st) & (~is_suspended)].copy()
+        try:
+            from portfolio_policy import strict_qualification_enabled
+            _strict_policy = strict_qualification_enabled()
+        except Exception:
+            _strict_policy = False
+        if _strict_policy:
+            print("  ⚠ 严格约束后无剩余股票，保留空结果，不放宽硬过滤")
+            (out_path / "second_screen.csv").write_text("", encoding="utf-8")
+            (out_path / "second_screen_candidates.csv").write_text("", encoding="utf-8")
+            return
+        else:
+            print("  ⚠ 严格约束后无剩余股票，将放宽为仅排除停牌/ST")
+            filtered = risk_df[(~is_st) & (~is_suspended)].copy()
 
     # ── 3. 从 model_predict/scores.csv 补充得分信息 ─
     scores_csv = _resolve_scores_csv(pred_dir)
@@ -325,6 +336,13 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     candidates_csv = out_path / "second_screen_candidates.csv"
     result = _apply_industry_cap(candidates, hold_num=hold_num, cap_ratio=0.40)
     result = _apply_risk_parity_weights(result)
+    try:
+        from portfolio_policy import strict_qualification_enabled
+        if strict_qualification_enabled() and hold_num > 0 and len(result) > 0:
+            result["weight"] = result["weight"] * (len(result) / float(hold_num))
+            result["risk_parity_weight"] = result["weight"]
+    except Exception:
+        pass
 
     candidate_weights = _apply_risk_parity_weights(result.copy())[["code", "risk_parity_weight", "weight"]]
     candidates = candidates.merge(candidate_weights, on="code", how="left")

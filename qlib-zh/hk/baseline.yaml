@@ -7,7 +7,9 @@ version: hk-qlib-baseline-v0
 
 runtime:
   docker_image: zhuhai123/qlib-rdagent:v1
-  provider_uri: /root/.qlib/qlib_data/hk_data_20261016
+  image_digest: null
+  # 行情写在工程目录 qlib-zh/hk/data，不使用 ~/.qlib。/work 是容器里的仓库根。
+  provider_uri: /work/qlib-zh/hk/data/hk_data_20261016
 
 # 行情从哪来、落到哪、用什么价格。不含训练起止日。
 data:
@@ -201,3 +203,26 @@ report:
   publish_test_for: selected_only    # 未选中模型的测试集数字进附录
   copy_config_into_output: true
   lock_test_after_first_run: true
+
+# 可变持仓默认关闭，和 A 股基线使用同一套组合规则。
+portfolio_policy:
+  enabled: false
+  max_holdings: 50
+  allow_new_buys_outside_topk: false
+  master_candidate_pool_multiplier: 3.0
+  unfilled_slot_policy: cash
+  allocation:
+    method: preserve_strategy_allocator
+    base_cash_ratio: 0.0
+    risk_scale: 1.0
+  score_gate:
+    mode: calibrated_net_excess
+    profile: balanced
+    missing_artifact_policy: freeze_no_buy
+  turnover:
+    max_regular_replacements: 5
+    hold_rank_buffer_multiplier: 2.0
+    mandatory_exit_bypasses_limit: true
+  execution:
+    redistribute_failed_buy_weight: false
+    risk_degree: 1.0

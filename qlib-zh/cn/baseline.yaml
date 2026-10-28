@@ -5,6 +5,7 @@ version: cn-qlib-baseline-v0
 
 runtime:
   docker_image: zhuhai123/qlib-rdagent:v1
+  image_digest: null
   provider_uri: /work/qlib-zh/cn/data/cn_data
   region: cn
   output_dir: qlib-zh/cn/output
@@ -214,3 +215,26 @@ report:
   publish_test_for: selected_only
   copy_config_into_output: true
   lock_test_after_first_run: true
+
+# 可变持仓默认关闭。打开后最多持有 max_holdings 只，空槽位留现金。
+portfolio_policy:
+  enabled: false
+  max_holdings: 50
+  allow_new_buys_outside_topk: false
+  master_candidate_pool_multiplier: 3.0
+  unfilled_slot_policy: cash
+  allocation:
+    method: preserve_strategy_allocator
+    base_cash_ratio: 0.0
+    risk_scale: 1.0
+  score_gate:
+    mode: calibrated_net_excess
+    profile: balanced
+    missing_artifact_policy: freeze_no_buy
+  turnover:
+    max_regular_replacements: 5
+    hold_rank_buffer_multiplier: 2.0
+    mandatory_exit_bypasses_limit: true
+  execution:
+    redistribute_failed_buy_weight: false
+    risk_degree: 1.0

@@ -644,9 +644,25 @@ class StockFishBot:
         # 解析参数
         market = "csi300"
         holdings_raw = ""
+        max_holdings = None
+        score_gate_profile = None
+        score_gate_mode = None
 
         if parsed.inline_master:
             raw = parsed.inline_master.strip()
+            import re
+            k_match = re.search(r"\bk=(\d+)\b", raw)
+            if k_match:
+                max_holdings = int(k_match.group(1))
+                raw = re.sub(r"\bk=\d+\b", "", raw).strip(" :")
+            profile_match = re.search(r"\bprofile=(conservative|balanced|aggressive)\b", raw)
+            if profile_match:
+                score_gate_profile = profile_match.group(1)
+                raw = re.sub(r"\bprofile=(conservative|balanced|aggressive)\b", "", raw).strip(" :")
+            mode_match = re.search(r"\bmode=(disabled|calibrated_net_excess)\b", raw)
+            if mode_match:
+                score_gate_mode = mode_match.group(1)
+                raw = re.sub(r"\bmode=(disabled|calibrated_net_excess)\b", "", raw).strip(" :")
             # 格式: market[:holdings]
             if ":" in raw:
                 parts = raw.split(":", 1)
@@ -695,7 +711,13 @@ class StockFishBot:
         heartbeat_task = asyncio.create_task(_heartbeat())
 
         try:
-            result = await self._api.qlib_infer(model=MODEL, holdings=holdings_raw)
+            result = await self._api.qlib_infer(
+                model=MODEL,
+                holdings=holdings_raw,
+                max_holdings=max_holdings,
+                score_gate_profile=score_gate_profile,
+                score_gate_mode=score_gate_mode,
+            )
         except Exception as e:
             heartbeat_running = False
             heartbeat_task.cancel()
@@ -712,6 +734,18 @@ class StockFishBot:
             pred_date = result.get("pred_date", "")
             message = result.get("message", "推理完成")
             strategy_b = result.get("strategy_b", {})
+            portfolio = result.get("portfolio") or {}
+            if portfolio:
+                cash = float(portfolio.get("target_cash_weight") or 0) * 100
+                resp.append(
+                    f"\n📦 **组合目标**：最大K {portfolio.get('max_holdings')}，"
+                    f"模型门槛拒绝 {portfolio.get('model_reject_count')}，"
+                    f"硬过滤拒绝 {portfolio.get('hard_reject_count')}，"
+                    f"最终选中 {portfolio.get('selected_count')}，"
+                    f"目标现金 {cash:.1f}%"
+                )
+                if portfolio.get("decision_status") == "DATA_ERROR":
+                    resp.append("数据或校准器不可用：不新买，也不把模型排名当成满仓清单。")
 
             resp = [f"✅ Qlib 推理完成！", f"模型: **{MODEL}** | 预测日期: {pred_date}"]
 

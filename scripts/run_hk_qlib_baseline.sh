@@ -4,6 +4,7 @@
 #
 #   bash scripts/run_hk_qlib_baseline.sh
 #   bash scripts/run_hk_qlib_baseline.sh --model all
+#   PORTFOLIO_POLICY_ENABLED=1 SCORE_GATE_MODE=disabled bash scripts/run_hk_qlib_baseline.sh --model xgboost,catboost
 
 set -euo pipefail
 
@@ -17,11 +18,18 @@ echo "把已下载行情写成 qlib bin ..."
 echo "补齐回测用的每手股数 ..."
 "$PYTHON" qlib-zh/hk/lots.py
 
+policy_env=()
+for name in PORTFOLIO_POLICY_ENABLED SCORE_GATE_MODE SCORE_GATE_PROFILE PORTFOLIO_MAX_HOLDINGS ROLLING_MODE BASE_CASH_RATIO RISK_SCALE; do
+  if [[ -n "${!name:-}" ]]; then
+    policy_env+=(-e "${name}=${!name}")
+  fi
+done
+
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
   -e CUDA_VISIBLE_DEVICES= \
-  -v "${HOME}/.qlib:/root/.qlib" \
+  "${policy_env[@]}" \
   -v "${ROOT}:/work" \
   -w /work \
   zhuhai123/qlib-rdagent:v1 \

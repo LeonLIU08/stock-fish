@@ -603,6 +603,18 @@ def qlib_infer():
     data = request.get_json(silent=True) or {}
     model = data.get('model', '').strip()
     holdings = data.get('holdings', '').strip()
+    max_holdings = data.get('max_holdings')
+    score_gate_profile = data.get('score_gate_profile') or None
+    score_gate_mode = data.get('score_gate_mode') or None
+    if max_holdings not in (None, ""):
+        try:
+            max_holdings = int(max_holdings)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'max_holdings 必须是正整数'}), 400
+        if max_holdings < 1:
+            return jsonify({'error': 'max_holdings 必须是正整数'}), 400
+    else:
+        max_holdings = None
 
     if not model:
         return jsonify({'error': '请选择模型'}), 400
@@ -644,12 +656,26 @@ def qlib_infer():
                                  count=event_data.get('count', 0),
                                  scores=event_data.get('scores', []),
                                  pred_date=event_data.get('pred_date', ''),
-                                 strategy_b=event_data.get('strategy_b', {}))
+                                 strategy_b=event_data.get('strategy_b', {}),
+                                 portfolio=event_data.get('portfolio'),
+                                 model_ranking=event_data.get('model_ranking'),
+                                 checkpoint_as_of=event_data.get('checkpoint_as_of'),
+                                 train_label_end=event_data.get('train_label_end'),
+                                 label_embargo_days=event_data.get('label_embargo_days'),
+                                 retrained=event_data.get('retrained'))
                 else:
                     progress = 0.5 if '推理' in message else 0.1
                     _update_qlib(task_id, progress, 'running', message)
 
-            result = run_qlib_inference(model, top_n=20, progress_callback=_progress, holdings=holdings)
+            result = run_qlib_inference(
+                model,
+                top_n=20 if max_holdings is None else max_holdings,
+                progress_callback=_progress,
+                holdings=holdings,
+                max_holdings=max_holdings,
+                score_gate_profile=score_gate_profile,
+                score_gate_mode=score_gate_mode,
+            )
 
             # 确保完成状态
             with _qlib_lock:
@@ -661,6 +687,12 @@ def qlib_infer():
                     qt['count'] = result.get('count', 0)
                     qt['scores'] = result.get('scores', [])
                     qt['pred_date'] = result.get('pred_date', '')
+                    qt['portfolio'] = result.get('portfolio')
+                    qt['model_ranking'] = result.get('model_ranking')
+                    qt['checkpoint_as_of'] = result.get('checkpoint_as_of')
+                    qt['train_label_end'] = result.get('train_label_end')
+                    qt['label_embargo_days'] = result.get('label_embargo_days')
+                    qt['retrained'] = result.get('retrained')
                     qt['message'] = f"完成 — 已选出 {result.get('count', 0)} 只股票"
 
         except Exception as e:
@@ -699,6 +731,13 @@ def qlib_infer_stream(task_id):
                 data['count'] = qt.get('count', 0)
                 data['pred_date'] = qt.get('pred_date', '')
                 data['strategy_b'] = qt.get('strategy_b', {})
+                data['portfolio'] = qt.get('portfolio')
+                data['model_ranking'] = qt.get('model_ranking')
+                data['checkpoint_as_of'] = qt.get('checkpoint_as_of')
+                data['train_label_end'] = qt.get('train_label_end')
+                data['label_embargo_days'] = qt.get('label_embargo_days')
+                data['retrained'] = qt.get('retrained')
+                data['scores'] = qt.get('scores', [])
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
                 break
 

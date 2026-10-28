@@ -407,8 +407,28 @@ def worker_main(args) -> int:
         "module_path": task["model"]["module_path"],
         "kwargs": task["model"].get("kwargs") or {},
     }
+    from score_gate_training import freeze_asof_calibrator, policy_requests_calibrator
+
+    wants_calibrator = policy_requests_calibrator(cfg)
+    calibrator = None
+    as_of = _stamp(task["dataset"]["kwargs"]["segments"]["test"][0])
+    model_name = _gate_model_name(task["model"]["class"])
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    if wants_calibrator:
+        from run_baseline import require_calendar
+
+        _data_dir, calendar = require_calendar(cfg)
+        calibrator = freeze_asof_calibrator(cfg, spec, calendar, as_of, fold_dir, model_name)
     pred, curves = _fit_and_predict(task, spec, cfg)
     fold_dir.mkdir(parents=True, exist_ok=True)
+    if wants_calibrator:
+        from inner_oof import apply_calibrator
+        from score_gate_training import round_trip_cost, score_gate_profile
+
+        gate = apply_calibrator(pred, calibrator, model_name, score_gate_profile(cfg), round_trip_cost(cfg))
+        temporary_gate = fold_dir / "gate.pkl.tmp"
+        gate.to_pickle(temporary_gate)
+        temporary_gate.replace(fold_dir / "gate.pkl")
     pred_path = fold_dir / "pred.pkl"
     tmp_pred = fold_dir / "pred.pkl.tmp"
     pred.to_frame("score").to_pickle(tmp_pred)
@@ -418,6 +438,14 @@ def worker_main(args) -> int:
     tmp_curve.replace(fold_dir / "train_curves.json")
     print(f"已写入 {pred_path}", flush=True)
     return 0
+
+
+def _gate_model_name(model_class: str) -> str:
+    return {
+        "XGBModel": "xgboost",
+        "CatBoostModel": "catboost",
+        "LGBModel": "lightgbm",
+    }.get(str(model_class), str(model_class).lower())
 
 
 def _between(pred: pd.Series, start: str, end: str) -> pd.Series:
@@ -465,13 +493,19 @@ def run_rolling(
         return {"model": name, "folds": [{key: list(value) for key, value in fold.items()} for fold in folds]}
 
     ensure_panel(cfg, out_dir, config_path)
+    from score_gate_training import policy_requests_calibrator
+
     end_limit = pd.Timestamp(eval_end or cfg["segments"]["test"]["end"])
     pending = []
     for index, task in enumerate(tasks, start=1):
         fold = folds[index - 1]
         fold_dir = out_dir / name / "folds" / f"{index:02d}"
         pred_path = fold_dir / "pred.pkl"
-        if pred_path.exists() and pred_path.stat().st_size > 0:
+        gate_path = fold_dir / "gate.pkl"
+        fold_complete = pred_path.exists() and pred_path.stat().st_size > 0
+        if policy_requests_calibrator(cfg):
+            fold_complete = fold_complete and gate_path.exists() and gate_path.stat().st_size > 0
+        if fold_complete:
             print(f"[{name}] 跳过已完成 {index}/{len(tasks)} {fold['test'][0]} ~ {fold['test'][1]}", flush=True)
             continue
         if pred_path.exists():
@@ -496,10 +530,14 @@ def run_rolling(
         print(f"[{name}] 未完成 {len(pending)} 折，同时训练 {workers} 折", flush=True)
         _train_folds(pending, config_path, workers)
     parts = []
+    gate_parts = []
     curves = {}
     for index, _task in enumerate(tasks, start=1):
         fold_dir = out_dir / name / "folds" / f"{index:02d}"
         pred = pd.read_pickle(fold_dir / "pred.pkl")["score"]
+        gate_path = fold_dir / "gate.pkl"
+        if gate_path.exists():
+            gate_parts.append(pd.read_pickle(gate_path))
         curve_path = fold_dir / "train_curves.json"
         if curve_path.exists():
             curves = json.loads(curve_path.read_text(encoding="utf-8"))
@@ -507,6 +545,13 @@ def run_rolling(
         parts.append(pred.loc[dates <= end_limit])
     stitched = pd.concat(parts)
     stitched = stitched[~stitched.index.duplicated(keep="last")].sort_index()
+    gate = None
+    if gate_parts:
+        from score_gate_training import policy_requests_calibrator
+
+        if policy_requests_calibrator(cfg):
+            gate = pd.concat(gate_parts)
+            gate = gate[~gate.index.duplicated(keep="last")].sort_index()
     labels = _labels_for(stitched, cfg)
     pred_dir = out_dir / name
     metrics = {}
@@ -522,7 +567,7 @@ def run_rolling(
         piece = _between(stitched, start, end)
         label_piece = _between(labels, start, end)
         metrics[segment] = evaluate_segment(
-            name, piece, label_piece, segment, start, end, calendar, cfg, pred_dir
+            name, piece, label_piece, segment, start, end, calendar, cfg, pred_dir, gate_df=gate
         )
     result = {
         "model": name,

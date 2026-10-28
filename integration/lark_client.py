@@ -222,12 +222,21 @@ class LarkClient:
         self,
         model: str = "2026-06-21-csi300-alpha158",
         holdings: str = "",
+        max_holdings: int | None = None,
+        score_gate_profile: str | None = None,
+        score_gate_mode: str | None = None,
     ) -> Dict[str, Any]:
         """POST /api/qlib/infer — Qlib 模型推理。"""
         session = await self._ensure_session()
         payload: Dict[str, Any] = {"model": model}
         if holdings:
             payload["holdings"] = holdings
+        if max_holdings:
+            payload["max_holdings"] = int(max_holdings)
+        if score_gate_profile:
+            payload["score_gate_profile"] = score_gate_profile
+        if score_gate_mode:
+            payload["score_gate_mode"] = score_gate_mode
         logger.info(f"[LarkClient] qlib_infer model={model}" + (f" holdings={holdings}" if holdings else ""))
         async with session.post(
             f"{self._base}/api/qlib/infer", json=payload

@@ -24,6 +24,15 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+_PRACTICE = ROOT / "scripts" / "practice"
+if str(_PRACTICE) not in sys.path:
+    sys.path.insert(0, str(_PRACTICE))
+
+
+def _portfolio_fallback_disabled(args) -> bool:
+    if os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1":
+        return True
+    return bool(getattr(args, "max_holdings", None))
 
 
 def main():
@@ -33,6 +42,8 @@ def main():
     parser.add_argument("--date", required=True, help="Analysis date (YYYY-MM-DD)")
     parser.add_argument("--holdings", default="", help="Current holdings (comma-separated)")
     parser.add_argument("--top-n", type=int, default=5, help="Number of stocks to recommend")
+    parser.add_argument("--max-holdings", type=int, default=None, help="最大持仓槽位 K")
+    parser.add_argument("--score-gate-mode", default=None, help="disabled 或 calibrated_net_excess")
     args = parser.parse_args()
 
     stocks = [s.strip() for s in args.stocks.split(",") if s.strip()]
@@ -67,7 +78,14 @@ def main():
     factor_df = D.features(stocks, _ALL_EXPRESSIONS, start_time=start_time, end_time=end_time)
 
     if factor_df is None or factor_df.empty:
-        print(json.dumps({"error": "Factor query returned empty", "buy": stocks[:top_n], "sell": [], "keep": []}))
+        fallback_buy = [] if _portfolio_fallback_disabled(args) else stocks[:top_n]
+        print(json.dumps({
+            "error": "Factor query returned empty",
+            "decision_status": "DATA_ERROR" if not fallback_buy else "VALID",
+            "buy": fallback_buy,
+            "sell": [],
+            "keep": [],
+        }))
         return
 
     # Normalize index
@@ -88,7 +106,14 @@ def main():
     # Extract no-leakage factor snapshot
     fs = _extract_no_leakage_factors(factor_df, stocks, as_of_date)
     if fs.empty or len(fs) < 3:
-        print(json.dumps({"error": "Insufficient factor data", "buy": stocks[:top_n], "sell": [], "keep": []}))
+        fallback_buy = [] if _portfolio_fallback_disabled(args) else stocks[:top_n]
+        print(json.dumps({
+            "error": "Insufficient factor data",
+            "decision_status": "DATA_ERROR" if not fallback_buy else "VALID",
+            "buy": fallback_buy,
+            "sell": [],
+            "keep": [],
+        }))
         return
 
     # Compute dimension scores
@@ -167,6 +192,42 @@ def main():
         "top20_ranked": [{"stock": s, "score": round(sc, 4), "vetoed": s in vetoed}
                          for s, sc in scored],
     }
+    if args.max_holdings:
+        from portfolio_policy import build_target, config_from_dict
+
+        ranked_rows = [
+            {"instrument": stock, "rank_score": score, "rank": index + 1}
+            for index, (stock, score) in enumerate(scored)
+        ]
+        eligibility = {
+            stock: {
+                "hard_entry_eligible": stock not in vetoed,
+                "hard_hold_eligible": stock not in vetoed,
+                "hard_entry_reason": "RISK_VETO",
+                "hard_hold_reason": "RISK_VETO",
+            }
+            for stock in vetoed
+        }
+        config = config_from_dict(
+            {
+                "enabled": True,
+                "max_holdings": args.max_holdings,
+                "score_gate": {
+                    "mode": args.score_gate_mode or "disabled",
+                    "artifact_available": False,
+                    "thresholds_locked": True,
+                    "missing_artifact_policy": "freeze_no_buy"
+                    if args.score_gate_mode == "calibrated_net_excess"
+                    else "disabled",
+                },
+            }
+        )
+        decision = build_target(ranked_rows, current_positions=holdings, eligibility=eligibility, config=config)
+        result["portfolio"] = decision.to_dict()
+        result["buy"] = [
+            {"stock": code, "score": next((score for stock, score in scored if stock == code), None)}
+            for code in decision.planned_buys
+        ]
     print(json.dumps(result, ensure_ascii=False))
 
 

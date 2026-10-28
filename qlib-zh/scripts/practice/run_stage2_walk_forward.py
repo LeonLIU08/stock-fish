@@ -425,7 +425,10 @@ def _combine_model_predictions(model_frames: dict[str, pd.DataFrame], weights: d
         score_df = _to_score_frame(frame, score_col="score")
         if name in target_names:
             target_index = score_df.index if target_index is None else target_index.intersection(score_df.index)
+        raw_df = score_df.rename(columns={"score": f"raw_{name}"})
         score_df = _daily_rank_gaussian(score_df, "score").rename(columns={"score": f"score_{name}"})
+        if os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1" or os.environ.get("ROLLING_MODE") == "strict_single_day_oos":
+            score_df = score_df.join(raw_df, how="left")
         if combined is None:
             combined = score_df
         else:
@@ -452,6 +455,8 @@ def _combine_model_predictions(model_frames: dict[str, pd.DataFrame], weights: d
             combined["score"] = combined["score"] + combined[col] * float(weight)
 
     keep_cols = [*score_cols, "score"]
+    raw_cols = [column for column in combined.columns if column.startswith("raw_")]
+    keep_cols.extend(raw_cols)
     return combined[keep_cols]
 
 
@@ -879,6 +884,7 @@ def _generate_model_fold_config(
             "--test-end",
             fold["oos_end"],
             *(["--handler-cache", str(handler_cache)] if handler_cache else []),
+            *(["--allow-valid-inside-train"] if str(fold.get("allow_valid_inside_train", "0")) == "1" else []),
         ],
         cwd=ROOT,
         env=base_env,
@@ -1674,12 +1680,17 @@ def _holding_count_diagnostics(trade_signal: pd.DataFrame) -> dict[str, float]:
             "max_holdings": float("nan"),
         }
 
-    counts = (
-        trade_signal.reset_index()
-        .groupby("datetime")["instrument"]
-        .nunique()
-        .astype(float)
-    )
+    counts = trade_signal.reset_index()
+    if "weight" in counts.columns:
+        counts = counts[pd.to_numeric(counts["weight"], errors="coerce").fillna(0) > 0]
+    if counts.empty:
+        return {
+            "avg_holdings": 0.0,
+            "median_holdings": 0.0,
+            "min_holdings": 0.0,
+            "max_holdings": 0.0,
+        }
+    counts = counts.groupby("datetime")["instrument"].nunique().astype(float)
     return {
         "avg_holdings": float(counts.mean()),
         "median_holdings": float(counts.median()),
@@ -2427,7 +2438,25 @@ class PrecomputedWeightStrategy:
     """Factory wrapper around Qlib WeightStrategyBase for precomputed target weights."""
 
     @staticmethod
-    def create(signal, risk_degree: float = 0.95):
+    def create(
+        signal,
+        risk_degree: float = 0.95,
+        preserve_cash: bool = False,
+        liquidate_dates=None,
+        freeze_dates=None,
+        max_holdings=None,
+        decision_status_by_date=None,
+    ):
+        if preserve_cash:
+            from variable_holding_strategy import create_qlib_weight_strategy
+
+            return create_qlib_weight_strategy(
+                signal,
+                liquidate_dates=set(liquidate_dates or []),
+                freeze_dates=set(freeze_dates or []),
+                max_holdings=max_holdings,
+                decision_status_by_date=decision_status_by_date or {},
+            )
         from qlib.contrib.strategy.order_generator import OrderGenWOInteract
         from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
 
@@ -2690,8 +2719,35 @@ def _write_full_backtest_report(
     price_cap = _get_price_cap()
     full_backtest_strategy = str(os.environ.get("FULL_BACKTEST_STRATEGY", "stage36_risk_parity") or "stage36_risk_parity").strip().lower()
     target_market = str(os.environ.get("TARGET_MARKET") or _resolve_instrument_name(template_cfg) or "csi300").strip().lower()
+    policy_state = None
+    _rebalance_freq = os.environ.get("FULL_BACKTEST_REBALANCE_FREQ", "weekly").strip().lower()
+    if _rebalance_freq not in ("daily", "weekly", "monthly", "yearly"):
+        _rebalance_freq = "weekly"
+    try:
+        from portfolio_policy import portfolio_policy_enabled
+        _use_policy = portfolio_policy_enabled()
+    except Exception:
+        _use_policy = False
 
-    if full_backtest_strategy == "enhanced_model":
+    if _use_policy:
+        from portfolio_backtest import build_policy_signal, load_policy, write_policy_artifacts
+
+        _policy = load_policy()
+        _policy.enabled = True
+        if _policy.score_gate.mode == "calibrated_net_excess" and not _policy.score_gate.artifact_available:
+            print("  [portfolio_policy] 校准器不可用：这些交易日冻结持仓并且不新买。")
+        shifted_signal, policy_state = build_policy_signal(
+            raw_signal_df,
+            cal,
+            _policy,
+            freq=_rebalance_freq,
+            price_cap=price_cap,
+        )
+        signal_source = "portfolio_policy"
+        portfolio_construction = policy_state["construction"]
+        risk_degree = 1.0
+        write_policy_artifacts(full_dir, policy_state, calendar=cal)
+    elif full_backtest_strategy == "enhanced_model":
         # ── Enhanced Model: buffered top-K + risk filter + industry cap + risk parity ──
         # Preserves model's IC quality while adding risk management layers
         # the model doesn't optimize for: tail-risk exclusion, diversification, sizing.
@@ -2963,7 +3019,7 @@ def _write_full_backtest_report(
         portfolio_construction = "Risk Parity weighted target position"
         risk_degree = 0.95
 
-    if shifted_signal.empty:
+    if shifted_signal.empty and not (policy_state and policy_state.get("decisions")):
         report_txt.write_text(
             "Signal data exists, but no eligible trade dates remain after applying the backtest selection rules.",
             encoding="utf-8",
@@ -3174,7 +3230,17 @@ def _write_full_backtest_report(
             print(f"    [master_veto] Failed: {_exc}")
             traceback.print_exc()
 
-    strategy = PrecomputedWeightStrategy.create(signal=shifted_signal, risk_degree=risk_degree)
+    if not shifted_signal.empty:
+        shifted_signal.reset_index().to_csv(full_dir / "trade_signal.csv", index=False, encoding="utf-8-sig")
+    strategy = PrecomputedWeightStrategy.create(
+        signal=shifted_signal,
+        risk_degree=1.0 if policy_state is not None else risk_degree,
+        preserve_cash=policy_state is not None,
+        liquidate_dates=None if policy_state is None else policy_state.get("liquidate_dates"),
+        freeze_dates=None if policy_state is None else policy_state.get("freeze_dates"),
+        max_holdings=None if policy_state is None else policy_state.get("max_holdings"),
+        decision_status_by_date=None if policy_state is None else policy_state.get("decision_status_by_date"),
+    )
 
     report_normal, _positions_normal = backtest_daily(
         start_time=trade_start,
@@ -3307,6 +3373,9 @@ def _write_full_backtest_report(
         f"IC t-stat: {ic_t_stat:.6f}",
         "",
     ]
+    _exposure_txt = full_dir / "position_exposure_report.txt"
+    if _exposure_txt.exists():
+        summary_lines.extend(["", _exposure_txt.read_text(encoding="utf-8")])
 
     if not validity_diag["is_valid"]:
         summary_lines.extend([f"Validity issue: {issue}" for issue in validity_diag["issues"]])
@@ -3391,6 +3460,11 @@ def _write_full_backtest_report(
         parts.append("</div>")
         sections_html.append("\n".join(parts))
 
+    exposure_html = ""
+    _exposure_html_path = full_dir / "position_exposure_section.html"
+    if _exposure_html_path.exists():
+        exposure_html = _exposure_html_path.read_text(encoding="utf-8")
+
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3439,6 +3513,7 @@ def _write_full_backtest_report(
                         <tr><th>max_holdings</th><td>{holding_diag['max_holdings']:.0f}</td></tr>
                 </table>
         </div>
+    {exposure_html}
     {''.join(sections_html)}
 </body>
 </html>
@@ -3669,6 +3744,11 @@ def _predict_only_main(args, template_path, output_root, wf_root) -> None:
     pred_date = _fmt(min(requested_end, calendar_end))
     print(f"  Prediction date: {pred_date}")
     print(f"  Calendar max: {calendar_end.date()}")
+    rolling_mode = getattr(args, "rolling_mode", "") or os.environ.get("ROLLING_MODE", "")
+    if rolling_mode == "strict_single_day_oos":
+        from rolling_schedule import assert_strict_checkpoint
+
+        assert_strict_checkpoint(output_root, pred_date)
 
     # Find latest fold checkpoint
     print("\n[1/5] Finding latest fold checkpoint...")
@@ -3871,6 +3951,12 @@ def main() -> None:
                     help="Only precompute handler feature cache, then exit (stage1)")
     ap.add_argument("--cache-workers", type=int, default=1,
                     help="Number of parallel workers for cache precompute (default: 1 = serial)")
+    ap.add_argument(
+        "--rolling-mode",
+        default=os.environ.get("ROLLING_MODE", ""),
+        choices=["", "strict_single_day_oos"],
+        help="strict_single_day_oos：每个预测日最终重训，outer test 只有当天",
+    )
     args = ap.parse_args()
 
     template_path = Path(args.template)
@@ -3895,12 +3981,14 @@ def main() -> None:
         _predict_only_main(args, template_path, output_root, wf_root)
         return
 
-    if args.step_years <= 0 and args.step_weeks <= 0:
-        raise ValueError("Either --step-years or --step-weeks must be positive")
+    rolling_mode = args.rolling_mode or os.environ.get("ROLLING_MODE", "")
+    if rolling_mode != "strict_single_day_oos":
+        if args.step_years <= 0 and args.step_weeks <= 0:
+            raise ValueError("Either --step-years or --step-weeks must be positive")
+        if args.valid_years <= 0 and args.valid_months <= 0 and args.valid_weeks <= 0:
+            raise ValueError("One of valid-years, valid-months, or valid-weeks must be positive")
     if args.train_years <= 0:
         raise ValueError("train-years must be positive")
-    if args.valid_years <= 0 and args.valid_months <= 0 and args.valid_weeks <= 0:
-        raise ValueError("One of valid-years, valid-months, or valid-weeks must be positive")
     if args.hold_num <= 0:
         raise ValueError("hold-num must be positive")
     if args.half_life <= 0:
@@ -3945,22 +4033,38 @@ def main() -> None:
             f"Clipped to latest trade date {calendar_end.date()}."
         )
 
-    raw_folds = _build_fold_dates(
-        calendar=calendar,
-        start_date=args.walk_forward_start,
-        end_date=effective_end_str,
-        step_years=args.step_years,
-        step_weeks=args.step_weeks,
-        test_years=args.test_years,
-        test_weeks=args.test_weeks,
-        train_years=args.train_years,
-        valid_years=args.valid_years,
-        valid_months=args.valid_months,
-        valid_weeks=args.valid_weeks,
-        train_base_start=args.train_base_start,
-        history_years=args.history_years,
-        train_coverage_intervals=train_coverage_intervals,
-    )
+    if rolling_mode == "strict_single_day_oos":
+        from label_embargo import label_expression_for_model_mode
+        from rolling_schedule import build_strict_daily_folds
+
+        raw_folds = build_strict_daily_folds(
+            calendar,
+            start_date=args.walk_forward_start,
+            end_date=effective_end_str,
+            label_expression=label_expression_for_model_mode(args.model_mode),
+            model_mode=args.model_mode,
+            train_window_years=args.train_years,
+            calibration_window_years=float(os.environ.get("CALIBRATION_WINDOW_YEARS", "1") or 1),
+        )
+        pd.DataFrame(raw_folds).to_csv(output_root / "rolling_training_daily.csv", index=False, encoding="utf-8-sig")
+        print("  strict daily: 每个预测日是独立 outer fold；特征缓存命中也不会跳过最终重训")
+    else:
+        raw_folds = _build_fold_dates(
+            calendar=calendar,
+            start_date=args.walk_forward_start,
+            end_date=effective_end_str,
+            step_years=args.step_years,
+            step_weeks=args.step_weeks,
+            test_years=args.test_years,
+            test_weeks=args.test_weeks,
+            train_years=args.train_years,
+            valid_years=args.valid_years,
+            valid_months=args.valid_months,
+            valid_weeks=args.valid_weeks,
+            train_base_start=args.train_base_start,
+            history_years=args.history_years,
+            train_coverage_intervals=train_coverage_intervals,
+        )
     folds = raw_folds
 
     _mode = f"{args.step_years}y" if args.step_years > 0 else f"{args.step_weeks}w"
@@ -4029,9 +4133,11 @@ def main() -> None:
         handler_cache_meta.write_text(json.dumps({"end_date": effective_end_str, "start_date": args.train_base_start}))
     args.handler_cache = handler_cache_path
 
-    if args.cache_only:
+    if args.cache_only and rolling_mode != "strict_single_day_oos":
         print("  [Cache] --cache-only: precompute complete, exiting.")
         return
+    if args.cache_only:
+        print("  [Cache] strict daily 模式不因特征缓存命中跳过最终重训。")
 
     segment_groups = _group_folds_by_year(folds, args.segment_years)
     fold_index = 0

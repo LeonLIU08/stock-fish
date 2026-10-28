@@ -805,6 +805,11 @@ def build_master_signal(
     # Optional factor IC validation data (only populated when validate_factor_ic=True)
     dim_scores_per_date: dict[pd.Timestamp, dict[str, np.ndarray]] = {}
     instruments_per_date: dict[pd.Timestamp, list[str]] = {}
+    try:
+        from portfolio_policy import strict_qualification_enabled
+        _strict_policy = strict_qualification_enabled()
+    except Exception:
+        _strict_policy = False
 
     for trade_dt in trade_dates:
         # ── Per-date regime detection (NO leakage: strictly T-21 to T-1) ──
@@ -826,14 +831,16 @@ def build_master_signal(
         candidates = day_df.sort_values("score", ascending=False).head(top_k_candidates)
         cand_codes = candidates["instrument"].tolist()
 
-        if len(cand_codes) < hold_num:
+        if not cand_codes:
+            continue
+        if len(cand_codes) < hold_num and not _strict_policy:
             continue
 
         # Extract NO-LEAKAGE factor values for candidates
         factor_slice = _extract_no_leakage_factors(
             factor_df, cand_codes, trade_dt
         )
-        if factor_slice.empty or len(factor_slice) < hold_num:
+        if factor_slice.empty or (len(factor_slice) < hold_num and not _strict_policy):
             continue
 
         # ── Step 5: Compute dimension scores ───────────────────────────
@@ -898,7 +905,7 @@ def build_master_signal(
             safe_mask = np.array([inst not in risky_set for inst in instruments_slice])
             safe_indices = np.where(safe_mask)[0]
 
-            if len(safe_indices) < hold_num:
+            if len(safe_indices) < hold_num and not _strict_policy:
                 # Not enough safe stocks → fill from flagged (least risky first)
                 print(f"[master]   {_fmt(trade_dt)}: only {len(safe_indices)} safe stocks, "
                       f"backfilling from flagged")
@@ -919,6 +926,8 @@ def build_master_signal(
             lo, hi = float(np.min(scores)), float(np.max(scores))
             weights = ((scores - lo) / (hi - lo)) if hi > lo else np.ones(len(scores)) / len(scores)
             weights = weights / weights.sum()
+            if _strict_policy:
+                weights = weights * (len(sel_df) / float(hold_num))
 
             sel_df["datetime"] = trade_dt
             sel_df["score"] = weights
@@ -956,6 +965,8 @@ def build_master_signal(
             lo, hi = float(np.min(scores)), float(np.max(scores))
             weights = ((scores - lo) / (hi - lo)) if hi > lo else np.ones(len(scores)) / len(scores)
             weights = weights / weights.sum()
+            if _strict_policy:
+                weights = weights * (len(sel_df) / float(hold_num))
 
             sel_df["datetime"] = trade_dt
             sel_df["score"] = weights
@@ -1065,6 +1076,8 @@ def build_master_signal(
         else:
             weights = np.ones(len(scores)) / len(scores)
         weights = weights / weights.sum()
+        if _strict_policy:
+            weights = weights * (len(sel_df) / float(hold_num))
 
         sel_df["datetime"] = trade_dt
         sel_df["score"] = weights

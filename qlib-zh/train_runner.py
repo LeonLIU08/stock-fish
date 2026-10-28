@@ -231,6 +231,16 @@ def run_training(
         "-e", "FULL_BACKTEST_REBALANCE_FREQ=yearly",  # 年度调仓
         "-e", "FULL_BACKTEST_STRATEGY=master_analysis",  # 大师分析策略：top20→top5
     ]
+    for env_name in (
+        "PORTFOLIO_POLICY_ENABLED",
+        "ROLLING_MODE",
+        "SCORE_GATE_MODE",
+        "SCORE_GATE_PROFILE",
+        "PORTFOLIO_MAX_HOLDINGS",
+        "STRICT_NO_RELAXATION",
+    ):
+        if os.environ.get(env_name):
+            cmd += ["-e", f"{env_name}={os.environ[env_name]}"]
 
     if lightgbm_only:
         cmd += ["-e", "STAGE2_LIGHTGBM_ONLY=1"]
@@ -292,6 +302,8 @@ def run_training(
         "--model-mode", model_mode,
         "--hold-num", str(hold_num),
     ]
+    if os.environ.get("ROLLING_MODE") == "strict_single_day_oos":
+        cmd += ["--rolling-mode", "strict_single_day_oos"]
 
     _log(f"数据划分: train={train_years}y  valid={valid_desc}  test={test_val}{test_unit}  stride={step_desc} (目标{fold_target}fold)")
 

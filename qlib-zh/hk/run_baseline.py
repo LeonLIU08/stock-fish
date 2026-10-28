@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -53,16 +54,15 @@ def run_output_dir(cfg: dict, config_path: Path, *parts: str) -> Path:
 
 
 def provider_dir(cfg: dict) -> Path:
-    """容器里的 /work 对应仓库根目录。港股旧数据仍兼容 ~/.qlib。"""
+    """容器里的 /work 对应仓库根目录。"""
     uri = str(cfg["runtime"]["provider_uri"])
     if uri.startswith("/work/"):
         return repo_root() / uri[len("/work/") :]
     path = Path(uri)
+    if not path.is_absolute():
+        return repo_root() / path
     if path.exists():
         return path
-    home = Path.home() / ".qlib" / "qlib_data" / cfg["data"]["freeze_dirname"]
-    if home.exists():
-        return home
     return path
 
 
@@ -416,6 +416,7 @@ def evaluate_segment(
     calendar: pd.DatetimeIndex,
     cfg: dict,
     pred_dir: Path,
+    gate_df: pd.DataFrame | None = None,
 ) -> dict:
     from qlib.contrib.evaluate import backtest_daily
     from qlib.contrib.strategy import TopkDropoutStrategy
@@ -468,14 +469,35 @@ def evaluate_segment(
             qbacktest.Exchange = HKLotExchange
         strategy_cls = LotTopkDropoutStrategy
     try:
+        strategy = strategy_cls(
+            signal=pred,
+            topk=int(backtest["topk"]),
+            n_drop=int(backtest["n_drop"]),
+        )
+        policy = dict(cfg.get("portfolio_policy") or {})
+        use_policy = bool(policy.get("enabled")) or os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1"
+        if use_policy:
+            practice = Path(__file__).resolve().parents[1] / "scripts" / "practice"
+            if str(practice) not in sys.path:
+                sys.path.insert(0, str(practice))
+            from portfolio_backtest import load_policy, strategy_from_score_frame, write_runtime_fingerprint
+
+            policy_config = load_policy(policy)
+            policy_config.enabled = True
+            signal = pred.to_frame("score")
+            if gate_df is not None and not gate_df.empty:
+                signal = signal.join(gate_df, how="left")
+            strategy = strategy_from_score_frame(signal, policy_config, calendar)
+            write_runtime_fingerprint(cfg, pred_dir)
+            print(
+                f"[{name}] 使用可变持仓策略，最大槽位 {policy_config.max_holdings}，"
+                f"score_gate={policy_config.score_gate.mode}",
+                flush=True,
+            )
         report_df, _positions = backtest_daily(
             start_time=start,
             end_time=end,
-            strategy=strategy_cls(
-                signal=pred,
-                topk=int(backtest["topk"]),
-                n_drop=int(backtest["n_drop"]),
-            ),
+            strategy=strategy,
             account=float(backtest["account"]),
             benchmark=str(backtest["benchmark"]),
             exchange_kwargs={
@@ -493,6 +515,11 @@ def evaluate_segment(
 
             qbacktest.Exchange = saved_exchange
     report_df.to_csv(pred_dir / f"{segment}_backtest.csv")
+    if (cfg.get("portfolio_policy") or {}).get("enabled") or os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1":
+        import pickle
+
+        with open(pred_dir / f"{segment}_positions.pkl", "wb") as handle:
+            pickle.dump(_positions, handle)
     portfolio = portfolio_summary(report_df)
     print(
         f"[{name}] {segment} rank_ic={summary['rank_ic']} excess={portfolio['excess_return']}",
@@ -509,6 +536,7 @@ def run_model(
     handler_span: dict,
     calendar: pd.DatetimeIndex,
     out_dir: Path,
+    config_path: Path | None = None,
 ) -> dict:
     from qlib.contrib.evaluate import backtest_daily
     from qlib.contrib.strategy import TopkDropoutStrategy
@@ -516,6 +544,15 @@ def run_model(
     from qlib.utils import init_instance_by_config
 
     label = cfg["label"]
+    from score_gate_training import policy_requests_calibrator
+
+    if policy_requests_calibrator(cfg):
+        if config_path is None:
+            raise RuntimeError("打开校准门槛时需要配置文件路径，以便按月缓存样本外预测")
+        from run_rolling import run_rolling
+
+        print(f"[{name}] 校准门槛：按月样本外预测，每个预测日冻结校准器后再重训并只预测该折", flush=True)
+        return run_rolling(name, spec, cfg, calendar, out_dir, False, config_path)
     universe = cfg["universe"]
     backtest = cfg["backtest"]
     features = cfg["features"]
@@ -648,7 +685,7 @@ def main() -> int:
     )
     reports = []
     for name, spec in selected_models(cfg, args.model):
-        reports.append(run_model(name, spec, cfg, resolved, handler_span, calendar, out_dir))
+        reports.append(run_model(name, spec, cfg, resolved, handler_span, calendar, out_dir, args.config))
     symbols = universe_symbols(cfg)
     universe = cfg.get("universe") or {}
     summary = {

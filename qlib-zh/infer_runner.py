@@ -102,6 +102,9 @@ def run_inference(
     top_n: int = 20,
     progress_callback=None,
     holdings: str = "",
+    max_holdings: int | None = None,
+    score_gate_profile: str | None = None,
+    score_gate_mode: str | None = None,
 ) -> dict:
     """
     在 Docker 中运行 qlib predict_only 推理，返回 Top N 股票。
@@ -154,7 +157,7 @@ def run_inference(
         "-e", f"TARGET_BENCHMARK={cfg['benchmark']}",
         "-e", f"PRED_DATE={pred_date}",
         "-e", "STAGE2_LIGHTGBM_ONLY=1",
-        "-e", "HOLD_NUM=20",
+        "-e", f"HOLD_NUM={int(max_holdings or top_n)}",
         "-e", "CASH_TOTAL=100000",
         "-e", "TX_FEE_RATE=0.0001",
         "-e", "STAMP_DUTY_RATE=0.0005",
@@ -177,8 +180,33 @@ def run_inference(
         "--uri-folder", "mlruns",
         "--walk-forward-end", pred_date,
         "--model-mode", "robust",
-        "--hold-num", "20",
+        "--hold-num", str(int(max_holdings or top_n)),
     ]
+    env_insert_at = cmd.index(DOCKER_IMAGE)
+    extra_env = []
+    for env_name in ("PORTFOLIO_POLICY_ENABLED", "ROLLING_MODE", "SCORE_GATE_MODE", "SCORE_GATE_PROFILE", "PORTFOLIO_MAX_HOLDINGS"):
+        if os.environ.get(env_name):
+            extra_env.extend(["-e", f"{env_name}={os.environ[env_name]}"])
+    if score_gate_mode:
+        extra_env.extend(["-e", f"SCORE_GATE_MODE={score_gate_mode}"])
+    if score_gate_profile:
+        extra_env.extend(["-e", f"SCORE_GATE_PROFILE={score_gate_profile}"])
+    if max_holdings:
+        extra_env.extend(["-e", "PORTFOLIO_POLICY_ENABLED=1", "-e", f"PORTFOLIO_MAX_HOLDINGS={int(max_holdings)}"])
+    if extra_env:
+        cmd[env_insert_at:env_insert_at] = extra_env
+
+    if os.environ.get("ROLLING_MODE") == "strict_single_day_oos":
+        practice = Path(__file__).resolve().parent / "scripts" / "practice"
+        if str(practice) not in sys.path:
+            sys.path.insert(0, str(practice))
+        from rolling_schedule import StaleCheckpointError, assert_strict_checkpoint
+
+        model_root = _LOCAL_PROJECT_ROOT / "DATA" / "analysis_outputs" / model_name / "model_predict"
+        try:
+            assert_strict_checkpoint(model_root, pred_date)
+        except StaleCheckpointError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     _log(f"启动 Docker 推理...")
     _log(f"脚本: {cfg['script']}")
@@ -361,7 +389,52 @@ def run_inference(
         "pred_date": pred_date,
         "scores": scores_detail,
         "strategy_b": strategy_b_result,
+        "model_ranking": scores_detail,
+        "checkpoint_as_of": None,
+        "train_label_end": None,
+        "label_embargo_days": None,
+        "retrained": False,
     }
+    portfolio_requested = max_holdings is not None or os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1"
+    if portfolio_requested:
+        practice = Path(__file__).resolve().parent / "scripts" / "practice"
+        if str(practice) not in sys.path:
+            sys.path.insert(0, str(practice))
+        from portfolio_backtest import apply_policy_to_ranked_rows
+
+        artifact_day = pred_date.replace("-", "")
+        artifact_dir = _LOCAL_PROJECT_ROOT / "DATA" / "analysis_outputs" / model_name / "model_predict" / "rolling_models" / artifact_day
+        metadata_path = artifact_dir / "rolling_asof_metadata.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            result["checkpoint_as_of"] = metadata.get("checkpoint_as_of")
+            result["train_label_end"] = metadata.get("train_label_end")
+            result["label_embargo_days"] = metadata.get("label_embargo_days")
+            result["retrained"] = bool(metadata.get("retrained"))
+        holding_codes = [c.strip() for c in holdings.split("/") if c.strip()] if holdings else []
+        portfolio = apply_policy_to_ranked_rows(
+            [
+                {
+                    "instrument": row["instrument"],
+                    "code": row["code"],
+                    "rank_score": row["score"],
+                    "rank": row["rank"],
+                }
+                for row in all_rows
+            ],
+            max_holdings=int(max_holdings or os.environ.get("PORTFOLIO_MAX_HOLDINGS") or top_n),
+            score_gate_profile=score_gate_profile or os.environ.get("SCORE_GATE_PROFILE"),
+            score_gate_mode=score_gate_mode or os.environ.get("SCORE_GATE_MODE"),
+            holdings=holding_codes,
+            artifact_available=(artifact_dir / "score_gate_calibrator.pkl").exists(),
+        )
+        result["portfolio"] = portfolio
+        if portfolio.get("decision_status") in {"VALID", "VALID_EMPTY"}:
+            result["stocks"] = "/".join(portfolio.get("selected_codes") or [])
+            result["count"] = int(portfolio.get("selected_count") or 0)
+        elif portfolio.get("decision_status") == "DATA_ERROR":
+            result["stocks"] = ""
+            result["count"] = 0
 
     _log(
         f"完成 — Top {len(stocks)} 股票: {result['stocks'][:80]}...",
@@ -371,6 +444,12 @@ def run_inference(
         pred_date=result["pred_date"],
         scores=result["scores"],
         strategy_b=result["strategy_b"],
+        portfolio=result.get("portfolio"),
+        model_ranking=result.get("model_ranking"),
+        checkpoint_as_of=result.get("checkpoint_as_of"),
+        train_label_end=result.get("train_label_end"),
+        label_embargo_days=result.get("label_embargo_days"),
+        retrained=result.get("retrained"),
     )
 
     return result
@@ -383,6 +462,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Qlib 推理执行器")
     ap.add_argument("model", help="模型名称")
     ap.add_argument("--top-n", type=int, default=20, help="返回 Top N 股票 (默认 20)")
+    ap.add_argument("--max-holdings", type=int, default=None, help="最大持仓槽位 K")
+    ap.add_argument("--score-gate-profile", default=None)
+    ap.add_argument("--score-gate-mode", default=None)
     ap.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
     args = ap.parse_args()
 
@@ -390,7 +472,14 @@ if __name__ == "__main__":
         msg = data.get("message", "")
         print(f"[qlib] {msg}", file=sys.stderr)
 
-    result = run_inference(args.model, top_n=args.top_n, progress_callback=_print_progress)
+    result = run_inference(
+        args.model,
+        top_n=args.top_n,
+        progress_callback=_print_progress,
+        max_holdings=args.max_holdings,
+        score_gate_profile=args.score_gate_profile,
+        score_gate_mode=args.score_gate_mode,
+    )
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

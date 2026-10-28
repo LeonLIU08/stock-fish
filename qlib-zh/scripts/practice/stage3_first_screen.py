@@ -425,7 +425,12 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
 
         return candidate
 
-    # 先走严格版；如果被过度过滤清空，则逐级放宽，但不会影响原本已经可用的结果。
+    # 严格组合规则下不逐级放宽，避免把被拒绝的股票补回来。
+    try:
+        from portfolio_policy import strict_qualification_enabled
+        _strict_policy = strict_qualification_enabled()
+    except Exception:
+        _strict_policy = False
     attempts = [
         (True, True, True),
         (True, True, False),
@@ -434,6 +439,8 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
         (False, False, True),
         (False, False, False),
     ]
+    if _strict_policy:
+        attempts = attempts[:1]
     pool = pd.DataFrame()
     for apply_limit, apply_turnover, apply_price_cap in attempts:
         candidate = _screen(apply_limit, apply_turnover, apply_price_cap)

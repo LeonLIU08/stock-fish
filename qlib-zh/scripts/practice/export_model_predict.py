@@ -397,7 +397,8 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
     # pred_df 通常是 MultiIndex (datetime, instrument) → score 列
     if pred_df.index.nlevels == 2:
         pred_df.index.names = ["datetime", "instrument"]
-        pred_df.columns      = ["score"]
+        if "score" not in pred_df.columns:
+            pred_df = pred_df.rename(columns={pred_df.columns[0]: "score"})
     elif pred_df.index.nlevels == 1:
         # 尝试从列推断
         if "instrument" in pred_df.columns:
@@ -449,7 +450,7 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
     slice_df["stock"] = slice_df["code"]
     slice_df["date"] = slice_df["pred_date"]
 
-    export_scores_df = slice_df[[
+    export_columns = [
         "stock",
         "code",
         "instrument",
@@ -461,7 +462,10 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
         "rank_pct",
         "score_quantile",
         "quantile_bucket",
-    ]].copy()
+    ]
+    if "raw_prediction" in slice_df.columns:
+        export_columns.append("raw_prediction")
+    export_scores_df = slice_df[export_columns].copy()
 
     # ── 2. 绩效指标 ─────────────────────────────
     portfolio_dir = artifacts / "portfolio_analysis"

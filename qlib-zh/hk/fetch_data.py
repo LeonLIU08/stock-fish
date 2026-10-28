@@ -1,7 +1,7 @@
 """拉取港股日线，预处理后写成 qlib bin。
 
-读取 qlib-zh/hk/baseline.yaml。中间结果是 pickle，放在 ~/.qlib/hk_staging/<freeze_dirname>/，
-qlib 目录放在 ~/.qlib/qlib_data/<freeze_dirname>/。已成功的股票会跳过，中断后可续跑。
+读取 qlib-zh/hk/baseline.yaml。中间结果是 pickle，放在 qlib-zh/hk/data/staging/<freeze_dirname>/，
+qlib 目录放在 qlib-zh/hk/data/<freeze_dirname>/。已成功的股票会跳过，中断后可续跑。
 
     bash scripts/fetch_hk_qlib_data.sh --symbols 00700,02800
     bash scripts/fetch_hk_qlib_data.sh
@@ -64,11 +64,16 @@ def freeze_name(cfg: dict) -> str:
 
 
 def qlib_dir(cfg: dict) -> Path:
-    return Path.home() / ".qlib" / "qlib_data" / freeze_name(cfg)
+    """行情 bin 放在工程目录。配置里的 /work 前缀对应仓库根。"""
+    uri = str(cfg["runtime"]["provider_uri"])
+    if uri.startswith("/work/"):
+        return ROOT / uri[len("/work/") :]
+    path = Path(uri)
+    return path if path.is_absolute() else ROOT / path
 
 
 def staging_dir(cfg: dict) -> Path:
-    return Path.home() / ".qlib" / "hk_staging" / freeze_name(cfg)
+    return qlib_dir(cfg).parent / "staging" / freeze_name(cfg)
 
 
 def as_date(value) -> Optional[date]:
@@ -322,6 +327,18 @@ def load_em_symbols(width: int) -> list[str]:
     return codes
 
 
+def configured_universe(cfg: dict, width: int) -> tuple[Path, list[str]] | None:
+    raw = (cfg.get("universe") or {}).get("symbols_file")
+    if not raw:
+        return None
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.exists():
+        return None
+    return path, read_symbol_file(path, width)
+
+
 def resolve_symbols(args, cfg: dict) -> list[str]:
     width = int(cfg["data"]["code_width"])
     calendar = normalize_code(cfg["data"]["calendar_instrument"], width)
@@ -339,10 +356,15 @@ def resolve_symbols(args, cfg: dict) -> list[str]:
             logger.info("从东财读取当前港股列表")
             picked = load_em_symbols(width)
         except Exception as exc:
-            if not cached.exists():
-                raise
-            logger.warning(f"东财列表失败，改用已保存名单 {cached}: {exc}")
-            picked = read_symbol_file(cached, width)
+            if cached.exists():
+                logger.warning(f"东财列表失败，改用已保存名单 {cached}: {exc}")
+                picked = read_symbol_file(cached, width)
+            else:
+                configured = configured_universe(cfg, width)
+                if configured is None:
+                    raise
+                path, picked = configured
+                logger.warning(f"东财列表失败，改用配置名单 {path}: {exc}")
         picked = [code for code in picked if int(code) < EQUITY_CODE_LIMIT]
     ordered = []
     seen = set()
@@ -497,11 +519,19 @@ def dump_qlib(cfg: dict) -> dict:
     staging = staging_dir(cfg)
     target = qlib_dir(cfg)
     calendar_frame = None
+    any_bars = False
     for code, frame in iter_staged_bars(staging):
+        any_bars = True
         if code == calendar_code:
             calendar_frame = frame
             break
     if calendar_frame is None:
+        bars_dir = staging / "bars"
+        if not any_bars:
+            raise RuntimeError(
+                f"没有已下载的港股行情: {bars_dir}。"
+                f"请先运行 bash scripts/fetch_hk_qlib_data.sh；日历标的 {calendar_code} 会自动加入。"
+            )
         raise RuntimeError(f"日历标的 {calendar_code} 没有行情，无法生成交易日")
     calendar = build_calendar({calendar_code: calendar_frame}, calendar_code)
     calendars_dir = target / "calendars"

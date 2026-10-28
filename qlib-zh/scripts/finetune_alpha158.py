@@ -210,6 +210,18 @@ def _run_backtest(scores_csv: Path, output_dir: Path, pred_date: str,
         score_series = pred_df.set_index(["datetime", "instrument"])["score"]
 
         strategy = TopkDropoutStrategy(signal=score_series, topk=topk, n_drop=5)
+        if os.environ.get("PORTFOLIO_POLICY_ENABLED") == "1":
+            practice = Path(__file__).resolve().parent / "practice"
+            if str(practice) not in sys.path:
+                sys.path.insert(0, str(practice))
+            from portfolio_backtest import strategy_from_score_frame
+            from portfolio_policy import config_from_env
+
+            policy_config = config_from_env()
+            policy_config.enabled = True
+            calendar = pd.DatetimeIndex(score_series.index.get_level_values("datetime").unique())
+            strategy = strategy_from_score_frame(score_series.to_frame("score"), policy_config, calendar)
+            print(f"[finetune] 可变持仓 K={policy_config.max_holdings}，risk_degree=1")
         pred_dt = pd.Timestamp(pred_date)
         cfg = {
             "start_time": str(pred_dt - timedelta(days=30)),

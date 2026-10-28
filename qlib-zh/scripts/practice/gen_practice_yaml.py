@@ -13,7 +13,11 @@ import pandas as pd
 import yaml
 
 
-def validate_date_order(dates: dict, practice_mode: bool = False) -> None:
+def validate_date_order(
+    dates: dict,
+    practice_mode: bool = False,
+    allow_valid_inside_train: bool = False,
+) -> None:
     """Ensure train/valid/test windows are ordered and non-overlapping.
 
     train/valid boundaries are strictly ordered; test_start <= test_end is
@@ -21,6 +25,10 @@ def validate_date_order(dates: dict, practice_mode: bool = False) -> None:
 
     When practice_mode=True (finetune/practice), test window may share the
     same period as valid window.
+
+    When allow_valid_inside_train=True, the final refit may use every mature
+    label. The valid window is then an early-stopping slice inside train,
+    not a holdout that permanently removes those labels.
     """
     keys = ["train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"]
     missing = [k for k in keys if k not in dates]
@@ -28,6 +36,17 @@ def validate_date_order(dates: dict, practice_mode: bool = False) -> None:
         raise ValueError(f"Missing required dates: {missing}")
 
     parsed = {k: pd.Timestamp(dates[k]) for k in keys}
+    if allow_valid_inside_train:
+        if not (
+            parsed["train_start"] <= parsed["valid_start"] <= parsed["valid_end"] <= parsed["train_end"]
+            < parsed["test_start"]
+        ):
+            raise ValueError(
+                "final refit requires valid_start/valid_end inside train and test_start after train_end"
+            )
+        if parsed["test_start"] > parsed["test_end"]:
+            raise ValueError("test_start must not be later than test_end")
+        return
     for left, right in zip(keys, keys[1:]):
         # Allow valid_end == test_start in practice mode (same window)
         if practice_mode and left == "valid_end" and right == "test_start":
@@ -80,8 +99,13 @@ def patch_yaml(
     sample_weight_half_life: int | None = None,
     handler_cache: str | None = None,
     practice_mode: bool = False,
+    allow_valid_inside_train: bool = False,
 ) -> None:
-    validate_date_order(dates, practice_mode=practice_mode)
+    validate_date_order(
+        dates,
+        practice_mode=practice_mode,
+        allow_valid_inside_train=allow_valid_inside_train,
+    )
 
     with open(template_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -220,6 +244,7 @@ def main():
     ap.add_argument("--data-start", default=None, dest="data_start")
     ap.add_argument("--sample-weight-half-life", type=int, default=None, dest="sample_weight_half_life")
     ap.add_argument("--handler-cache", default=None, dest="handler_cache")
+    ap.add_argument("--allow-valid-inside-train", action="store_true", default=False)
     args = ap.parse_args()
 
     sample_weight_half_life = args.sample_weight_half_life
@@ -245,6 +270,7 @@ def main():
         data_start=getattr(args, "data_start", None),
         sample_weight_half_life=sample_weight_half_life,
         handler_cache=getattr(args, "handler_cache", None),
+        allow_valid_inside_train=bool(getattr(args, "allow_valid_inside_train", False)),
     )
 
 

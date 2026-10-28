@@ -371,14 +371,27 @@
       <input type="checkbox" id="qlibCheck" onchange="toggleQlibInfer()"
              style="width:16px;height:16px;cursor:pointer;" />
       <span style="font-size:13px;color:#8ab4f8;">启用qlib推理</span>
-      <span style="font-size:11px;color:#6b8db5;">基于Qlib模型预测Top20股票，约5-15分钟</span>
+      <span style="font-size:11px;color:#6b8db5;">模型排名和组合目标分开。填写最大 K 后按槽位留出现金</span>
     </label>
     <div id="qlibInferControls" style="display:none;">
       <select id="qlibModelSelect">
         <option value="">选择模型...</option>
       </select>
       <button id="qlibInferBtn" onclick="startQlibInfer()">开始推理</button>
+      <input id="qlibMaxHoldings" type="number" min="1" placeholder="最大 K" title="留空则只返回模型排名 Top20" style="width:90px;background:#1a2d42;color:#e0e0e0;border:1px solid #1e3a5f;border-radius:6px;padding:4px 8px;" />
+      <select id="qlibScoreGateMode" title="模型准入模式" style="background:#1a2d42;color:#e0e0e0;border:1px solid #1e3a5f;border-radius:6px;">
+        <option value="">门槛默认</option>
+        <option value="disabled">硬过滤</option>
+        <option value="calibrated_net_excess">校准超额</option>
+      </select>
+      <select id="qlibScoreGateProfile" title="冻结的门槛档位" style="background:#1a2d42;color:#e0e0e0;border:1px solid #1e3a5f;border-radius:6px;">
+        <option value="">profile</option>
+        <option value="conservative">conservative</option>
+        <option value="balanced">balanced</option>
+        <option value="aggressive">aggressive</option>
+      </select>
       <span id="qlibInferStatus"></span>
+      <div id="qlibPortfolioSummary" style="flex-basis:100%;font-size:12px;color:#d6e4ff;margin-top:6px;"></div>
     </div>
     <!-- 全股市分析 -->
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;margin-top:10px;">
@@ -781,6 +794,20 @@ function _connectSSE(url, onMessage, onStateChange, maxRetries = 10) {
   };
 }
 
+function renderQlibPortfolio(data) {
+  const el = document.getElementById('qlibPortfolioSummary');
+  if (!el) return;
+  const portfolio = data.portfolio;
+  if (!portfolio) {
+    el.textContent = '';
+    return;
+  }
+  const cash = Number(portfolio.target_cash_weight);
+  const cashText = Number.isFinite(cash) ? `${(cash * 100).toFixed(1)}%` : '-';
+  const checkpoint = data.checkpoint_as_of ? `，checkpoint ${data.checkpoint_as_of}` : '';
+  el.textContent = `最大K ${portfolio.max_holdings}，模型门槛拒绝 ${portfolio.model_reject_count}，硬过滤拒绝 ${portfolio.hard_reject_count}，最终选中 ${portfolio.selected_count}，目标现金 ${cashText}，状态 ${portfolio.decision_status || '-'}${checkpoint}`;
+}
+
 async function startQlibInfer() {
   const model = document.getElementById('qlibModelSelect').value;
   if (!model) { alert('请选择模型'); return; }
@@ -796,10 +823,17 @@ async function startQlibInfer() {
   simLogDiv.textContent = '';
 
   try {
+    const payload = { model };
+    const maxHoldings = document.getElementById('qlibMaxHoldings').value;
+    const scoreGateMode = document.getElementById('qlibScoreGateMode').value;
+    const scoreGateProfile = document.getElementById('qlibScoreGateProfile').value;
+    if (maxHoldings) payload.max_holdings = Number(maxHoldings);
+    if (scoreGateMode) payload.score_gate_mode = scoreGateMode;
+    if (scoreGateProfile) payload.score_gate_profile = scoreGateProfile;
     const resp = await fetch(`${API}/api/qlib/infer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model })
+      body: JSON.stringify(payload)
     });
     if (!resp.ok) {
       const err = await resp.json();
@@ -815,8 +849,17 @@ async function startQlibInfer() {
       statusEl.textContent = data.message || '';
 
       if (data.status === 'completed') {
-        document.getElementById('symbolInput').value = data.stocks;
-        statusEl.textContent = `✅ 完成 — 已填入 ${data.count || 20} 只股票 (预测日: ${data.pred_date || '-'})`;
+        renderQlibPortfolio(data);
+        const portfolio = data.portfolio;
+        if (!portfolio) {
+          document.getElementById('symbolInput').value = data.stocks;
+          statusEl.textContent = `✅ 完成 — 已填入 ${data.count || 20} 只股票 (预测日: ${data.pred_date || '-'})`;
+        } else if (portfolio.decision_status === 'DATA_ERROR') {
+          statusEl.textContent = '数据或校准器不可用：不新买，也不把模型排名当成买入清单';
+        } else {
+          document.getElementById('symbolInput').value = data.stocks || '';
+          statusEl.textContent = `✅ 组合目标 ${portfolio.selected_count} 只，目标现金 ${(Number(portfolio.target_cash_weight) * 100).toFixed(1)}%`;
+        }
         btn.disabled = false;
         es.close();
       }

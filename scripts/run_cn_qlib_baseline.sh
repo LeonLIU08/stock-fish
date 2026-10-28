@@ -8,16 +8,25 @@
 #   bash scripts/run_cn_qlib_baseline.sh
 #   bash scripts/run_cn_qlib_baseline.sh --dry-run
 #   bash scripts/run_cn_qlib_baseline.sh --model all
+#   PORTFOLIO_POLICY_ENABLED=1 SCORE_GATE_MODE=disabled bash scripts/run_cn_qlib_baseline.sh --model xgboost,catboost
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+policy_env=()
+for name in PORTFOLIO_POLICY_ENABLED SCORE_GATE_MODE SCORE_GATE_PROFILE PORTFOLIO_MAX_HOLDINGS ROLLING_MODE BASE_CASH_RATIO RISK_SCALE; do
+  if [[ -n "${!name:-}" ]]; then
+    policy_env+=(-e "${name}=${!name}")
+  fi
+done
+
 docker run --rm \
   --entrypoint python3 \
   -e PYTHONUNBUFFERED=1 \
   -e CUDA_VISIBLE_DEVICES= \
+  "${policy_env[@]}" \
   -v "${ROOT}:/work" \
   -w /work \
   zhuhai123/qlib-rdagent:v1 \

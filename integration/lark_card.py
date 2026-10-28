@@ -500,7 +500,7 @@ class CardBuilder:
                 "**5. Qlib 数据更新** — `/update_data`\n"
                 "　下载最新 qlib 市场数据\n\n"
                 "**6. Qlib 推理** — `/qlib_inference [市场]`\n"
-                "　Qlib 模型推理选股（非大师分析）\n\n"
+                "　Qlib 模型推理。可加 `k=50 profile=balanced` 查看最大 K、拒绝数、最终 N 和目标现金\n\n"
                 "**6. 本帮助** — `/help`"
             ),
             _hr(),

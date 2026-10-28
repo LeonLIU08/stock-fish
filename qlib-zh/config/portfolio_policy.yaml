@@ -1,0 +1,52 @@
+# 可变持仓默认关闭。开启后 max_holdings 是最大槽位和仓位分母，不是必须买满的数量。
+portfolio_policy:
+  enabled: false
+  max_holdings: 50
+  allow_new_buys_outside_topk: false
+  master_candidate_pool_multiplier: 3.0
+  unfilled_slot_policy: cash
+
+  rolling:
+    mode: strict_single_day_oos
+    signal_timing: close
+    execution_lag_trading_days: 1
+    prediction_frequency: every_trading_day
+    retrain_frequency: every_prediction
+    test_window_trading_days: 1
+    train_window_years: 5
+    calibration_window_years: 1
+    inner_oof_step: month
+    label_embargo_trading_days: auto_from_label
+    final_refit: true
+    allow_stale_checkpoint_days: 0
+    warm_start: false
+
+  allocation:
+    method: preserve_strategy_allocator
+    base_cash_ratio: 0.0
+    risk_scale: 1.0
+
+  qualification:
+    mode: strict_no_relaxation
+    min_listing_days: 60
+    exclude_st: true
+    require_liquidity: true
+    require_lot_affordable: true
+    hard_risk_veto: true
+    data_error_policy: freeze_no_buy
+
+  score_gate:
+    mode: calibrated_net_excess
+    profile: balanced
+    missing_artifact_policy: freeze_no_buy
+
+  turnover:
+    max_regular_replacements: 5
+    hold_rank_buffer_multiplier: 2.0
+    mandatory_exit_bypasses_limit: true
+
+  execution:
+    redistribute_failed_buy_weight: false
+    retry_blocked_sell: true
+    enforce_lot_size: true
+    risk_degree: 1.0

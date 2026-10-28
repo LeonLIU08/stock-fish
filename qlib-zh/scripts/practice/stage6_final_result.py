@@ -123,6 +123,18 @@ def final_result(second_screen_csv: str, pred_dir: str,
     fallback_candidate_df = None
 
     if ss_df.empty:
+        try:
+            from portfolio_policy import strict_qualification_enabled
+            _strict_policy = strict_qualification_enabled()
+        except Exception:
+            _strict_policy = False
+        if _strict_policy:
+            print(f"⚠ second_screen.csv 为空，严格模式不回退原始分数: {ss_path}")
+            empty_result = out_path / "result.csv"
+            empty_update = out_path / "result_update.csv"
+            pd.DataFrame().to_csv(empty_result, index=False, encoding="utf-8-sig")
+            pd.DataFrame().to_csv(empty_update, index=False, encoding="utf-8-sig")
+            return
         print(f"⚠ second_screen.csv 为空，回退使用 scores.csv 生成最终结果: {ss_path}")
         scores_csv = _resolve_scores_csv(pred_dir)
         scores_df = _load_csv(scores_csv, "scores.csv")
