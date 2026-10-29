@@ -17,7 +17,29 @@ cd "$ROOT"
 
 env_file=()
 if [[ -f "${ROOT}/.env" ]]; then
-  env_file=(--env-file "${ROOT}/.env")
+  cleaned="$(mktemp)"
+  trap 'rm -f "${cleaned}"' EXIT
+  python3 - "${ROOT}/.env" "${cleaned}" <<'PY'
+import sys
+from pathlib import Path
+
+source, target = sys.argv[1:]
+lines = []
+for raw in Path(source).read_text(encoding="utf-8").splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        continue
+    key, value = stripped.split("=", 1)
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        lines.append(f"{key}={value[1:-1]}")
+        continue
+    if " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    lines.append(f"{key}={value}")
+Path(target).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  env_file=(--env-file "${cleaned}")
 fi
 
 docker run --rm \

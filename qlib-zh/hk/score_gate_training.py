@@ -133,6 +133,53 @@ def _train_month(
     return merged[["datetime", "instrument", "model", "raw_prediction", "future_excess", "model_train_label_end"]]
 
 
+def _coverage_path(path: Path) -> Path:
+    return path.with_suffix(".coverage.json")
+
+
+def _month_target_end(
+    calendar: pd.DatetimeIndex,
+    month_start: pd.Timestamp,
+    month_end: pd.Timestamp,
+) -> pd.Timestamp:
+    """一个缓存文件覆盖从 month_start 到该月最后一个交易日。"""
+    start = pd.Timestamp(month_start)
+    requested = pd.Timestamp(month_end)
+    days = pd.DatetimeIndex(calendar)
+    in_month = days[(days >= start) & (days.to_period("M") == start.to_period("M"))]
+    if len(in_month) == 0:
+        return requested
+    return max(requested, pd.Timestamp(in_month[-1]))
+
+
+def _cached_coverage_end(path: Path) -> pd.Timestamp | None:
+    """已写过的预测终点。旧文件没有旁路记录时，用表里的最后一天。"""
+    meta = _coverage_path(path)
+    if meta.exists():
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+        if payload.get("end"):
+            return pd.Timestamp(payload["end"])
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    frame = pd.read_parquet(path)
+    if frame.empty or "datetime" not in frame.columns:
+        return None
+    return pd.Timestamp(frame["datetime"].max())
+
+
+def _write_oof(path: Path, frame: pd.DataFrame, covered_end: pd.Timestamp) -> None:
+    temporary = path.with_suffix(".parquet.tmp")
+    frame.to_parquet(temporary, index=False)
+    temporary.replace(path)
+    meta = _coverage_path(path)
+    meta_tmp = meta.with_suffix(".tmp")
+    meta_tmp.write_text(
+        json.dumps({"end": pd.Timestamp(covered_end).strftime("%Y-%m-%d")}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    meta_tmp.replace(meta)
+
+
 def ensure_oof_month(
     cfg: dict,
     spec: dict,
@@ -141,21 +188,24 @@ def ensure_oof_month(
     month_end: pd.Timestamp,
     model_name: str,
 ) -> pd.DataFrame:
-    path = _oof_dir(cfg, model_name) / f"{month_start.strftime('%Y-%m-%d')}.parquet"
-    if path.exists() and path.stat().st_size > 0:
-        return pd.read_parquet(path)
+    """按月缓存样本外预测。第一次写入就覆盖到该月最后一个交易日。
+
+    缓存名只用月份起点。窗口刚碰到这个月时，请求终点往往只是第一天；
+    若把这天当成整月，后面的预测日会一直缺样本。
+    """
     import fcntl
 
+    path = _oof_dir(cfg, model_name) / f"{month_start.strftime('%Y-%m-%d')}.parquet"
+    target = _month_target_end(calendar, month_start, month_end)
     lock_path = path.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        if path.exists() and path.stat().st_size > 0:
+        covered = _cached_coverage_end(path)
+        if covered is not None and covered >= target:
             return pd.read_parquet(path)
-        frame = _train_month(cfg, spec, calendar, month_start, month_end, model_name)
-        temporary = path.with_suffix(".parquet.tmp")
-        frame.to_parquet(temporary, index=False)
-        temporary.replace(path)
+        frame = _train_month(cfg, spec, calendar, month_start, target, model_name)
+        _write_oof(path, frame, target)
         return frame
 
 

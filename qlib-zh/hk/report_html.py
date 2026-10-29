@@ -317,6 +317,17 @@ def _indexed(path: Path) -> pd.DataFrame:
     return frame.set_index(frame.columns[0])
 
 
+def _cash_weight(frame: pd.DataFrame) -> list[float] | None:
+    if "cash" not in frame.columns or "account" not in frame.columns:
+        return None
+    account = frame["account"].astype(float)
+    cash = frame["cash"].astype(float)
+    weight = cash / account.where(account != 0)
+    if not any(_is_finite(value) for value in weight):
+        return None
+    return [float(value) if _is_finite(value) else float("nan") for value in weight]
+
+
 def _equity(frame: pd.DataFrame) -> pd.DataFrame:
     ret = frame["return"].astype(float)
     if "cost" in frame.columns:
@@ -360,7 +371,8 @@ def _segment_block(name: str, title: str, model_dir: Path) -> str:
             )
         )
     if bt_path.exists():
-        equity = _equity(_indexed(bt_path))
+        frame = _indexed(bt_path)
+        equity = _equity(frame)
         dates = _date_labels(equity.index)
         parts.append("<h4>累计收益</h4>")
         parts.append(
@@ -381,6 +393,16 @@ def _segment_block(name: str, title: str, model_dir: Path) -> str:
                 y_kind="pct",
             )
         )
+        cash = _cash_weight(frame)
+        if cash is not None:
+            parts.append("<h4>当日现金比重</h4>")
+            parts.append(
+                _chart(
+                    [("现金", cash, "#0ca678")],
+                    x_labels=dates,
+                    y_kind="pct",
+                )
+            )
     return "\n".join(parts)
 
 

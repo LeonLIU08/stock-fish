@@ -38,6 +38,7 @@ from run_baseline import (
     run_output_dir,
     score_frame,
     selected_models,
+    trading_day_on_or_before,
     universe_expression,
     universe_symbols,
 )
@@ -101,6 +102,50 @@ def _early_stop_segment(calendar: pd.DatetimeIndex, eval_start: str, days: int) 
     return _stamp(calendar[start_idx]), _stamp(calendar[end_idx])
 
 
+def _cfg_with_test_end(cfg: dict, test_end: str) -> dict:
+    segments = dict(cfg["segments"])
+    test = dict(segments["test"])
+    test["end"] = test_end
+    segments["test"] = test
+    copied = dict(cfg)
+    copied["segments"] = segments
+    return copied
+
+
+def _bounded_test_end(calendar: pd.DatetimeIndex, day: str) -> str:
+    """配置终点晚于行情时，停在日历里最后一个不晚于它的交易日。"""
+    return trading_day_on_or_before(calendar, day).strftime("%Y-%m-%d")
+
+
+def _rolling_gen_class():
+    """日历尽头再滚一天时，qlib 返回 None，不能拿去和截止日期比较。"""
+    from qlib.workflow.task.gen import RollingGen
+
+    class BoundedRollingGen(RollingGen):
+        def gen_following_tasks(self, task, test_end):
+            prev_seg = task["dataset"]["kwargs"]["segments"]
+            while True:
+                segments = {}
+                try:
+                    for key, seg in prev_seg.items():
+                        if key == self.train_key and self.rtype == self.ROLL_EX:
+                            rtype = self.ta.SHIFT_EX
+                        else:
+                            rtype = self.ta.SHIFT_SD
+                        segments[key] = self.ta.shift(seg, step=self.step, rtype=rtype)
+                    start, end = segments[self.test_key]
+                    if start is None or end is None or start > test_end:
+                        break
+                except KeyError:
+                    break
+                prev_seg = segments
+                rolled = self.task_copy_func(task)
+                self._update_task_segs(rolled, segments)
+                yield rolled
+
+    return BoundedRollingGen
+
+
 def build_tasks(
     cfg: dict,
     spec: dict,
@@ -113,7 +158,7 @@ def build_tasks(
     rolling = cfg["rolling"]
     segments = cfg["segments"]
     eval_start = eval_start or str(segments["valid"]["start"])[:10]
-    eval_end = eval_end or str(segments["test"]["end"])[:10]
+    eval_end = _bounded_test_end(calendar, eval_end or str(segments["test"]["end"])[:10])
     horizon = int(cfg["label"]["horizon_trading_days"])
     trunc_days = int(rolling.get("trunc_days") or horizon + 1)
     rtype = RollingGen.ROLL_SD if rolling.get("rtype") == "sliding" else RollingGen.ROLL_EX
@@ -140,7 +185,7 @@ def build_tasks(
     }
     return task_generator(
         task,
-        RollingGen(
+        _rolling_gen_class()(
             step=int(rolling["step"]),
             rtype=rtype,
             trunc_days=trunc_days,
@@ -345,6 +390,12 @@ def build_panel(cfg: dict, run_dir: Path) -> None:
         resume_symbols,
     )
 
+    calendar = load_calendar(provider_dir(cfg) / "calendars" / "day.txt")
+    requested_end = str(cfg["segments"]["test"]["end"])[:10]
+    bounded_end = _bounded_test_end(calendar, requested_end)
+    if bounded_end != requested_end:
+        print(f"Alpha158 终点 {requested_end} 晚于行情日历，收到 {bounded_end}", flush=True)
+        cfg = _cfg_with_test_end(cfg, bounded_end)
     if panel_ready(cfg):
         print(f"复用已落盘的 Alpha158: {panel_dir(cfg)}", flush=True)
         return
@@ -479,6 +530,11 @@ def run_rolling(
     eval_end: str | None = None,
     fold_workers: int = 1,
 ) -> dict:
+    requested_end = (eval_end or str(cfg["segments"]["test"]["end"]))[:10]
+    eval_end = _bounded_test_end(calendar, requested_end)
+    if eval_end != requested_end:
+        print(f"[{name}] 测试终点 {requested_end} 晚于行情日历，滚动停在 {eval_end}", flush=True)
+        cfg = _cfg_with_test_end(cfg, eval_end)
     tasks = build_tasks(cfg, spec, calendar, eval_start, eval_end)
     folds = [_segment_dates(task) for task in tasks]
     print(f"[{name}] RollingGen 任务 {len(tasks)} 个", flush=True)

@@ -39,9 +39,20 @@ _DEFAULT_STATIC_INFO_TTL = 86400  # 24h
 _DEFAULT_CONNECTION_COOLDOWN_SECONDS = 15
 
 
+def _env_token(name: str, default: str = "") -> str:
+    """取环境变量的第一个词。docker --env-file 会把行尾注释一起带进来。"""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    token = str(raw).strip()
+    if " #" in token:
+        token = token.split(" #", 1)[0].rstrip()
+    return token.split()[0] if token else default
+
+
 def _static_info_ttl_seconds() -> int:
     """TTL for static_info cache; 0 disables caching (always fetch)."""
-    raw = os.getenv("LONGBRIDGE_STATIC_INFO_TTL_SECONDS", "").strip()
+    raw = _env_token("LONGBRIDGE_STATIC_INFO_TTL_SECONDS")
     if raw == "":
         return _DEFAULT_STATIC_INFO_TTL
     try:
@@ -52,7 +63,7 @@ def _static_info_ttl_seconds() -> int:
 
 def _connection_cooldown_seconds() -> int:
     """Cooldown after connection-close errors to avoid reconnect thrashing."""
-    raw = os.getenv("LONGBRIDGE_CONNECTION_COOLDOWN_SECONDS", "").strip()
+    raw = _env_token("LONGBRIDGE_CONNECTION_COOLDOWN_SECONDS")
     if raw == "":
         return _DEFAULT_CONNECTION_COOLDOWN_SECONDS
     try:
@@ -120,7 +131,7 @@ def _sanitize_longbridge_env() -> None:
         except Exception:
             pass
 
-    region = (os.getenv("LONGBRIDGE_REGION") or "").strip().lower()
+    region = _env_token("LONGBRIDGE_REGION").lower()
     if region:
         if not os.environ.get("LONGPORT_REGION"):
             os.environ["LONGPORT_REGION"] = region
@@ -277,7 +288,7 @@ class LongbridgeFetcher(BaseFetcher):
     """
 
     name = "LongbridgeFetcher"
-    priority = int(os.getenv("LONGBRIDGE_PRIORITY", "5"))
+    priority = int(_env_token("LONGBRIDGE_PRIORITY", "5"))
 
     _CONNECTION_ERRORS = ("client is closed", "context closed", "connection closed")
 

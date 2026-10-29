@@ -49,7 +49,7 @@ segments:
     end: 2025-12-31                  # 3 个月
   test:
     start: 2026-01-01
-    end: 2026-03-31                  # 3 个月
+    end: 2026-12-31                  # 全年
 
 # 扩展窗口滚动。步长是交易日。验证段和测试段连起来，每步重训并只预测这一步。
 rolling:
@@ -96,7 +96,7 @@ models:
       lambda_l2: 580.9768
       max_depth: 4
       num_leaves: 15
-      num_threads: 20
+      num_threads: 30
       num_boost_round: 5000          # 1000 轮时验证损失仍在下降，提高上限
       early_stopping_rounds: 50      # 验证损失连续 50 轮不降就停
       verbose_eval: 200              # 终端每隔这么多轮打印一次，不进入模型参数
@@ -112,7 +112,7 @@ models:
       max_depth: 8
       n_estimators: 647
       subsample: 0.8789
-      nthread: 20
+      nthread: 30
   catboost:
     enabled: true
     dataset_kind: tabular
@@ -124,7 +124,7 @@ models:
       subsample: 0.8789
       max_depth: 6
       num_leaves: 100
-      thread_count: 20
+      thread_count: 30
       grow_policy: Lossguide
       task_type: CPU
       # Poisson 只支持 GPU。CPU 用 Bernoulli，仍然按 subsample 抽样本。
@@ -156,7 +156,7 @@ models:
       lambda_l2: 580.9768
       max_depth: 8
       num_leaves: 210
-      num_threads: 20
+      num_threads: 30
       verbosity: -1
 
 # 怎么把分数变成持仓。不含报告里展示哪些指标。

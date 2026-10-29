@@ -619,6 +619,77 @@ class CalibratorWiringTests(unittest.TestCase):
         self.assertNotIn(pd.Timestamp("2026-10-20"), set(pd.to_datetime(chosen["datetime"])))
         self.assertIn(pd.Timestamp("2025-10-16"), set(pd.to_datetime(chosen["datetime"])))
 
+    def test_rolling_end_stops_on_last_trading_day(self):
+        hk = Path(__file__).resolve().parents[2] / "qlib-zh" / "hk"
+        sys.path.insert(0, str(hk))
+        from run_rolling import _bounded_test_end
+
+        calendar = pd.DatetimeIndex(pd.to_datetime(["2026-10-26", "2026-10-27", "2026-10-28"]))
+        self.assertEqual(_bounded_test_end(calendar, "2026-12-31"), "2026-10-28")
+        self.assertEqual(_bounded_test_end(calendar, "2026-10-27"), "2026-10-27")
+
+    def test_oof_month_cache_covers_the_rest_of_the_month(self):
+        import tempfile
+        from unittest.mock import patch
+
+        hk = Path(__file__).resolve().parents[2] / "qlib-zh" / "hk"
+        sys.path.insert(0, str(hk))
+        import score_gate_training
+
+        calendar = pd.bdate_range("2026-03-02", "2026-03-31")
+        calls = []
+
+        def fake_train(_cfg, _spec, _calendar, month_start, month_end, model_name):
+            calls.append((pd.Timestamp(month_start), pd.Timestamp(month_end), model_name))
+            days = pd.bdate_range(month_start, month_end)
+            return pd.DataFrame(
+                {
+                    "datetime": days,
+                    "instrument": ["00001"] * len(days),
+                    "model": model_name,
+                    "raw_prediction": 0.1,
+                    "future_excess": 0.01,
+                    "model_train_label_end": pd.Timestamp("2026-02-26"),
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {"data": {"freeze_dirname": "freeze"}, "runtime": {"cache_dir": tmp}}
+            with patch.object(score_gate_training, "_train_month", fake_train):
+                first = score_gate_training.ensure_oof_month(
+                    cfg, {}, calendar, pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-02"), "xgboost"
+                )
+                second = score_gate_training.ensure_oof_month(
+                    cfg, {}, calendar, pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-27"), "xgboost"
+                )
+            self.assertEqual(calls, [(pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-31"), "xgboost")])
+            self.assertIn(pd.Timestamp("2026-03-27"), set(pd.to_datetime(first["datetime"])))
+            self.assertIn(pd.Timestamp("2026-03-31"), set(pd.to_datetime(second["datetime"])))
+
+            short = pd.DataFrame(
+                {
+                    "datetime": [pd.Timestamp("2026-03-02")],
+                    "instrument": ["00001"],
+                    "model": "xgboost",
+                    "raw_prediction": [0.1],
+                    "future_excess": [0.01],
+                    "model_train_label_end": [pd.Timestamp("2026-02-26")],
+                }
+            )
+            cache = Path(tmp) / "freeze" / "score_gate_oof" / "xgboost"
+            cache.mkdir(parents=True, exist_ok=True)
+            short.to_parquet(cache / "2026-03-02.parquet", index=False)
+            coverage = cache / "2026-03-02.coverage.json"
+            if coverage.exists():
+                coverage.unlink()
+            calls.clear()
+            with patch.object(score_gate_training, "_train_month", fake_train):
+                repaired = score_gate_training.ensure_oof_month(
+                    cfg, {}, calendar, pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-27"), "xgboost"
+                )
+            self.assertEqual(len(calls), 1)
+            self.assertIn(pd.Timestamp("2026-03-27"), set(pd.to_datetime(repaired["datetime"])))
+
     def test_saved_threshold_is_used_for_that_day(self):
         from portfolio_backtest import build_policy_signal
 
